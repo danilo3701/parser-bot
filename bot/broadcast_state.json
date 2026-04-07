@@ -1,0 +1,211 @@
+{
+  "send_as_channels": [
+    "@connect_services"
+  ],
+  "broadcast_groups_state": {
+    "spain_chatss": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "spain_granitsa": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "UkrEspana": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Ukr_Malaga_Valencia_Marbelia": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "ukrainci_v_madridi": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "UkraineSpainMIR": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "amigosalicanteucrania": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "costablanca_es": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "uaalicante": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "servicio24": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "es_ruso": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "visadesp": {
+      "status": "blocked",
+      "reason": "ChannelPrivateError",
+      "updated_at": "2026-03-26T10:38:54.118521+00:00"
+    },
+    "ValenciaUtil": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "mibarcelona": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Barcelona_chatik": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "espanolukraine": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Malaga_Marbella_Spain": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "moyavalencia": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "valenciarusia": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Vmeste_Barcelona": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "mallorcalive": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "infohelpBCN": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "beni_es": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "barcelonav2": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "malagaru": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Ukrainian_in_Barcelona": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "chat_ukr_spain": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "chatik_torrevieja": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    },
+    "Benidorm_chatik": {
+      "status": "active",
+      "reason": "",
+      "updated_at": null
+    }
+  },
+  "broadcast_schedule": {
+    "enabled": false,
+    "times": [
+      "08:12",
+      "11:33",
+      "17:40",
+      "22:30"
+    ],
+    "tz": "Europe/Madrid"
+  },
+  "campaign": {
+    "send_as_channel": "@connect_services",
+    "source_channel": "@connect_services",
+    "source_message_id": 18,
+    "selected_groups": [
+      "UkraineSpainMIR",
+      "ValenciaUtil",
+      "amigosalicanteucrania",
+      "es_ruso",
+      "espanolukraine",
+      "mibarcelona",
+      "servicio24",
+      "spain_chatss",
+      "spain_granitsa",
+      "uaalicante",
+      "ukrainci_v_madridi",
+      "valenciarusia",
+      "visadesp"
+    ],
+    "test_passed": true,
+    "last_test_at": "2026-03-25T17:33:52.570711+00:00"
+  },
+  "last_runs": {
+    "2026-03-25_08:12": {
+      "status": "skipped",
+      "summary": "Не выбран канал отправки send-as.",
+      "updated_at": "2026-03-25T15:43:22.971757+00:00"
+    },
+    "2026-03-25_11:33": {
+      "status": "skipped",
+      "summary": "Не выбран канал отправки send-as.",
+      "updated_at": "2026-03-25T15:43:22.972764+00:00"
+    },
+    "2026-03-25_17:40": {
+      "status": "skipped",
+      "summary": "Тест-рассылка не пройдена.",
+      "updated_at": "2026-03-25T16:40:06.593597+00:00"
+    },
+    "2026-03-26_08:12": {
+      "status": "ok",
+      "summary": "Групп: 13 | Отправлено: 11 | Пропущено: 2 | Автоблок: 1",
+      "updated_at": "2026-03-26T10:38:54.120086+00:00"
+    },
+    "2026-03-26_11:33": {
+      "status": "ok",
+      "summary": "Групп: 12 | Отправлено: 10 | Пропущено: 2 | Автоблок: 0",
+      "updated_at": "2026-03-26T10:51:45.908438+00:00"
+    }
+  }
+}
