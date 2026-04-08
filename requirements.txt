@@ -2,5 +2,4 @@ aiogram==3.3.0
 python-dotenv
 telethon
 aiofiles
-pydantic==2.6.4
-pydantic-core==2.16.3
+pydantic==2.5.3
