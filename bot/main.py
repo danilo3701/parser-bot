@@ -61,6 +61,36 @@ OWNER_IDS = {
     for item in OWNER_IDS_ENV.split(",")
     if item.strip().isdigit()
 }
+TG_ACCOUNTS_RAW = os.getenv("TG_ACCOUNTS", "")
+def parse_broadcast_accounts(raw: str) -> dict[str, dict]:
+    accounts = {}
+    if not raw:
+        return accounts
+    for chunk in re.split(r"[,\n;]+", raw):
+        item = chunk.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) < 4:
+            continue
+        alias, api_id, api_hash, phone, *rest = parts
+        alias = alias.strip()
+        if not re.match(r"^[A-Za-z0-9_]{2,32}$", alias):
+            continue
+        try:
+            api_id_int = int(api_id)
+        except ValueError:
+            continue
+        password = rest[0].strip() if rest else None
+        accounts[alias] = {
+            "api_id": api_id_int,
+            "api_hash": api_hash.strip(),
+            "phone": phone.strip(),
+            "password": password or None,
+        }
+    return accounts
+
+BROADCAST_ACCOUNTS = parse_broadcast_accounts(TG_ACCOUNTS_RAW)
 SESSION_PATH = Path(os.getenv("TG_SESSION_PATH", Path(__file__).parent.parent / "parser" / "tutor_bot_scan.session")).resolve()
 
 # ─── Инициализация ───────────────────────────────────────────────────────────
@@ -259,6 +289,7 @@ def broadcast_summary_text(state: dict) -> str:
     campaign = state.get("campaign", {})
     schedule = state.get("broadcast_schedule", {})
     send_mode = campaign.get("send_mode", "user")
+    account = campaign.get("send_account") or ""
     source_channel = campaign.get("source_channel") or "не задан"
     source_message_id = campaign.get("source_message_id")
     source_value = f"{source_channel} #{source_message_id}" if source_message_id else source_channel
@@ -276,8 +307,14 @@ def broadcast_summary_text(state: dict) -> str:
         channel = campaign.get("send_as_channel", "не выбран")
         mode_label = f"📢 От канала: {channel}"
 
+    if BROADCAST_ACCOUNTS:
+        account_label = account if account else "не выбран"
+    else:
+        account_label = "один аккаунт (env)"
+
     return (
         "📣 <b>Рассылка</b>\n\n"
+        f"Аккаунт: <b>{account_label}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
         f"Источник поста: <b>{source_value}</b>\n"
         f"Выбрано групп: <b>{len(selected_groups)}</b>\n"
@@ -293,8 +330,11 @@ def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
+    selected_account = campaign.get("send_account", "") or "не выбран"
 
     rows = []
+    if BROADCAST_ACCOUNTS:
+        rows.append([InlineKeyboardButton(text=f"👤 Аккаунт: {selected_account}", callback_data="bc_accounts")])
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
@@ -328,6 +368,22 @@ def broadcast_channels_keyboard(state: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑 Удалить выбранный", callback_data="bc_del_selected_channel")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def broadcast_accounts_keyboard(state: dict) -> InlineKeyboardMarkup:
+    selected = state.get("campaign", {}).get("send_account", "")
+    if not BROADCAST_ACCOUNTS:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Аккаунты не заданы в TG_ACCOUNTS", callback_data="broadcast")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        ])
+    buttons = []
+    for alias in sorted(BROADCAST_ACCOUNTS.keys()):
+        mark = "✅" if alias == selected else "▫️"
+        buttons.append([InlineKeyboardButton(text=f"{mark} {alias}", callback_data=f"bc_acc_{alias}")])
+    buttons.append([InlineKeyboardButton(text="🚫 Сбросить выбор", callback_data="bc_acc_clear")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -444,6 +500,7 @@ async def execute_broadcast(groups: list[str]) -> dict:
         source_channel=source_channel,
         source_message_id=int(source_message_id),
         send_as_channel=send_as,
+        account_alias=campaign.get("send_account") or None,
         delay_seconds=5.0,
         jitter_seconds=1.0,
     )
@@ -451,6 +508,10 @@ async def execute_broadcast(groups: list[str]) -> dict:
 
 def is_campaign_ready(state: dict) -> tuple[bool, str]:
     campaign = state.get("campaign", {})
+    if BROADCAST_ACCOUNTS:
+        acc = campaign.get("send_account", "")
+        if not acc or acc not in BROADCAST_ACCOUNTS:
+            return False, "Не выбран аккаунт отправки (TG_ACCOUNTS)."
     if not campaign.get("source_channel") or not campaign.get("source_message_id"):
         return False, "Не задан источник поста."
     if campaign.get("send_mode") == "channel" and not campaign.get("send_as_channel"):
@@ -600,6 +661,22 @@ async def broadcast_menu(query: CallbackQuery):
     await query.answer()
 
 
+@dp.callback_query(F.data == "bc_accounts")
+async def broadcast_accounts(query: CallbackQuery):
+    state = broadcast_manager.load()
+    if not BROADCAST_ACCOUNTS:
+        await query.answer("TG_ACCOUNTS не задано.", show_alert=True)
+        return
+    await query.message.edit_text(
+        "👤 <b>Аккаунты отправки</b>\n\n"
+        "Список берётся из переменной <code>TG_ACCOUNTS</code> в .env. "
+        "Выберите аккаунт, от имени которого идти рассылка.",
+        parse_mode="HTML",
+        reply_markup=broadcast_accounts_keyboard(state),
+    )
+    await query.answer()
+
+
 @dp.callback_query(F.data == "bc_channels")
 async def broadcast_channels(query: CallbackQuery):
     state = broadcast_manager.load()
@@ -677,6 +754,32 @@ async def broadcast_delete_selected_channel(query: CallbackQuery):
         reply_markup=broadcast_channels_keyboard(state),
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == "bc_acc_clear")
+async def broadcast_account_clear(query: CallbackQuery):
+    state = broadcast_manager.set_send_account("")
+    await query.message.edit_text(
+        "👤 <b>Аккаунты отправки</b>\n\nВыбор сброшен.",
+        parse_mode="HTML",
+        reply_markup=broadcast_accounts_keyboard(state),
+    )
+    await query.answer("Сброшено")
+
+
+@dp.callback_query(F.data.startswith("bc_acc_"))
+async def broadcast_account_set(query: CallbackQuery):
+    alias = query.data[len("bc_acc_"):]
+    if alias not in BROADCAST_ACCOUNTS:
+        await query.answer("Аккаунт не найден в TG_ACCOUNTS.", show_alert=True)
+        return
+    state = broadcast_manager.set_send_account(alias)
+    await query.message.edit_text(
+        "👤 <b>Аккаунты отправки</b>\n\nАктивный аккаунт обновлён.",
+        parse_mode="HTML",
+        reply_markup=broadcast_accounts_keyboard(state),
+    )
+    await query.answer("Выбрано")
 
 
 @dp.callback_query(F.data == "bc_source")

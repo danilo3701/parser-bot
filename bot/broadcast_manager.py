@@ -20,6 +20,7 @@ class BroadcastManager:
             },
             "campaign": {
                 "send_mode": "user",
+                "send_account": "",
                 "send_as_channel": "",
                 "source_channel": "",
                 "source_message_id": None,
@@ -52,6 +53,7 @@ class BroadcastManager:
         state.setdefault("send_as_channels", [])
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
+        state["campaign"].setdefault("send_account", "")
         return state
 
     def save(self, state: dict) -> None:
@@ -98,6 +100,13 @@ class BroadcastManager:
     def set_send_as_channel(self, channel: str) -> dict:
         state = self.load()
         state["campaign"]["send_as_channel"] = channel
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def set_send_account(self, account: str | None) -> dict:
+        state = self.load()
+        state["campaign"]["send_account"] = account or ""
         self.reset_test_flag_in_state(state)
         self.save(state)
         return state
