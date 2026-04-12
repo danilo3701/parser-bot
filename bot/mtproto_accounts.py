@@ -112,6 +112,7 @@ class PendingLogin:
     session_file: Path
     client: object  # TelegramClient
     qr_login: object | None = None
+    bg_task: object | None = None  # asyncio.Task for QR auto-watch
 
 
 def new_pending_login(*, method: str, api_id: int, api_hash: str, phone: str, client: object, session_file: Path) -> PendingLogin:

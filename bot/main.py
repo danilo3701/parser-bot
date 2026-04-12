@@ -20,6 +20,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 
 # Добавляем пути
 sys.path.insert(0, str(Path(__file__).parent))
@@ -1136,6 +1137,8 @@ async def _cleanup_pending_login(user_id: int) -> None:
     pending = pending_logins.pop(user_id, None)
     if not pending:
         return
+    if pending.bg_task and not pending.bg_task.done():
+        pending.bg_task.cancel()
     try:
         await pending.client.disconnect()
     except Exception:
@@ -1243,6 +1246,8 @@ async def account_connect_qr_refresh(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "acc_qr_check")
 async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
+    import telethon.errors
+
     user_id = query.from_user.id
     pending = pending_logins.get(user_id)
     if not pending or pending.method != "qr" or not pending.qr_login:
@@ -1258,6 +1263,15 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
         await asyncio.wait_for(pending.qr_login.wait(), timeout=1.0)
     except asyncio.TimeoutError:
         await query.answer("Ещё не подтверждено. Отсканируйте QR и нажмите снова.", show_alert=True)
+        return
+    except telethon.errors.SessionPasswordNeededError:
+        await state.set_state(MainMenu.connecting_account_password)
+        await query.answer()
+        await _safe_edit_text(
+            query.message,
+            "🔐 QR отсканирован, но включена 2FA.\nВведите пароль:",
+            reply_markup=account_cancel_keyboard(),
+        )
         return
     except Exception as exc:
         await _cleanup_pending_login(user_id)
@@ -1496,6 +1510,97 @@ async def _finalize_account_login(message: Message, state: FSMContext, *, user_i
     await message.answer("✅ Аккаунт подключен.", reply_markup=account_menu_keyboard(user_id))
 
 
+async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None:
+    """Background task: auto-detect QR scan and finalize login (with 2FA support)."""
+    import telethon.errors
+
+    pending = pending_logins.get(user_id)
+    if not pending or pending.method != "qr" or not pending.qr_login:
+        return
+
+    ttl = max((pending.expires_at - datetime.now(timezone.utc)).total_seconds(), 1.0)
+
+    try:
+        await asyncio.wait_for(pending.qr_login.wait(), timeout=ttl)
+
+    except asyncio.CancelledError:
+        return
+
+    except asyncio.TimeoutError:
+        pending_logins.pop(user_id, None)
+        try:
+            await bot.send_message(
+                chat_id,
+                "⏰ QR-код истёк. Нажмите <b>Обновить QR</b> или вернитесь назад.",
+                parse_mode="HTML",
+                reply_markup=account_menu_keyboard(user_id),
+            )
+        except Exception:
+            pass
+        return
+
+    except telethon.errors.SessionPasswordNeededError:
+        # 2FA — keep pending alive so password handler can call sign_in(password=...)
+        key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+        ctx = FSMContext(storage=dp.storage, key=key)
+        await ctx.set_state(MainMenu.connecting_account_password)
+        try:
+            await bot.delete_message(chat_id, qr_message_id)
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id,
+            "🔐 QR отсканирован, но включена 2FA.\nВведите пароль:",
+            reply_markup=account_cancel_keyboard(),
+        )
+        return
+
+    except Exception:
+        return
+
+    # QR scanned successfully, no 2FA — finalize
+    pending = pending_logins.get(user_id)
+    if not pending:
+        return
+
+    me = None
+    try:
+        me = await pending.client.get_me()
+    except Exception:
+        pass
+
+    set_connected_account(
+        user_id=user_id,
+        phone="",
+        api_id=pending.api_id,
+        api_hash=pending.api_hash,
+        me_id=getattr(me, "id", None) if me else None,
+        username=getattr(me, "username", None) if me else None,
+        first_name=getattr(me, "first_name", None) if me else None,
+    )
+
+    pending_logins.pop(user_id, None)
+    try:
+        await pending.client.disconnect()
+    except Exception:
+        pass
+
+    key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+    ctx = FSMContext(storage=dp.storage, key=key)
+    await ctx.set_state(MainMenu.viewing)
+
+    try:
+        await bot.delete_message(chat_id, qr_message_id)
+    except Exception:
+        pass
+
+    await bot.send_message(
+        chat_id,
+        "✅ Аккаунт подключен!",
+        reply_markup=account_menu_keyboard(user_id),
+    )
+
+
 async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: bool) -> None:
     api_id = int(os.getenv("TG_API_ID", "0") or "0")
     api_hash = (os.getenv("TG_API_HASH") or "").strip()
@@ -1541,7 +1646,7 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
     ])
 
     await state.set_state(MainMenu.viewing)
-    await query.message.answer_photo(
+    sent = await query.message.answer_photo(
         photo=photo,
         caption=(
             "📷 <b>QR-вход</b>\n\n"
@@ -1550,6 +1655,9 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
         ),
         parse_mode="HTML",
         reply_markup=kb,
+    )
+    pending.bg_task = asyncio.create_task(
+        _qr_auto_watch(user_id, query.message.chat.id, sent.message_id)
     )
     await query.answer("QR готов" if not refresh else "QR обновлён")
 
