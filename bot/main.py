@@ -85,6 +85,7 @@ OWNER_IDS = {
     for item in OWNER_IDS_ENV.split(",")
     if item.strip().isdigit()
 }
+OWNER_2FA_PASSWORD = (os.getenv("OWNER_2FA_PASSWORD") or "").strip()
 SESSION_PATH = Path(os.getenv("TG_SESSION_PATH", Path(__file__).parent.parent / "parser" / "tutor_bot_scan.session")).resolve()
 
 # Для пула постов: куда бот копирует присланные сообщения, чтобы Telethon мог их переотправлять.
@@ -1415,6 +1416,8 @@ async def account_connect_qr_refresh(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "acc_qr_check")
 async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
+    import telethon.errors
+
     user_id = query.from_user.id
     pending = pending_logins.get(user_id)
     if not pending or pending.method != "qr" or not pending.qr_login:
@@ -1436,23 +1439,42 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
         await query.answer(f"Ошибка QR: {type(exc).__name__}", show_alert=True)
         return
 
-    # Проверяем авторизацию после сканирования
+    # Пытаемся получить мета — выкинет ошибку если требуется пароль
     try:
-        if await pending.client.is_user_authorized():
-            # Уже авторизован — финализируем
-            await _finalize_account_login(query.message, state, user_id=user_id, phone="")
-            await query.answer("✅ QR отсканирован и авторизован!")
-        else:
-            # Требуется пароль
-            await state.set_state(MainMenu.connecting_account_password)
-            await query.answer()
-            await _safe_edit_text(
-                query.message,
-                "🔐 <b>QR отсканирован!</b>\n\n"
-                "Но этот аккаунт защищен паролем 2FA.\n\n"
-                "Введите пароль (не код, а именно пароль):",
-                reply_markup=account_cancel_keyboard(),
-            )
+        me = await pending.client.get_me()
+        # Успешно — авторизован
+        await _finalize_account_login(query.message, state, user_id=user_id, phone="")
+        await query.answer("✅ QR отсканирован и авторизован!")
+
+    except telethon.errors.SessionPasswordNeededError:
+        # Требуется пароль
+        # Если админ и есть переменная — пробуем автоматически
+        if user_id in OWNER_IDS and OWNER_2FA_PASSWORD:
+            try:
+                await pending.client.sign_in(password=OWNER_2FA_PASSWORD)
+                await _finalize_account_login(query.message, state, user_id=user_id, phone="")
+                await query.answer("✅ QR авторизован! (пароль введён автоматически)")
+                return
+            except telethon.errors.PasswordHashInvalidError:
+                await query.answer("❌ OWNER_2FA_PASSWORD неверный!", show_alert=True)
+                await _cleanup_pending_login(user_id)
+                return
+            except Exception as exc:
+                await query.answer(f"❌ Ошибка пароля: {type(exc).__name__}", show_alert=True)
+                await _cleanup_pending_login(user_id)
+                return
+
+        # Не админ или нет переменной — просим ввести
+        await state.set_state(MainMenu.connecting_account_password)
+        await query.answer()
+        await _safe_edit_text(
+            query.message,
+            "🔐 <b>QR отсканирован!</b>\n\n"
+            "Но этот аккаунт защищен паролем 2FA.\n\n"
+            "Введите пароль (не код, а именно пароль):",
+            reply_markup=account_cancel_keyboard(),
+        )
+
     except Exception as exc:
         await _cleanup_pending_login(user_id)
         await query.answer(f"Ошибка при проверке: {type(exc).__name__}", show_alert=True)
@@ -1771,63 +1793,122 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
     if not pending:
         return
 
+    # Попытаемся получить мета-информацию — это выкинет ошибку если требуется пароль
     try:
-        # Проверяем, требуется ли 2FA пароль
-        if await pending.client.is_user_authorized():
-            # Уже авторизован — финализируем
-            me = None
+        me = await pending.client.get_me()
+        # Успешно получили — авторизован, финализируем
+        set_connected_account(
+            user_id=user_id,
+            phone="",
+            api_id=pending.api_id,
+            api_hash=pending.api_hash,
+            me_id=getattr(me, "id", None) if me else None,
+            username=getattr(me, "username", None) if me else None,
+            first_name=getattr(me, "first_name", None) if me else None,
+        )
+
+        pending_logins.pop(user_id, None)
+        try:
+            await pending.client.disconnect()
+        except Exception:
+            pass
+
+        key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+        ctx = FSMContext(storage=dp.storage, key=key)
+        await ctx.set_state(MainMenu.viewing)
+
+        try:
+            await bot.delete_message(chat_id, qr_message_id)
+        except Exception:
+            pass
+
+        await bot.send_message(
+            chat_id,
+            "✅ Аккаунт подключен!",
+            reply_markup=account_menu_keyboard(user_id),
+        )
+
+    except telethon.errors.SessionPasswordNeededError:
+        # Требуется пароль 2FA
+        # Если это админ и есть переменная пароля — используем её автоматически
+        if user_id in OWNER_IDS and OWNER_2FA_PASSWORD:
             try:
-                me = await pending.client.get_me()
-            except Exception:
-                pass
+                await pending.client.sign_in(password=OWNER_2FA_PASSWORD)
+                # Пароль прошёл — финализируем
+                me = None
+                try:
+                    me = await pending.client.get_me()
+                except Exception:
+                    pass
 
-            set_connected_account(
-                user_id=user_id,
-                phone="",
-                api_id=pending.api_id,
-                api_hash=pending.api_hash,
-                me_id=getattr(me, "id", None) if me else None,
-                username=getattr(me, "username", None) if me else None,
-                first_name=getattr(me, "first_name", None) if me else None,
-            )
+                set_connected_account(
+                    user_id=user_id,
+                    phone="",
+                    api_id=pending.api_id,
+                    api_hash=pending.api_hash,
+                    me_id=getattr(me, "id", None) if me else None,
+                    username=getattr(me, "username", None) if me else None,
+                    first_name=getattr(me, "first_name", None) if me else None,
+                )
 
-            pending_logins.pop(user_id, None)
-            try:
-                await pending.client.disconnect()
-            except Exception:
-                pass
+                pending_logins.pop(user_id, None)
+                try:
+                    await pending.client.disconnect()
+                except Exception:
+                    pass
 
-            key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
-            ctx = FSMContext(storage=dp.storage, key=key)
-            await ctx.set_state(MainMenu.viewing)
+                key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+                ctx = FSMContext(storage=dp.storage, key=key)
+                await ctx.set_state(MainMenu.viewing)
 
-            try:
-                await bot.delete_message(chat_id, qr_message_id)
-            except Exception:
-                pass
+                try:
+                    await bot.delete_message(chat_id, qr_message_id)
+                except Exception:
+                    pass
 
-            await bot.send_message(
-                chat_id,
-                "✅ Аккаунт подключен!",
-                reply_markup=account_menu_keyboard(user_id),
-            )
-        else:
-            # Требуется пароль 2FA
-            key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
-            ctx = FSMContext(storage=dp.storage, key=key)
-            await ctx.set_state(MainMenu.connecting_account_password)
-            try:
-                await bot.delete_message(chat_id, qr_message_id)
-            except Exception:
-                pass
-            await bot.send_message(
-                chat_id,
-                "🔐 <b>QR отсканирован!</b>\n\n"
-                "Но этот аккаунт защищен паролем 2FA.\n\n"
-                "Введите пароль (не код, а именно пароль):",
-                parse_mode="HTML",
-                reply_markup=account_cancel_keyboard(),
-            )
+                await bot.send_message(
+                    chat_id,
+                    "✅ Аккаунт подключен! (пароль введён автоматически)",
+                    reply_markup=account_menu_keyboard(user_id),
+                )
+                return
+
+            except telethon.errors.PasswordHashInvalidError:
+                # Неверный пароль в переменной
+                await bot.send_message(
+                    chat_id,
+                    "❌ Пароль из OWNER_2FA_PASSWORD неверный.\n\n"
+                    "Проверьте переменную в Railway.",
+                    reply_markup=account_menu_keyboard(user_id),
+                )
+                pending_logins.pop(user_id, None)
+                return
+            except Exception as exc:
+                await bot.send_message(
+                    chat_id,
+                    f"❌ Ошибка при вводе пароля: {type(exc).__name__}",
+                    reply_markup=account_menu_keyboard(user_id),
+                )
+                pending_logins.pop(user_id, None)
+                return
+
+        # Не админ или нет переменной — просим ввести вручную
+        key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+        ctx = FSMContext(storage=dp.storage, key=key)
+        await ctx.set_state(MainMenu.connecting_account_password)
+        try:
+            await bot.delete_message(chat_id, qr_message_id)
+        except Exception:
+            pass
+        await bot.send_message(
+            chat_id,
+            "🔐 <b>QR отсканирован!</b>\n\n"
+            "Но этот аккаунт защищен паролем 2FA.\n\n"
+            "Введите пароль (не код, а именно пароль):",
+            parse_mode="HTML",
+            reply_markup=account_cancel_keyboard(),
+        )
+
     except Exception as exc:
         pending_logins.pop(user_id, None)
         try:
