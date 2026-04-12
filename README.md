@@ -65,4 +65,35 @@ python telegram_history_scan.py
 python telegram_keyword_monitor.py
 ```
 
+## Railway / Hosting (ENV variables)
+
+Если бот развёрнут на Railway (или другом хостинге), значения из `bot/.env` **не подхватываются автоматически** — их нужно добавить в переменные окружения проекта.
+
+Минимальный набор для работы бота + рассылки (Telethon):
+
+```
+BOT_TOKEN=...
+OWNER_IDS=...            # ваш Telegram user_id (можно несколько через запятую)
+RESULTS_CHANNEL=...      # куда слать результаты сканирования (ID канала/чата)
+
+TG_API_ID=...
+TG_API_HASH=...
+TG_PHONE=...             # +79990001122
+# TG_PASSWORD=...        # если включена 2FA (обязательно при 2FA)
+```
+
+Опционально (если используете):
+```
+BROADCAST_TZ=Europe/Madrid
+SOURCE_HEADER_CHANNEL_ID=...
+BROADCAST_STORAGE_CHANNEL=@your_channel
+TG_SESSION_PATH=/data/tutor_bot_scan.session
+```
+
+Важно про `TG_ACCOUNTS`:
+- Если не нужно несколько аккаунтов для рассылки — **не задавайте `TG_ACCOUNTS`** (или очистите), используйте `TG_API_ID/TG_API_HASH/TG_PHONE`.
+- Если нужно несколько аккаунтов — задайте `TG_ACCOUNTS` в формате `alias:api_id:api_hash:+phone[:password]` (несколько записей через запятую).
+
+После добавления/изменения переменных окружения перезапустите сервис на Railway. При первом запуске Telethon попросит код подтверждения и создаст `.session` файл.
+
 Результаты приходят в Telegram Избранное (Saved Messages).

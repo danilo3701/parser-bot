@@ -47,6 +47,8 @@ from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_a
 from broadcast_manager import BroadcastManager
 from broadcast_sender import send_broadcast_campaign
 
+# Подхватываем bot/.env независимо от того, из какой папки запускают бота
+load_dotenv(Path(__file__).parent / ".env")
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
