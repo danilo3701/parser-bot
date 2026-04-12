@@ -52,10 +52,12 @@ from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
     disconnect_account,
+    extract_session_string,
     get_account,
+    get_session_string,
     list_connected_user_ids,
+    make_client_from_string_session,
     new_pending_login,
-    session_file_for_user,
     set_connected_account,
 )
 from user_data import (
@@ -367,7 +369,7 @@ def get_setup_steps(user_id: int, state: dict, groups: list[str]) -> dict:
     return {
         "account": get_account(user_id) is not None,
         "posts": len(state.get("campaign", {}).get("posts", [])) > 0,
-        "groups": len(get_active_selected_groups_from(state, groups)) > 0,
+        "groups": len(groups) > 0,
         "schedule": any(
             v.get("time")
             for v in state.get("weekly_schedule", {}).values()
@@ -1107,10 +1109,7 @@ async def _readiness_check_connected_account(user_id: int) -> tuple[bool, str, o
     if not api_id or not api_hash:
         return False, "not_connected", None, ""
 
-    from telethon import TelegramClient
-
-    session_file = session_file_for_user(user_id)
-    client = TelegramClient(str(session_file), api_id, api_hash)
+    client = make_client_from_string_session(api_id, api_hash, get_session_string(user_id))
     try:
         await client.connect()
         if not await client.is_user_authorized():
@@ -1395,9 +1394,12 @@ async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
     await query.message.answer(
-        "🪪 <b>Подключение по API — шаг 1 из 3</b>\n\n"
-        "Отправьте ваш <b>App api_id</b> — это <b>число</b> из поля на сайте.\n\n"
-        "Пример: <code>12345678</code>",
+        "🪪 <b>Подключение по API</b>\n\n"
+        "Отправьте <b>App api_id</b> и <b>App api_hash</b> вместе в одном сообщении.\n\n"
+        "<b>Вариант 1 (через запятую):</b>\n"
+        "<code>30705626, 0123456789abcdef0123456789abcdef</code>\n\n"
+        "<b>Вариант 2 (на двух строках):</b>\n"
+        "<code>30705626\n0123456789abcdef0123456789abcdef</code>",
         parse_mode="HTML",
         reply_markup=account_cancel_keyboard(),
     )
@@ -1492,15 +1494,6 @@ async def account_disconnect(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(user_id)
     existed = disconnect_account(user_id)
 
-    base = session_file_for_user(user_id)
-    for suffix in (".session", ".session-journal"):
-        p = Path(str(base) + suffix)
-        try:
-            if p.exists() and p.is_file():
-                p.unlink()
-        except Exception:
-            pass
-
     await state.set_state(MainMenu.viewing)
     await _safe_edit_text(
         query.message,
@@ -1523,11 +1516,8 @@ async def account_check(query: CallbackQuery):
         await query.answer("Нет api_id/api_hash для проверки. Переподключите аккаунт.", show_alert=True)
         return
 
-    session_file = session_file_for_user(query.from_user.id)
     try:
-        from telethon import TelegramClient
-
-        client = TelegramClient(str(session_file), api_id, api_hash)
+        client = make_client_from_string_session(api_id, api_hash, get_session_string(query.from_user.id))
         await client.connect()
         me = await client.get_me()
         await client.disconnect()
@@ -1539,28 +1529,55 @@ async def account_check(query: CallbackQuery):
 
 @dp.message(MainMenu.connecting_account_api)
 async def account_connect_api_id_input(message: Message, state: FSMContext):
-    """Шаг 1: получаем api_id."""
+    """Получаем api_id и api_hash в одном сообщении."""
     raw = (message.text or "").strip()
-    try:
-        api_id = int(raw)
-        if api_id <= 0:
-            raise ValueError
-    except ValueError:
+
+    # Попытка 1: разделитель запятая
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",", 1)]
+    # Попытка 2: разделитель новая строка
+    elif "\n" in raw:
+        parts = [p.strip() for p in raw.split("\n", 1)]
+    else:
+        parts = []
+
+    # Валидация
+    error_msg = None
+    if len(parts) != 2:
+        error_msg = "❌ Нужны два значения: api_id и api_hash.\n\n"
+    else:
+        api_id_str, api_hash = parts
+        try:
+            api_id = int(api_id_str)
+            if api_id <= 0:
+                raise ValueError
+        except ValueError:
+            error_msg = "❌ <b>api_id</b> должно быть положительным числом.\n\n"
+
+        if not error_msg and (len(api_hash) < 10 or " " in api_hash):
+            error_msg = "❌ <b>api_hash</b> — строка без пробелов, минимум 10 символов.\n\n"
+
+    if error_msg:
         await message.answer(
-            "❌ <b>api_id</b> — это число. Скопируйте его точно из поля <b>App api_id</b> на сайте.\n\n"
-            "Пример: <code>12345678</code>",
+            error_msg +
+            "<b>Вариант 1 (через запятую):</b>\n"
+            "<code>30705626, 0123456789abcdef0123456789abcdef</code>\n\n"
+            "<b>Вариант 2 (на двух строках):</b>\n"
+            "<code>30705626\n0123456789abcdef0123456789abcdef</code>",
             parse_mode="HTML",
             reply_markup=account_cancel_keyboard(),
         )
         return
-    await state.update_data(api_id=api_id)
-    await state.set_state(MainMenu.connecting_account_api_hash)
+
+    # Успех: сохраняем оба значения и переходим к вводу телефона
+    await state.update_data(api_id=api_id, api_hash=api_hash)
+    await state.set_state(MainMenu.connecting_account_api_phone)
     await message.answer(
-        "✅ api_id принят.\n\n"
-        "🪪 <b>Шаг 2 из 3 — App api_hash</b>\n\n"
-        "Скопируйте строку из поля <b>App api_hash</b> на сайте и отправьте её сюда.\n"
-        "Это длинная строка из букв и цифр (32 символа).\n\n"
-        "Пример:\n<code>0123456789abcdef0123456789abcdef</code>",
+        "✅ api_id и api_hash приняты.\n\n"
+        "📱 <b>Номер телефона</b>\n\n"
+        "Введите номер телефона того аккаунта, который подключаете.\n"
+        "Формат: международный, с <b>+</b> в начале.\n\n"
+        "Пример: <code>+34604288463</code> или <code>+79990001122</code>",
         parse_mode="HTML",
         reply_markup=account_cancel_keyboard(),
     )
@@ -1622,11 +1639,9 @@ async def _start_phone_login(message: Message, state: FSMContext, *, api_id: int
         await message.answer("❌ Не настроены api_id/api_hash для подключения.", reply_markup=account_cancel_keyboard())
         return
 
-    from telethon import TelegramClient
     import telethon.errors
 
-    session_file = session_file_for_user(user_id)
-    client = TelegramClient(str(session_file), api_id, api_hash)
+    client = make_client_from_string_session(api_id, api_hash)
     try:
         await client.connect()
         await client.send_code_request(phone)
@@ -1647,7 +1662,7 @@ async def _start_phone_login(message: Message, state: FSMContext, *, api_id: int
         await message.answer(f"❌ Ошибка отправки кода: {type(exc).__name__}", reply_markup=account_cancel_keyboard())
         return
 
-    pending = new_pending_login(method="phone", api_id=api_id, api_hash=api_hash, phone=phone, client=client, session_file=session_file)
+    pending = new_pending_login(method="phone", api_id=api_id, api_hash=api_hash, phone=phone, client=client)
     pending_logins[user_id] = pending
     await state.set_state(MainMenu.connecting_account_code)
     await message.answer(
@@ -1747,6 +1762,8 @@ async def _finalize_account_login(message: Message, state: FSMContext, *, user_i
     except Exception:
         me = None
 
+    session_string = extract_session_string(pending.client)
+
     set_connected_account(
         user_id=user_id,
         phone=phone,
@@ -1755,6 +1772,7 @@ async def _finalize_account_login(message: Message, state: FSMContext, *, user_i
         me_id=getattr(me, "id", None) if me else None,
         username=getattr(me, "username", None) if me else None,
         first_name=getattr(me, "first_name", None) if me else None,
+        session_string=session_string,
     )
 
     await _cleanup_pending_login(user_id)
@@ -1803,6 +1821,8 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
     try:
         me = await pending.client.get_me()
         # Успешно получили — авторизован, финализируем
+        session_string = extract_session_string(pending.client)
+
         set_connected_account(
             user_id=user_id,
             phone="",
@@ -1811,6 +1831,7 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
             me_id=getattr(me, "id", None) if me else None,
             username=getattr(me, "username", None) if me else None,
             first_name=getattr(me, "first_name", None) if me else None,
+            session_string=session_string,
         )
 
         pending_logins.pop(user_id, None)
@@ -1847,6 +1868,8 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
                 except Exception:
                     pass
 
+                session_string = extract_session_string(pending.client)
+
                 set_connected_account(
                     user_id=user_id,
                     phone="",
@@ -1855,6 +1878,7 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
                     me_id=getattr(me, "id", None) if me else None,
                     username=getattr(me, "username", None) if me else None,
                     first_name=getattr(me, "first_name", None) if me else None,
+                    session_string=session_string,
                 )
 
                 pending_logins.pop(user_id, None)
@@ -1934,11 +1958,8 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
         await query.answer("Не настроены TG_API_ID/TG_API_HASH.", show_alert=True)
         return
 
-    from telethon import TelegramClient
-
     user_id = query.from_user.id
-    session_file = session_file_for_user(user_id)
-    client = TelegramClient(str(session_file), api_id, api_hash)
+    client = make_client_from_string_session(api_id, api_hash)
     try:
         await client.connect()
         qr_login = await client.qr_login()
@@ -1947,7 +1968,7 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
         await query.answer(f"Не удалось создать QR: {type(exc).__name__}", show_alert=True)
         return
 
-    pending = new_pending_login(method="qr", api_id=api_id, api_hash=api_hash, phone="", client=client, session_file=session_file)
+    pending = new_pending_login(method="qr", api_id=api_id, api_hash=api_hash, phone="", client=client)
     pending.qr_login = qr_login
     pending_logins[user_id] = pending
 
@@ -2591,7 +2612,11 @@ async def broadcast_test_v2(query: CallbackQuery):
         await query.answer("⚠️ Шаг 2: Добавьте хотя бы один пост в пул (кнопка «🗂 Посты»)", show_alert=True)
         return
     if not steps["groups"]:
-        await query.answer("⚠️ Шаг 3: Добавьте и выберите группы рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        await query.answer("⚠️ Шаг 3: Добавьте хотя бы одну группу рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        return
+    active_groups = get_active_selected_groups(state, groups_all)
+    if not active_groups:
+        await query.answer("⚠️ Выберите хотя бы одну группу для отправки", show_alert=True)
         return
     if not steps["schedule"]:
         await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
