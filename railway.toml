@@ -3,3 +3,7 @@ builder = "NIXPACKS"
 
 [deploy]
 startCommand = "python -m bot.main"
+
+[[volumes]]
+mountPath = "/data"
+name = "bot-data"

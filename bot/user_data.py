@@ -1,13 +1,18 @@
 import json
+import os
 import re
 from pathlib import Path
 
 
-USER_DATA_DIR = Path(__file__).parent / "user_data"
+def _user_data_dir() -> Path:
+    raw = (os.getenv("USER_DATA_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path(__file__).parent / "user_data").resolve()
 
 
 def user_dir(user_id: int) -> Path:
-    return USER_DATA_DIR / str(int(user_id))
+    return _user_data_dir() / str(int(user_id))
 
 
 def user_broadcast_state_path(user_id: int) -> Path:
@@ -19,10 +24,11 @@ def user_broadcast_groups_path(user_id: int) -> Path:
 
 
 def list_user_ids_from_disk() -> list[int]:
-    if not USER_DATA_DIR.exists():
+    d = _user_data_dir()
+    if not d.exists():
         return []
     out: list[int] = []
-    for p in USER_DATA_DIR.iterdir():
+    for p in d.iterdir():
         if p.is_dir() and p.name.isdigit():
             try:
                 out.append(int(p.name))
