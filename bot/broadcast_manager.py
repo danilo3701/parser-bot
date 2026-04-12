@@ -23,7 +23,6 @@ class BroadcastManager:
             },
             "campaign": {
                 "send_mode": "user",
-                "send_account": "",
                 "send_as_channel": "",
                 # Back-compat: older flows used a single source post reference.
                 "source_channel": "",
@@ -63,7 +62,6 @@ class BroadcastManager:
         state.setdefault("send_as_channels", [])
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
-        state["campaign"].setdefault("send_account", "")
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
 
         # Back-compat migration: if old source post is set and posts pool is empty, seed it.
@@ -137,13 +135,6 @@ class BroadcastManager:
     def set_send_as_channel(self, channel: str) -> dict:
         state = self.load()
         state["campaign"]["send_as_channel"] = channel
-        self.reset_test_flag_in_state(state)
-        self.save(state)
-        return state
-
-    def set_send_account(self, account: str | None) -> dict:
-        state = self.load()
-        state["campaign"]["send_account"] = account or ""
         self.reset_test_flag_in_state(state)
         self.save(state)
         return state

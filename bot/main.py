@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
@@ -47,7 +47,7 @@ from scanner import scan_groups_history, monitor_groups_realtime
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
-from broadcast_sender import send_broadcast_campaign, send_broadcast_campaign_with_client, verify_broadcast_messages
+from broadcast_sender import send_broadcast_campaign_with_client
 from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
@@ -85,36 +85,6 @@ OWNER_IDS = {
     for item in OWNER_IDS_ENV.split(",")
     if item.strip().isdigit()
 }
-TG_ACCOUNTS_RAW = os.getenv("TG_ACCOUNTS", "")
-def parse_broadcast_accounts(raw: str) -> dict[str, dict]:
-    accounts = {}
-    if not raw:
-        return accounts
-    for chunk in re.split(r"[,\n;]+", raw):
-        item = chunk.strip()
-        if not item:
-            continue
-        parts = item.split(":")
-        if len(parts) < 4:
-            continue
-        alias, api_id, api_hash, phone, *rest = parts
-        alias = alias.strip()
-        if not re.match(r"^[A-Za-z0-9_]{2,32}$", alias):
-            continue
-        try:
-            api_id_int = int(api_id)
-        except ValueError:
-            continue
-        password = rest[0].strip() if rest else None
-        accounts[alias] = {
-            "api_id": api_id_int,
-            "api_hash": api_hash.strip(),
-            "phone": phone.strip(),
-            "password": password or None,
-        }
-    return accounts
-
-BROADCAST_ACCOUNTS = parse_broadcast_accounts(TG_ACCOUNTS_RAW)
 SESSION_PATH = Path(os.getenv("TG_SESSION_PATH", Path(__file__).parent.parent / "parser" / "tutor_bot_scan.session")).resolve()
 
 # Для пула постов: куда бот копирует присланные сообщения, чтобы Telethon мог их переотправлять.
@@ -235,7 +205,9 @@ class MainMenu(StatesGroup):
     connecting_account_phone = State()
     connecting_account_code = State()
     connecting_account_password = State()
-    connecting_account_api = State()
+    connecting_account_api = State()        # ввод api_id (шаг 1)
+    connecting_account_api_hash = State()   # ввод api_hash (шаг 2)
+    connecting_account_api_phone = State()  # ввод телефона (шаг 3)
 
 
 # ─── Хелперы для клавиатур ───────────────────────────────────────────────────
@@ -423,7 +395,6 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None) -> str:
     campaign = state.get("campaign", {})
     schedule = state.get("broadcast_schedule", {})
     send_mode = campaign.get("send_mode", "user")
-    account = campaign.get("send_account") or ""
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     rotation_index = int(campaign.get("rotation_index") or 0) if posts else 0
     selected_groups = campaign.get("selected_groups", [])
@@ -480,12 +451,9 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
-    selected_account = campaign.get("send_account", "") or "не выбран"
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
 
     rows = []
-    if BROADCAST_ACCOUNTS and is_owner(user_id):
-        rows.append([InlineKeyboardButton(text=f"👤 Аккаунт: {selected_account}", callback_data="bc_accounts")])
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
@@ -521,22 +489,6 @@ def broadcast_channels_keyboard(state: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑 Удалить выбранный", callback_data="bc_del_selected_channel")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def broadcast_accounts_keyboard(state: dict) -> InlineKeyboardMarkup:
-    selected = state.get("campaign", {}).get("send_account", "")
-    if not BROADCAST_ACCOUNTS:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Аккаунты не заданы в TG_ACCOUNTS", callback_data="broadcast")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
-        ])
-    buttons = []
-    for alias in sorted(BROADCAST_ACCOUNTS.keys()):
-        mark = "✅" if alias == selected else "▫️"
-        buttons.append([InlineKeyboardButton(text=f"{mark} {alias}", callback_data=f"bc_acc_{alias}")])
-    buttons.append([InlineKeyboardButton(text="🚫 Сбросить выбор", callback_data="bc_acc_clear")])
-    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1305,19 +1257,44 @@ async def account_connect_phone_prompt(query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "acc_api")
 async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(query.from_user.id)
-    await query.message.edit_text(
-        "🪪 <b>Подключение по API ID / API Hash</b>\n\n"
-        "Этот режим для тех, у кого есть своё приложение Telegram (my.telegram.org).\n"
-        "Отправьте одним сообщением:\n"
-        "<code>api_id api_hash +79990001122</code>\n\n"
-        "Пример:\n"
-        "<code>123456 0123456789abcdef0123456789abcdef +79990001122</code>",
+    await query.answer()
+
+    assets = Path(__file__).parent / "assets"
+
+    await query.message.answer_photo(
+        FSInputFile(assets / "Captura de pantalla 2026-04-12 221400.png"),
+        caption=(
+            "🌐 <b>Шаг 1.</b> Откройте <b>my.telegram.org</b> в браузере.\n\n"
+            "Введите ваш номер телефона в международном формате и нажмите <b>Next</b>.\n\n"
+            "Вам придёт код в Telegram — введите его на сайте."
+        ),
+        parse_mode="HTML",
+    )
+    await query.message.answer_photo(
+        FSInputFile(assets / "Captura de pantalla 2026-04-12 221723.png"),
+        caption=(
+            "📨 <b>Шаг 2.</b> Вам придёт вот такое сообщение от <b>Telegram</b> с кодом.\n\n"
+            "Введите этот код на сайте my.telegram.org, чтобы войти."
+        ),
+        parse_mode="HTML",
+    )
+    await query.message.answer_photo(
+        FSInputFile(assets / "Captura de pantalla 2026-04-12 221839.png"),
+        caption=(
+            "🔑 <b>Шаг 3.</b> После входа нажмите <b>API development tools</b>.\n\n"
+            "Вы увидите вашу <b>App api_id</b> (число) и <b>App api_hash</b> (длинная строка).\n"
+            "Именно их нужно скопировать и прислать мне по очереди — как показано на скриншоте."
+        ),
+        parse_mode="HTML",
+    )
+    await query.message.answer(
+        "🪪 <b>Подключение по API — шаг 1 из 3</b>\n\n"
+        "Отправьте ваш <b>App api_id</b> — это <b>число</b> из поля на сайте.\n\n"
+        "Пример: <code>12345678</code>",
         parse_mode="HTML",
         reply_markup=account_cancel_keyboard(),
-        disable_web_page_preview=True,
     )
     await state.set_state(MainMenu.connecting_account_api)
-    await query.answer()
 
 
 @dp.callback_query(F.data == "acc_qr")
@@ -1334,8 +1311,6 @@ async def account_connect_qr_refresh(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "acc_qr_check")
 async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
-    import telethon.errors
-
     user_id = query.from_user.id
     pending = pending_logins.get(user_id)
     if not pending or pending.method != "qr" or not pending.qr_login:
@@ -1352,22 +1327,31 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
     except asyncio.TimeoutError:
         await query.answer("Ещё не подтверждено. Отсканируйте QR и нажмите снова.", show_alert=True)
         return
-    except telethon.errors.SessionPasswordNeededError:
-        await state.set_state(MainMenu.connecting_account_password)
-        await query.answer()
-        await _safe_edit_text(
-            query.message,
-            "🔐 QR отсканирован, но включена 2FA.\nВведите пароль:",
-            reply_markup=account_cancel_keyboard(),
-        )
-        return
     except Exception as exc:
         await _cleanup_pending_login(user_id)
         await query.answer(f"Ошибка QR: {type(exc).__name__}", show_alert=True)
         return
 
-    await _finalize_account_login(query.message, state, user_id=user_id, phone="")
-    await query.answer("OK")
+    # Проверяем авторизацию после сканирования
+    try:
+        if await pending.client.is_user_authorized():
+            # Уже авторизован — финализируем
+            await _finalize_account_login(query.message, state, user_id=user_id, phone="")
+            await query.answer("✅ QR отсканирован и авторизован!")
+        else:
+            # Требуется пароль
+            await state.set_state(MainMenu.connecting_account_password)
+            await query.answer()
+            await _safe_edit_text(
+                query.message,
+                "🔐 <b>QR отсканирован!</b>\n\n"
+                "Но этот аккаунт защищен паролем 2FA.\n\n"
+                "Введите пароль (не код, а именно пароль):",
+                reply_markup=account_cancel_keyboard(),
+            )
+    except Exception as exc:
+        await _cleanup_pending_login(user_id)
+        await query.answer(f"Ошибка при проверке: {type(exc).__name__}", show_alert=True)
 
 
 @dp.callback_query(F.data == "acc_disconnect")
@@ -1422,19 +1406,67 @@ async def account_check(query: CallbackQuery):
 
 
 @dp.message(MainMenu.connecting_account_api)
-async def account_connect_api_input(message: Message, state: FSMContext):
+async def account_connect_api_id_input(message: Message, state: FSMContext):
+    """Шаг 1: получаем api_id."""
     raw = (message.text or "").strip()
-    parts = raw.split()
-    if len(parts) != 3:
-        await message.answer("❌ Формат: <code>api_id api_hash +phone</code>", parse_mode="HTML", reply_markup=account_cancel_keyboard())
-        return
     try:
-        api_id = int(parts[0])
-    except Exception:
-        await message.answer("❌ api_id должен быть числом.", reply_markup=account_cancel_keyboard())
+        api_id = int(raw)
+        if api_id <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            "❌ <b>api_id</b> — это число. Скопируйте его точно из поля <b>App api_id</b> на сайте.\n\n"
+            "Пример: <code>12345678</code>",
+            parse_mode="HTML",
+            reply_markup=account_cancel_keyboard(),
+        )
         return
-    api_hash = parts[1].strip()
-    phone = parts[2].strip()
+    await state.update_data(api_id=api_id)
+    await state.set_state(MainMenu.connecting_account_api_hash)
+    await message.answer(
+        "✅ api_id принят.\n\n"
+        "🪪 <b>Шаг 2 из 3 — App api_hash</b>\n\n"
+        "Скопируйте строку из поля <b>App api_hash</b> на сайте и отправьте её сюда.\n"
+        "Это длинная строка из букв и цифр (32 символа).\n\n"
+        "Пример:\n<code>0123456789abcdef0123456789abcdef</code>",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+    )
+
+
+@dp.message(MainMenu.connecting_account_api_hash)
+async def account_connect_api_hash_input(message: Message, state: FSMContext):
+    """Шаг 2: получаем api_hash."""
+    raw = (message.text or "").strip()
+    if len(raw) < 10 or " " in raw:
+        await message.answer(
+            "❌ <b>api_hash</b> — длинная строка без пробелов.\n\n"
+            "Скопируйте точно из поля <b>App api_hash</b> на сайте.\n"
+            "Пример: <code>0123456789abcdef0123456789abcdef</code>",
+            parse_mode="HTML",
+            reply_markup=account_cancel_keyboard(),
+        )
+        return
+    await state.update_data(api_hash=raw)
+    await state.set_state(MainMenu.connecting_account_api_phone)
+    await message.answer(
+        "✅ api_hash принят.\n\n"
+        "📱 <b>Шаг 3 из 3 — Номер телефона</b>\n\n"
+        "Введите номер телефона того аккаунта, который подключаете.\n"
+        "Формат: международный, с <b>+</b> в начале.\n\n"
+        "Пример: <code>+34604288463</code> или <code>+79990001122</code>",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+    )
+
+
+@dp.message(MainMenu.connecting_account_api_phone)
+async def account_connect_api_phone_input(message: Message, state: FSMContext):
+    """Шаг 3: получаем телефон, запускаем вход."""
+    phone = (message.text or "").strip()
+    data = await state.get_data()
+    api_id = data.get("api_id", 0)
+    api_hash = data.get("api_hash", "")
     await _start_phone_login(message, state, api_id=api_id, api_hash=api_hash, phone=phone)
 
 
@@ -1627,66 +1659,81 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
             pass
         return
 
-    except telethon.errors.SessionPasswordNeededError:
-        # 2FA — keep pending alive so password handler can call sign_in(password=...)
-        key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
-        ctx = FSMContext(storage=dp.storage, key=key)
-        await ctx.set_state(MainMenu.connecting_account_password)
-        try:
-            await bot.delete_message(chat_id, qr_message_id)
-        except Exception:
-            pass
-        await bot.send_message(
-            chat_id,
-            "🔐 QR отсканирован, но включена 2FA.\nВведите пароль:",
-            reply_markup=account_cancel_keyboard(),
-        )
-        return
-
     except Exception:
         return
 
-    # QR scanned successfully, no 2FA — finalize
+    # QR scanned — проверяем требует ли пароль
     pending = pending_logins.get(user_id)
     if not pending:
         return
 
-    me = None
     try:
-        me = await pending.client.get_me()
-    except Exception:
-        pass
+        # Проверяем, требуется ли 2FA пароль
+        if await pending.client.is_user_authorized():
+            # Уже авторизован — финализируем
+            me = None
+            try:
+                me = await pending.client.get_me()
+            except Exception:
+                pass
 
-    set_connected_account(
-        user_id=user_id,
-        phone="",
-        api_id=pending.api_id,
-        api_hash=pending.api_hash,
-        me_id=getattr(me, "id", None) if me else None,
-        username=getattr(me, "username", None) if me else None,
-        first_name=getattr(me, "first_name", None) if me else None,
-    )
+            set_connected_account(
+                user_id=user_id,
+                phone="",
+                api_id=pending.api_id,
+                api_hash=pending.api_hash,
+                me_id=getattr(me, "id", None) if me else None,
+                username=getattr(me, "username", None) if me else None,
+                first_name=getattr(me, "first_name", None) if me else None,
+            )
 
-    pending_logins.pop(user_id, None)
-    try:
-        await pending.client.disconnect()
-    except Exception:
-        pass
+            pending_logins.pop(user_id, None)
+            try:
+                await pending.client.disconnect()
+            except Exception:
+                pass
 
-    key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
-    ctx = FSMContext(storage=dp.storage, key=key)
-    await ctx.set_state(MainMenu.viewing)
+            key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+            ctx = FSMContext(storage=dp.storage, key=key)
+            await ctx.set_state(MainMenu.viewing)
 
-    try:
-        await bot.delete_message(chat_id, qr_message_id)
-    except Exception:
-        pass
+            try:
+                await bot.delete_message(chat_id, qr_message_id)
+            except Exception:
+                pass
 
-    await bot.send_message(
-        chat_id,
-        "✅ Аккаунт подключен!",
-        reply_markup=account_menu_keyboard(user_id),
-    )
+            await bot.send_message(
+                chat_id,
+                "✅ Аккаунт подключен!",
+                reply_markup=account_menu_keyboard(user_id),
+            )
+        else:
+            # Требуется пароль 2FA
+            key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+            ctx = FSMContext(storage=dp.storage, key=key)
+            await ctx.set_state(MainMenu.connecting_account_password)
+            try:
+                await bot.delete_message(chat_id, qr_message_id)
+            except Exception:
+                pass
+            await bot.send_message(
+                chat_id,
+                "🔐 <b>QR отсканирован!</b>\n\n"
+                "Но этот аккаунт защищен паролем 2FA.\n\n"
+                "Введите пароль (не код, а именно пароль):",
+                parse_mode="HTML",
+                reply_markup=account_cancel_keyboard(),
+            )
+    except Exception as exc:
+        pending_logins.pop(user_id, None)
+        try:
+            await bot.send_message(
+                chat_id,
+                f"❌ Ошибка при QR: {type(exc).__name__}",
+                reply_markup=account_menu_keyboard(user_id),
+            )
+        except Exception:
+            pass
 
 
 async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: bool) -> None:
@@ -1748,24 +1795,6 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
         _qr_auto_watch(user_id, query.message.chat.id, sent.message_id)
     )
     await query.answer("QR готов" if not refresh else "QR обновлён")
-
-
-@dp.callback_query(F.data == "bc_accounts")
-async def broadcast_accounts(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
-    state = broadcast_manager.load()
-    if not BROADCAST_ACCOUNTS:
-        await query.answer("TG_ACCOUNTS не задано.", show_alert=True)
-        return
-    await query.message.edit_text(
-        "👤 <b>Аккаунты отправки</b>\n\n"
-        "Список берётся из переменной <code>TG_ACCOUNTS</code> в .env. "
-        "Выберите аккаунт, от имени которого идти рассылка.",
-        parse_mode="HTML",
-        reply_markup=broadcast_accounts_keyboard(state),
-    )
-    await query.answer()
 
 
 @dp.callback_query(F.data == "bc_channels")
@@ -1849,32 +1878,6 @@ async def broadcast_delete_selected_channel(query: CallbackQuery):
         reply_markup=broadcast_channels_keyboard(state),
     )
     await query.answer()
-
-
-@dp.callback_query(F.data == "bc_acc_clear")
-async def broadcast_account_clear(query: CallbackQuery):
-    state = broadcast_manager.set_send_account("")
-    await query.message.edit_text(
-        "👤 <b>Аккаунты отправки</b>\n\nВыбор сброшен.",
-        parse_mode="HTML",
-        reply_markup=broadcast_accounts_keyboard(state),
-    )
-    await query.answer("Сброшено")
-
-
-@dp.callback_query(F.data.startswith("bc_acc_"))
-async def broadcast_account_set(query: CallbackQuery):
-    alias = query.data[len("bc_acc_"):]
-    if alias not in BROADCAST_ACCOUNTS:
-        await query.answer("Аккаунт не найден в TG_ACCOUNTS.", show_alert=True)
-        return
-    state = broadcast_manager.set_send_account(alias)
-    await query.message.edit_text(
-        "👤 <b>Аккаунты отправки</b>\n\nАктивный аккаунт обновлён.",
-        parse_mode="HTML",
-        reply_markup=broadcast_accounts_keyboard(state),
-    )
-    await query.answer("Выбрано")
 
 
 @dp.callback_query(F.data == "bc_source")
@@ -2374,43 +2377,6 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
         reply_markup=broadcast_day_keyboard(data, source),
     )
     await query.answer("Скопировано")
-
-
-@dp.callback_query(F.data == "bc_test_legacy")
-async def broadcast_test(query: CallbackQuery):
-    if broadcast_lock.locked():
-        await query.answer("Рассылка уже выполняется.", show_alert=True)
-        return
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
-    groups_all = scoped_load_broadcast_groups(user_id)
-    state = bm.ensure_groups_known(groups_all)
-    ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
-    if not ready:
-        await query.answer(reason, show_alert=True)
-        return
-    test_groups = get_active_selected_groups(state, groups_all)
-
-    await query.message.edit_text(
-        f"🧪 <b>Тест-рассылка</b>\n\nГрупп: <code>{len(test_groups)}</code>\nВыполняю отправку...",
-        parse_mode="HTML",
-    )
-    async with broadcast_lock:
-        result = await execute_broadcast(user_id, test_groups, advance_rotation=False)
-    for group, err in result.get("blocked_groups", {}).items():
-        bm.set_group_blocked(group, err)
-
-    if result.get("sent_count", 0) > 0:
-        bm.mark_test_passed()
-    else:
-        bm.reset_test_flag()
-    state = bm.load()
-    await query.message.edit_text(
-        f"🧪 <b>Тест завершён</b>\n\n{result.get('summary', '')}",
-        parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
-    )
-    await query.answer()
 
 
 @dp.callback_query(F.data == "bc_test")
