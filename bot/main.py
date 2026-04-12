@@ -47,6 +47,7 @@ from scanner import scan_groups_history, monitor_groups_realtime
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
+from balance_manager import BalanceManager
 from broadcast_sender import send_broadcast_campaign_with_client
 from mtproto_accounts import (
     PendingLogin,
@@ -392,6 +393,18 @@ def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
     )
 
 
+def scoped_balance_manager(user_id: int) -> BalanceManager:
+    """
+    Owner uses global balance_state.json; regular users have isolated state under bot/user_data/<user_id>/.
+    """
+    path_bot_dir = Path(__file__).parent
+    if is_owner(user_id):
+        path = path_bot_dir / "balance_state.json"
+    else:
+        path = path_bot_dir / "user_data" / str(user_id) / "balance_state.json"
+    return BalanceManager(path)
+
+
 def scoped_load_broadcast_groups(user_id: int) -> list[str]:
     return load_groups() if is_owner(user_id) else load_user_broadcast_groups(user_id)
 
@@ -508,7 +521,14 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     schedule_enabled = state.get("broadcast_schedule", {}).get("enabled", True)
 
+    # Get balance
+    bm = scoped_balance_manager(user_id)
+    balance = bm.get_balance()
+
     rows = []
+    # Add balance button at the top
+    rows.append([InlineKeyboardButton(text=f"💰 Баланс: {balance} постов", callback_data="bc_balance")])
+
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
@@ -686,6 +706,72 @@ def broadcast_copy_target_keyboard(source_weekday: str) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=days[6][0], callback_data=days[6][1])])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"bcs_day_{source_weekday}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_balance_text(balance: int) -> str:
+    """Format balance display with tariff options."""
+    return (
+        f"💰 <b>Баланс постов: {balance}</b>\n\n"
+        "Выберите тариф и пополните баланс:\n\n"
+        "<b>🟢 Пробный:</b> 80 постов / €5 (€0.0625/пост)\n"
+        "<b>🔵 Стартовый:</b> 250 постов / €12 (€0.048/пост, -23% 📉)\n"
+        "<b>🔥 Оптимальный:</b> 600 постов / €20 (€0.0333/пост, -47% 📉) — <b>Популярный!</b>\n"
+        "<b>💎 Оптовый:</b> 1500 постов / €40 (€0.0267/пост, -57% 📉)\n\n"
+        "Платите только за успешные публикации."
+    )
+
+
+def broadcast_balance_keyboard() -> InlineKeyboardMarkup:
+    """Balance menu with tariff purchase buttons."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="🔥 €20 (600)", callback_data="bc_buy_optimal"),
+            InlineKeyboardButton(text="💎 €40 (1500)", callback_data="bc_buy_wholesale"),
+        ],
+        [
+            InlineKeyboardButton(text="🔵 €12 (250)", callback_data="bc_buy_starter"),
+            InlineKeyboardButton(text="🟢 €5 (80)", callback_data="bc_buy_trial"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def broadcast_test_result_text(test_result: dict, working_groups: list, failed_groups: dict) -> str:
+    """Format test broadcast result."""
+    working_count = len(working_groups)
+    failed_count = len(failed_groups)
+
+    text = "🧪 <b>Результат тестовой рассылки</b>\n\n"
+
+    if working_count > 0:
+        text += f"✅ <b>Группы, где работает ({working_count}):</b>\n"
+        # Show up to 10 groups
+        for group in working_groups[:10]:
+            text += f"  • @{group}\n"
+        if working_count > 10:
+            text += f"  • ... и ещё {working_count - 10}\n"
+
+    if failed_count > 0:
+        text += f"\n❌ <b>Группы, где не работает ({failed_count}):</b>\n"
+        for group, reason in list(failed_groups.items())[:10]:
+            reason_emoji = "🚫" if reason == "blocked" else "⚠️"
+            text += f"  {reason_emoji} @{group} ({reason})\n"
+        if failed_count > 10:
+            text += f"  • ... и ещё {failed_count - 10}\n"
+
+    return text
+
+
+def broadcast_test_result_keyboard() -> InlineKeyboardMarkup:
+    """Buttons after test: disable failed, add more groups, proceed to mass broadcast."""
+    buttons = [
+        [InlineKeyboardButton(text="🚫 Отключить нерабочие", callback_data="bc_test_disable_failed")],
+        [InlineKeyboardButton(text="➕ Добавить группы", callback_data="bc_groups")],
+        [InlineKeyboardButton(text="📢 Массовая рассылка", callback_data="bc_mass")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 BROADCAST_GROUPS_PER_PAGE = 6
@@ -917,7 +1003,16 @@ async def scheduler_loop():
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(MainMenu.viewing)
-    bm_state = scoped_broadcast_manager(message.from_user.id).load()
+    user_id = message.from_user.id
+
+    # Initialize balance on first start
+    balance_mgr = scoped_balance_manager(user_id)
+    current_balance = balance_mgr.get_balance()
+    if current_balance == 0:
+        # First time user: give 30 free posts
+        balance_mgr.reset_to_free_tier()
+
+    bm_state = scoped_broadcast_manager(user_id).load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
@@ -1367,35 +1462,12 @@ async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
 
     assets = Path(__file__).parent / "assets"
 
-    await query.message.answer_photo(
-        FSInputFile(assets / "Captura de pantalla 2026-04-12 221400.png"),
-        caption=(
-            "🌐 <b>Шаг 1.</b> Откройте <b>my.telegram.org</b> в браузере.\n\n"
-            "Введите ваш номер телефона в международном формате и нажмите <b>Next</b>.\n\n"
-            "Вам придёт код в Telegram — введите его на сайте."
-        ),
-        parse_mode="HTML",
-    )
-    await query.message.answer_photo(
-        FSInputFile(assets / "Captura de pantalla 2026-04-12 221723.png"),
-        caption=(
-            "📨 <b>Шаг 2.</b> Вам придёт вот такое сообщение от <b>Telegram</b> с кодом.\n\n"
-            "Введите этот код на сайте my.telegram.org, чтобы войти."
-        ),
-        parse_mode="HTML",
-    )
-    await query.message.answer_photo(
-        FSInputFile(assets / "Captura de pantalla 2026-04-12 221839.png"),
-        caption=(
-            "🔑 <b>Шаг 3.</b> После входа нажмите <b>API development tools</b>.\n\n"
-            "Вы увидите вашу <b>App api_id</b> (число) и <b>App api_hash</b> (длинная строка).\n"
-            "Именно их нужно скопировать и прислать мне по очереди — как показано на скриншоте."
-        ),
-        parse_mode="HTML",
-    )
     await query.message.answer(
         "🪪 <b>Подключение по API</b>\n\n"
-        "Отправьте <b>App api_id</b> и <b>App api_hash</b> вместе в одном сообщении.\n\n"
+        "1. Откройте <b>my.telegram.org</b> в браузере. Введите номер телефона и нажмите <b>Next</b>. Вам придёт код в Telegram — введите его на сайте.\n\n"
+        "2. Вам придёт сообщение от <b>Telegram</b> с кодом. Введите его на сайте my.telegram.org, чтобы войти.\n\n"
+        "3. После входа нажмите <b>API development tools</b>. Вы увидите <b>App api_id</b> (число) и <b>App api_hash</b> (длинная строка).\n\n"
+        "Отправьте оба значения вместе:\n\n"
         "<b>Вариант 1 (через запятую):</b>\n"
         "<code>30705626, 0123456789abcdef0123456789abcdef</code>\n\n"
         "<b>Вариант 2 (на двух строках):</b>\n"
@@ -1403,6 +1475,26 @@ async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
         parse_mode="HTML",
         reply_markup=account_cancel_keyboard(),
     )
+
+    media_group = [
+        InputMediaPhoto(
+            media=FSInputFile(assets / "Captura de pantalla 2026-04-12 221400.png"),
+            caption="<b>Шаг 1.</b> Откройте my.telegram.org в браузере",
+            parse_mode="HTML",
+        ),
+        InputMediaPhoto(
+            media=FSInputFile(assets / "Captura de pantalla 2026-04-12 221723.png"),
+            caption="<b>Шаг 2.</b> Введите полученный код",
+            parse_mode="HTML",
+        ),
+        InputMediaPhoto(
+            media=FSInputFile(assets / "Captura de pantalla 2026-04-12 221839.png"),
+            caption="<b>Шаг 3.</b> Скопируйте App api_id и App api_hash",
+            parse_mode="HTML",
+        ),
+    ]
+    await query.message.answer_media_group(media_group)
+
     await state.set_state(MainMenu.connecting_account_api)
 
 
@@ -2552,7 +2644,7 @@ async def broadcast_schedule_day_toggle(query: CallbackQuery):
     await query.answer("Обновлено")
 
 
-@dp.callback_query(F.data.startswith("bcs_copy_"))
+@dp.callback_query(F.data.startswith("bcs_copy_") & ~F.data.startswith("bcs_copy_to_"))
 async def broadcast_schedule_copy_start(query: CallbackQuery, state: FSMContext):
     weekday = query.data[len("bcs_copy_"):]
     if weekday not in WEEKDAYS:
@@ -2589,7 +2681,7 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
         parse_mode="HTML",
         reply_markup=broadcast_day_keyboard(data, source),
     )
-    await query.answer("Скопировано")
+    await query.answer("✅ Скопировано")
 
 
 @dp.callback_query(F.data == "bc_test")
@@ -2629,10 +2721,24 @@ async def broadcast_test_v2(query: CallbackQuery):
 
     test_groups = get_active_selected_groups(state, groups_all)
 
+    # Check balance before test
+    balance_mgr = scoped_balance_manager(user_id)
+    if not balance_mgr.check_sufficient(1):
+        await query.message.edit_text(
+            "❌ <b>Недостаточно постов!</b>\n\n"
+            f"Требуется: 1 пост для теста\n"
+            f"В наличии: {balance_mgr.get_balance()} постов\n\n"
+            "Выберите пакет и пополните баланс:",
+            parse_mode="HTML",
+            reply_markup=broadcast_balance_keyboard(),
+        )
+        await query.answer()
+        return
+
     await query.message.edit_text(
         "🧪 <b>Тест-рассылка</b>\n\n"
         f"Групп: <code>{len(test_groups)}</code>\n"
-        "Выполняю отправку…",
+        "⏳ Проверяю 60 сек...",
         parse_mode="HTML",
     )
 
@@ -2672,12 +2778,38 @@ async def broadcast_test_v2(query: CallbackQuery):
     else:
         bm.reset_test_flag()
 
+    # Build lists of working and failed groups
+    working_groups = list(sent_message_ids.keys()) if sent_message_ids else []
+    failed_groups = {}
+    for group in test_groups:
+        if group not in working_groups:
+            reason = send_errors.get(group, "unknown")
+            failed_groups[group] = reason
+
+    # Spend posts (balance deduction) for successful broadcasts
+    balance_mgr = scoped_balance_manager(user_id)
+    if result.get("sent_count", 0) > 0:
+        balance_mgr.spend_posts(
+            amount=result.get("sent_count", 0),
+            groups_count=len(test_groups),
+            sent_count=result.get("sent_count", 0),
+            summary=f"Тест-рассылка: {result.get('sent_count', 0)} групп",
+        )
+
+    # Show test result with new format
+    test_result_text = broadcast_test_result_text(result, working_groups, failed_groups)
+    new_balance = balance_mgr.get_balance()
+    full_text = (
+        test_result_text
+        + f"\n\n💰 <b>Баланс:</b> {new_balance} постов\n"
+        + f"⚠️ <b>Потрачено:</b> {result.get('sent_count', 0)} постов"
+    )
+
     updated = bm.load()
     await query.message.edit_text(
-        "🧪 <b>Тест завершён</b>\n\n"
-        f"{result.get('summary', '')}",
+        full_text,
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(updated, user_id=user_id),
+        reply_markup=broadcast_test_result_keyboard(),
         disable_web_page_preview=True,
     )
     await query.answer()
@@ -2737,18 +2869,194 @@ async def broadcast_mass(query: CallbackQuery):
         await query.answer(reason, show_alert=True)
         return
     groups = get_active_selected_groups(state, groups_all)
+
+    # Check balance before mass broadcast
+    balance_mgr = scoped_balance_manager(user_id)
+    if not balance_mgr.check_sufficient(len(groups)):
+        insufficient_text = (
+            f"❌ <b>Недостаточно постов!</b>\n\n"
+            f"Требуется: {len(groups)} постов\n"
+            f"В наличии: {balance_mgr.get_balance()} постов\n\n"
+            "Выберите пакет и пополните баланс:"
+        )
+        await query.message.edit_text(
+            insufficient_text,
+            parse_mode="HTML",
+            reply_markup=broadcast_balance_keyboard(),
+        )
+        await query.answer()
+        return
+
+    # Show confirmation with balance calculation
+    current_balance = balance_mgr.get_balance()
+    new_balance = current_balance - len(groups)
+    confirmation_text = (
+        f"📣 <b>Подтверждение рассылки</b>\n\n"
+        f"📊 Параметры:\n"
+        f"  Групп к отправке: <b>{len(groups)}</b>\n"
+        f"  Расписание: включено\n\n"
+        f"💰 Баланс постов:\n"
+        f"  Будет потрачено: {len(groups)} постов\n"
+        f"  Сейчас: {current_balance} постов\n"
+        f"  После рассылки: {new_balance} постов\n\n"
+        f"⚠️ Посты списываются только за успешные публикации.\n"
+        f"Нажмите \"Подтвердить\" для начала рассылки."
+    )
+
+    # Create confirmation keyboard with proceed and cancel buttons
+    confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="bc_confirm_mass")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")],
+    ])
+
     await query.message.edit_text(
-        f"📣 <b>Массовая рассылка</b>\n\nГрупп к отправке: <b>{len(groups)}</b>\nВыполняю...",
+        confirmation_text,
+        parse_mode="HTML",
+        reply_markup=confirm_keyboard,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_confirm_mass")
+async def broadcast_confirm_mass(query: CallbackQuery):
+    """Execute mass broadcast after confirmation."""
+    if broadcast_lock.locked():
+        await query.answer("Рассылка уже выполняется.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.load()
+    groups = get_active_selected_groups(state, groups_all)
+
+    await query.message.edit_text(
+        f"📣 <b>Массовая рассылка</b>\n\n"
+        f"Групп к отправке: <b>{len(groups)}</b>\n"
+        f"⏳ Выполняю...",
         parse_mode="HTML",
     )
+
     async with broadcast_lock:
         result = await execute_broadcast(user_id, groups, advance_rotation=True)
+
     for group, err in result.get("blocked_groups", {}).items():
         bm.set_group_blocked(group, err)
 
+    # Spend posts for successful broadcasts
+    sent_count = result.get("sent_count", 0)
+    balance_mgr = scoped_balance_manager(user_id)
+    if sent_count > 0:
+        balance_mgr.spend_posts(
+            amount=sent_count,
+            groups_count=len(groups),
+            sent_count=sent_count,
+            summary=f"Массовая рассылка: {sent_count} групп",
+        )
+
+    # Get updated balance
+    new_balance = balance_mgr.get_balance()
+
+    # Format result with balance information
+    result_text = (
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📊 <b>Результат:</b>\n"
+        f"  Групп: {len(groups)} | Отправлено: {sent_count} | Не удалось: {len(groups) - sent_count}\n\n"
+        f"💰 <b>Баланс:</b>\n"
+        f"  Потрачено: {sent_count} постов\n"
+        f"  Осталось: {new_balance} постов"
+    )
+
     state = bm.load()
     await query.message.edit_text(
-        f"📣 <b>Массовая рассылка завершена</b>\n\n{result.get('summary', '')}",
+        result_text,
+        parse_mode="HTML",
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
+    )
+    await query.answer()
+
+
+# ─── Баланс и покупки ─────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "bc_balance")
+async def broadcast_balance(query: CallbackQuery):
+    """Show balance and tariff purchase menu."""
+    user_id = query.from_user.id
+    bm = scoped_balance_manager(user_id)
+    balance = bm.get_balance()
+
+    await query.message.edit_text(
+        broadcast_balance_text(balance),
+        parse_mode="HTML",
+        reply_markup=broadcast_balance_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_buy_trial")
+async def broadcast_buy_trial(query: CallbackQuery):
+    """Pробный тариф: 80 posts / €5"""
+    await query.answer(
+        "🟢 Пробный тариф: 80 постов / €5\n\n"
+        "Переходим на Stripe...\n"
+        "(Позже подключим VIP hook для автоматической обработки платежей)",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "bc_buy_starter")
+async def broadcast_buy_starter(query: CallbackQuery):
+    """Стартовый тариф: 250 posts / €12"""
+    await query.answer(
+        "🔵 Стартовый тариф: 250 постов / €12\n\n"
+        "Переходим на Stripe...\n"
+        "(Позже подключим VIP hook для автоматической обработки платежей)",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "bc_buy_optimal")
+async def broadcast_buy_optimal(query: CallbackQuery):
+    """Оптимальный тариф: 600 posts / €20"""
+    await query.answer(
+        "🔥 Оптимальный тариф: 600 постов / €20 (самый популярный!)\n\n"
+        "Переходим на Stripe...\n"
+        "(Позже подключим VIP hook для автоматической обработки платежей)",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "bc_buy_wholesale")
+async def broadcast_buy_wholesale(query: CallbackQuery):
+    """Оптовый тариф: 1500 posts / €40"""
+    await query.answer(
+        "💎 Оптовый тариф: 1500 постов / €40\n\n"
+        "Переходим на Stripe...\n"
+        "(Позже подключим VIP hook для автоматической обработки платежей)",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "bc_test_disable_failed")
+async def broadcast_test_disable_failed(query: CallbackQuery):
+    """Disable failed groups after test."""
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups_all)
+
+    # Disable all groups with failed test status
+    groups_state = state.get("broadcast_groups_state", {})
+    disabled_count = 0
+    for group, meta in groups_state.items():
+        test_status = meta.get("last_test_status")
+        if test_status == "failed" or test_status == "deleted":
+            bm.set_group_blocked(group, f"test_{test_status}")
+            disabled_count += 1
+
+    state = bm.load()
+    await query.message.edit_text(
+        f"✅ Отключено групп: <b>{disabled_count}</b>",
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )

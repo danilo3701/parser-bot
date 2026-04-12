@@ -1,4 +1,10 @@
 {
+  "balance": {
+    "posts": 30,
+    "history": [],
+    "total_spent": 0,
+    "last_purchase": null
+  },
   "send_as_channels": [
     "@connect_services"
   ],
