@@ -93,6 +93,65 @@ def parse_broadcast_accounts(raw: str) -> dict[str, dict]:
 BROADCAST_ACCOUNTS = parse_broadcast_accounts(TG_ACCOUNTS_RAW)
 SESSION_PATH = Path(os.getenv("TG_SESSION_PATH", Path(__file__).parent.parent / "parser" / "tutor_bot_scan.session")).resolve()
 
+# Для пула постов: куда бот копирует присланные сообщения, чтобы Telethon мог их переотправлять.
+# Можно задать username канала (например, @connect_services). Если не задано, используем активный send-as канал.
+BROADCAST_STORAGE_CHANNEL = (os.getenv("BROADCAST_STORAGE_CHANNEL") or "").strip()
+
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+WEEKDAY_NAMES = {
+    "mon": "ПН",
+    "tue": "ВТ",
+    "wed": "СР",
+    "thu": "ЧТ",
+    "fri": "ПТ",
+    "sat": "СБ",
+    "sun": "ВС",
+}
+
+
+def _normalize_hhmm(raw_value: str) -> str | None:
+    value = (raw_value or "").strip().replace(".", ":")
+    m = re.match(r"^(\d{1,2}):(\d{2})$", value)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _validate_allowed_time(hhmm: str) -> tuple[bool, str]:
+    """
+    MVP rule: night is forbidden. Allow 07:00..21:59 inclusive.
+    """
+    try:
+        hh, mm = hhmm.split(":")
+        t = time(hour=int(hh), minute=int(mm))
+    except Exception:
+        return False, "❌ Неверное время. Пример: 10:00 или 10.00"
+    if t < time(7, 0) or t > time(21, 59):
+        return False, "🚫 Ночь запрещена. Разрешено: 07:00–21:59"
+    return True, ""
+
+
+def _resolve_storage_channel_ref(state: dict) -> str | None:
+    """
+    Возвращает чат/канал, куда копируем посты (Bot API) и откуда Telethon читает для рассылки.
+    Предпочтение:
+    1) env BROADCAST_STORAGE_CHANNEL
+    2) активный send-as канал кампании
+    3) legacy source_channel
+    """
+    if BROADCAST_STORAGE_CHANNEL:
+        return BROADCAST_STORAGE_CHANNEL
+    campaign = state.get("campaign", {}) if isinstance(state, dict) else {}
+    if campaign.get("send_as_channel"):
+        return str(campaign.get("send_as_channel"))
+    if campaign.get("source_channel"):
+        return str(campaign.get("source_channel"))
+    return None
+
 # ─── Инициализация ───────────────────────────────────────────────────────────
 
 bot = Bot(token=BOT_TOKEN)
@@ -129,6 +188,9 @@ class MainMenu(StatesGroup):
     adding_anti_keyword = State()
     adding_broadcast_channel = State()
     setting_broadcast_source = State()
+    adding_broadcast_post = State()
+    setting_broadcast_weekday_time = State()
+    copying_broadcast_weekday = State()
 
 
 # ─── Хелперы для клавиатур ───────────────────────────────────────────────────
@@ -290,16 +352,22 @@ def broadcast_summary_text(state: dict) -> str:
     schedule = state.get("broadcast_schedule", {})
     send_mode = campaign.get("send_mode", "user")
     account = campaign.get("send_account") or ""
-    source_channel = campaign.get("source_channel") or "не задан"
-    source_message_id = campaign.get("source_message_id")
-    source_value = f"{source_channel} #{source_message_id}" if source_message_id else source_channel
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    rotation_index = int(campaign.get("rotation_index") or 0) if posts else 0
     selected_groups = campaign.get("selected_groups", [])
     groups_state = state.get("broadcast_groups_state", {})
     blocked_count = sum(1 for item in groups_state.values() if item.get("status") == "blocked")
     test_status = "✅ пройден" if campaign.get("test_passed") else "❌ не пройден"
     schedule_status = "включено" if schedule.get("enabled", True) else "выключено"
     tz = schedule.get("tz", BROADCAST_TZ)
-    times = ", ".join(schedule.get("times", BROADCAST_TIMES))
+
+    weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+    active_days = []
+    for wd in WEEKDAYS:
+        meta = weekly.get(wd) or {}
+        if meta.get("enabled") and meta.get("time"):
+            active_days.append(f"{WEEKDAY_NAMES.get(wd, wd)} {meta.get('time')}")
+    weekly_label = ", ".join(active_days) if active_days else "не настроено"
 
     if send_mode == "user":
         mode_label = "🧑 От пользователя"
@@ -312,17 +380,19 @@ def broadcast_summary_text(state: dict) -> str:
     else:
         account_label = "один аккаунт (env)"
 
+    next_post_label = f" (следующий: <b>{rotation_index + 1}</b>)" if posts else ""
+
     return (
         "📣 <b>Рассылка</b>\n\n"
         f"Аккаунт: <b>{account_label}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
-        f"Источник поста: <b>{source_value}</b>\n"
+        f"Постов в пуле: <b>{len(posts)}</b>{next_post_label}\n"
         f"Выбрано групп: <b>{len(selected_groups)}</b>\n"
         f"Недоступных групп: <b>{blocked_count}</b>\n"
         f"Тест: <b>{test_status}</b>\n\n"
         f"Расписание: <b>{schedule_status}</b>\n"
         f"TZ: <b>{tz}</b>\n"
-        f"Слоты: <b>{times}</b>"
+        f"Неделя: <b>{weekly_label}</b>"
     )
 
 
@@ -331,6 +401,7 @@ def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
     send_mode = campaign.get("send_mode", "user")
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
     selected_account = campaign.get("send_account", "") or "не выбран"
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
 
     rows = []
     if BROADCAST_ACCOUNTS:
@@ -341,13 +412,13 @@ def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
     if send_mode == "channel":
         rows.append([InlineKeyboardButton(text="📢 Каналы send-as", callback_data="bc_channels")])
 
-    rows.append([InlineKeyboardButton(text="📝 Источник поста", callback_data="bc_source")])
+    rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
     rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
     rows.append([
         InlineKeyboardButton(text="🧪 Тест", callback_data="bc_test"),
         InlineKeyboardButton(text="✅ Массовая", callback_data="bc_mass"),
     ])
-    rows.append([InlineKeyboardButton(text="⏰ Время рассылки", callback_data="bc_times")])
+    rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
     rows.append([InlineKeyboardButton(
         text="⏰ Расписание: ON" if enabled else "⏰ Расписание: OFF",
         callback_data="bc_schedule_toggle",
@@ -387,21 +458,145 @@ def broadcast_accounts_keyboard(state: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def broadcast_times_keyboard(state: dict) -> InlineKeyboardMarkup:
-    """Клавиатура для выбора времени рассылки"""
-    current_times = set(state.get("broadcast_schedule", {}).get("times", BROADCAST_TIMES))
+def broadcast_posts_text(state: dict) -> str:
+    campaign = state.get("campaign", {})
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    if not posts:
+        return (
+            "🗂 <b>Посты (пул)</b>\n\n"
+            "Пока нет постов.\n\n"
+            "Нажмите <b>➕ Добавить</b> и пришлите пост (текст/фото/видео)."
+        )
+    lines = ["🗂 <b>Посты (пул)</b>\n", f"Всего: <b>{len(posts)}</b> / 10\n"]
+    for idx, p in enumerate(posts, 1):
+        kind = str(p.get("kind") or "post")
+        preview = (p.get("preview") or "").strip()
+        preview = (preview[:80] + "…") if len(preview) > 80 else preview
+        lines.append(f"{idx}. <b>{kind}</b> — {preview}")
+    return "\n".join(lines)
+
+
+def broadcast_posts_keyboard(state: dict) -> InlineKeyboardMarkup:
+    campaign = state.get("campaign", {})
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     buttons = []
-    row = []
-    for t in BROADCAST_TIME_OPTIONS:
-        mark = "✅" if t in current_times else "▫️"
-        row.append(InlineKeyboardButton(text=f"{mark} {t}", callback_data=f"bct_{t}"))
-        if len(row) == 3:
+    if posts:
+        row = []
+        for idx, p in enumerate(posts, 1):
+            pid = str(p.get("id") or "")
+            if not pid:
+                continue
+            row.append(InlineKeyboardButton(text=f"🗑 {idx}", callback_data=f"bcp_del_{pid}"))
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
             buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+    add_disabled = len(posts) >= 10
+    buttons.append([InlineKeyboardButton(
+        text="➕ Добавить" if not add_disabled else "➕ Добавить (лимит 10)",
+        callback_data="bcp_add" if not add_disabled else "noop",
+    )])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def broadcast_posts_add_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить еще", callback_data="bcp_more"),
+            InlineKeyboardButton(text="✅ Готово", callback_data="bcp_done"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_posts")],
+    ])
+
+
+def broadcast_week_text(state: dict) -> str:
+    schedule_enabled = state.get("broadcast_schedule", {}).get("enabled", True)
+    weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+    lines = [
+        "📅 <b>Расписание (неделя)</b>",
+        "",
+        f"Авторассылка: <b>{'ON' if schedule_enabled else 'OFF'}</b>",
+        "Правило MVP: <b>1 запуск в день</b> (07:00–21:59).",
+        "",
+        "Текущие дни:",
+    ]
+    any_day = False
+    for wd in WEEKDAYS:
+        meta = weekly.get(wd) or {}
+        if meta.get("enabled") and meta.get("time"):
+            any_day = True
+            lines.append(f"• {WEEKDAY_NAMES.get(wd, wd)} — <b>{meta.get('time')}</b>")
+    if not any_day:
+        lines.append("• (не настроено)")
+    lines.append("")
+    lines.append("Выберите день недели для настройки:")
+    return "\n".join(lines)
+
+
+def broadcast_week_keyboard() -> InlineKeyboardMarkup:
+    days = [(WEEKDAY_NAMES[wd], f"bcs_day_{wd}") for wd in WEEKDAYS]
+    row1 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[:3]]
+    row2 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[3:6]]
+    row3 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[6:]]
+    row3.append(InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast"))
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
+
+
+def broadcast_day_text(state: dict, weekday: str) -> str:
+    weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+    meta = weekly.get(weekday) or {}
+    name = WEEKDAY_NAMES.get(weekday, weekday)
+    enabled = bool(meta.get("enabled"))
+    t = meta.get("time")
+    status = "✅ открыт" if enabled else "⛔️ закрыт"
+    time_label = f"<b>{t}</b>" if t else "не задано"
+    return (
+        f"📅 <b>День: {name}</b>\n\n"
+        f"Статус: <b>{status}</b>\n"
+        f"Время: {time_label}\n\n"
+        "Введите время в формате <code>HH:MM</code> (например, <code>10:00</code> или <code>10.00</code>)."
+    )
+
+
+def broadcast_day_keyboard(state: dict, weekday: str) -> InlineKeyboardMarkup:
+    weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+    meta = weekly.get(weekday) or {}
+    enabled = bool(meta.get("enabled"))
+    t = meta.get("time")
+    buttons = [
+        [
+            InlineKeyboardButton(text="✏️ Установить время" if not t else "✏️ Изменить время", callback_data=f"bcs_set_{weekday}"),
+            InlineKeyboardButton(text="🗑 Убрать время", callback_data=f"bcs_clear_{weekday}"),
+        ],
+        [
+            InlineKeyboardButton(text="⛔️ Закрыть день" if enabled else "✅ Открыть день", callback_data=f"bcs_toggle_{weekday}"),
+            InlineKeyboardButton(text="📋 Скопировать на…", callback_data=f"bcs_copy_{weekday}"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_schedule")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def broadcast_copy_target_text(source_weekday: str) -> str:
+    name = WEEKDAY_NAMES.get(source_weekday, source_weekday)
+    return (
+        f"📋 <b>Скопировать время</b>\n\n"
+        f"Источник: <b>{name}</b>\n"
+        "Выберите целевой день:"
+    )
+
+
+def broadcast_copy_target_keyboard(source_weekday: str) -> InlineKeyboardMarkup:
+    days = [(WEEKDAY_NAMES[wd], f"bcs_copy_to_{source_weekday}_{wd}") for wd in WEEKDAYS if wd != source_weekday]
+    row1 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[:3]]
+    row2 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[3:6]]
+    rows = [row1, row2]
+    if len(days) > 6:
+        rows.append([InlineKeyboardButton(text=days[6][0], callback_data=days[6][1])])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"bcs_day_{source_weekday}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 BROADCAST_GROUPS_PER_PAGE = 6
@@ -488,22 +683,29 @@ def get_active_selected_groups(state: dict) -> list[str]:
     ]
 
 
-async def execute_broadcast(groups: list[str]) -> dict:
+async def execute_broadcast(groups: list[str], *, advance_rotation: bool) -> dict:
     state = broadcast_manager.load()
     campaign = state.get("campaign", {})
-    source_channel = campaign.get("source_channel", "")
-    source_message_id = campaign.get("source_message_id")
+    post = broadcast_manager.choose_next_post()
+    if not post:
+        return {"ok": False, "sent_count": 0, "skipped_count": len(groups), "summary": "Нет постов в пуле."}
+
+    source_channel = str(post.get("channel") or "")
+    source_message_id = int(post.get("message_id") or 0)
     send_mode = campaign.get("send_mode", "user")
     send_as = campaign.get("send_as_channel", "") if send_mode == "channel" else None
-    return await send_broadcast_campaign(
+    result = await send_broadcast_campaign(
         groups=groups,
         source_channel=source_channel,
-        source_message_id=int(source_message_id),
+        source_message_id=source_message_id,
         send_as_channel=send_as,
         account_alias=campaign.get("send_account") or None,
         delay_seconds=5.0,
         jitter_seconds=1.0,
     )
+    if advance_rotation and result.get("sent_count", 0) > 0:
+        broadcast_manager.advance_rotation_if_sent()
+    return result
 
 
 def is_campaign_ready(state: dict) -> tuple[bool, str]:
@@ -512,8 +714,9 @@ def is_campaign_ready(state: dict) -> tuple[bool, str]:
         acc = campaign.get("send_account", "")
         if not acc or acc not in BROADCAST_ACCOUNTS:
             return False, "Не выбран аккаунт отправки (TG_ACCOUNTS)."
-    if not campaign.get("source_channel") or not campaign.get("source_message_id"):
-        return False, "Не задан источник поста."
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    if not posts:
+        return False, "Нет постов в пуле. Добавьте посты в «Посты»."
     if campaign.get("send_mode") == "channel" and not campaign.get("send_as_channel"):
         return False, "Режим 'от канала': не выбран канал send-as."
     if not get_active_selected_groups(state):
@@ -545,34 +748,42 @@ async def scheduler_loop():
             now_local = datetime.now(ZoneInfo(tz_name))
             date_str = now_local.strftime("%Y-%m-%d")
 
-            for slot in schedule.get("times", BROADCAST_TIMES):
-                try:
-                    hh, mm = slot.split(":")
-                    slot_time = time(hour=int(hh), minute=int(mm))
-                except Exception:
-                    continue
-                if now_local.time() < slot_time:
-                    continue
-                if broadcast_manager.was_slot_run(date_str, slot):
-                    continue
-                if broadcast_lock.locked():
-                    continue
+            weekday = WEEKDAYS[now_local.weekday()]
+            weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+            meta = weekly.get(weekday) or {}
+            slot = meta.get("time")
+            if not (meta.get("enabled") and slot):
+                await asyncio.sleep(20)
+                continue
 
-                ready, reason = is_campaign_ready(state)
-                if not ready:
-                    broadcast_manager.mark_slot_run(date_str, slot, "skipped", reason)
-                    await notify_owner(f"📣 Слот {slot} пропущен: {reason}")
-                    continue
+            # Run only at the exact minute; if missed (downtime), skip for the day.
+            if now_local.strftime("%H:%M") != slot:
+                await asyncio.sleep(20)
+                continue
 
-                groups = get_active_selected_groups(state)
-                async with broadcast_lock:
-                    result = await execute_broadcast(groups)
-                for group, err in result.get("blocked_groups", {}).items():
-                    broadcast_manager.set_group_blocked(group, err)
+            if broadcast_manager.was_slot_run(date_str, slot):
+                await asyncio.sleep(20)
+                continue
+            if broadcast_lock.locked():
+                await asyncio.sleep(20)
+                continue
 
-                status = "ok" if result.get("ok") else "failed"
-                broadcast_manager.mark_slot_run(date_str, slot, status, result.get("summary", ""))
-                await notify_owner(f"📣 Авторассылка {slot}: {result.get('summary', '')}")
+            ready, reason = is_campaign_ready(state)
+            if not ready:
+                broadcast_manager.mark_slot_run(date_str, slot, "skipped", reason)
+                await notify_owner(f"📣 Авторассылка пропущена ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {reason}")
+                await asyncio.sleep(20)
+                continue
+
+            groups = get_active_selected_groups(state)
+            async with broadcast_lock:
+                result = await execute_broadcast(groups, advance_rotation=True)
+            for group, err in result.get("blocked_groups", {}).items():
+                broadcast_manager.set_group_blocked(group, err)
+
+            status = "ok" if result.get("ok") else "failed"
+            broadcast_manager.mark_slot_run(date_str, slot, status, result.get("summary", ""))
+            await notify_owner(f"📣 Авторассылка ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {result.get('summary', '')}")
 
             await asyncio.sleep(20)
         except Exception:
@@ -817,6 +1028,141 @@ async def broadcast_source_input(message: Message, state: FSMContext):
     )
 
 
+@dp.callback_query(F.data == "bc_posts")
+async def broadcast_posts(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    await state.set_state(MainMenu.viewing)
+    data = broadcast_manager.load()
+    await query.message.edit_text(
+        broadcast_posts_text(data),
+        parse_mode="HTML",
+        reply_markup=broadcast_posts_keyboard(data),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bcp_add")
+async def broadcast_posts_add_prompt(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    data = broadcast_manager.load()
+    storage_ref = _resolve_storage_channel_ref(data)
+    if not storage_ref:
+        await query.answer("Не задан канал для хранения постов (storage).", show_alert=True)
+        return
+    await query.message.edit_text(
+        "➕ <b>Добавить пост</b>\n\n"
+        "Пришлите пост (текст/фото/видео). Я сохраню его в служебный канал.\n\n"
+        "Лимит: <b>10</b> постов.",
+        parse_mode="HTML",
+        reply_markup=broadcast_posts_add_keyboard(),
+        disable_web_page_preview=True,
+    )
+    await state.set_state(MainMenu.adding_broadcast_post)
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bcp_more")
+async def broadcast_posts_add_more(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    await state.set_state(MainMenu.adding_broadcast_post)
+    await query.answer("Жду следующий пост")
+
+
+@dp.callback_query(F.data == "bcp_done")
+async def broadcast_posts_add_done(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    await state.set_state(MainMenu.viewing)
+    data = broadcast_manager.load()
+    await query.message.edit_text(
+        broadcast_posts_text(data),
+        parse_mode="HTML",
+        reply_markup=broadcast_posts_keyboard(data),
+        disable_web_page_preview=True,
+    )
+    await query.answer("Готово")
+
+
+@dp.callback_query(F.data.startswith("bcp_del_"))
+async def broadcast_posts_delete(query: CallbackQuery):
+    if not await ensure_owner_callback(query):
+        return
+    post_id = query.data[len("bcp_del_"):]
+    data = broadcast_manager.delete_post(post_id)
+    await query.message.edit_text(
+        broadcast_posts_text(data),
+        parse_mode="HTML",
+        reply_markup=broadcast_posts_keyboard(data),
+        disable_web_page_preview=True,
+    )
+    await query.answer("Удалено")
+
+
+@dp.message(MainMenu.adding_broadcast_post)
+async def broadcast_posts_add_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("⛔️ Доступ только для владельца.")
+        return
+
+    data = broadcast_manager.load()
+    campaign = data.get("campaign", {})
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    if len(posts) >= 10:
+        await message.answer("❌ Лимит постов: 10.", reply_markup=broadcast_posts_add_keyboard())
+        return
+
+    storage_ref = _resolve_storage_channel_ref(data)
+    if not storage_ref:
+        await message.answer("❌ Не задан канал для хранения постов (storage).")
+        return
+
+    kind = None
+    preview = ""
+    if message.text:
+        kind = "text"
+        preview = message.text
+    elif message.photo:
+        kind = "photo"
+        preview = message.caption or "[photo]"
+    elif message.video:
+        kind = "video"
+        preview = message.caption or "[video]"
+
+    if not kind:
+        await message.answer("❌ Поддерживается только: текст/фото/видео.", reply_markup=broadcast_posts_add_keyboard())
+        return
+
+    try:
+        copied = await bot.copy_message(
+            chat_id=storage_ref,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        stored_message_id = int(getattr(copied, "message_id", None) or getattr(copied, "message_id", 0))
+        if not stored_message_id:
+            stored_message_id = int(getattr(copied, "message_id", 0))
+    except Exception as exc:
+        await message.answer(f"❌ Не удалось сохранить пост в storage: {type(exc).__name__}", reply_markup=broadcast_posts_add_keyboard())
+        return
+
+    broadcast_manager.add_post(
+        channel=str(storage_ref),
+        message_id=stored_message_id,
+        kind=kind,
+        preview=preview,
+        max_posts=10,
+    )
+
+    await message.answer(
+        "✅ Пост сохранён.\n\nМожно добавить ещё или завершить.",
+        reply_markup=broadcast_posts_add_keyboard(),
+    )
+
+
 @dp.callback_query(F.data == "bc_groups")
 async def broadcast_groups(query: CallbackQuery):
     state = broadcast_manager.ensure_groups_known(load_groups())
@@ -871,42 +1217,170 @@ async def broadcast_schedule_toggle(query: CallbackQuery):
     await query.answer("Обновлено")
 
 
-@dp.callback_query(F.data == "bc_times")
-async def broadcast_times_menu(query: CallbackQuery):
-    state = broadcast_manager.load()
-    current = ", ".join(sorted(state.get("broadcast_schedule", {}).get("times", BROADCAST_TIMES)))
-    await query.message.edit_text(
-        f"⏰ <b>Время рассылки</b>\n\nАктивные слоты: <b>{current}</b>\n\nНажмите на время, чтобы включить или выключить слот.",
-        parse_mode="HTML",
-        reply_markup=broadcast_times_keyboard(state),
-    )
-    await query.answer()
-
-
-@dp.callback_query(F.data.startswith("bct_"))
-async def broadcast_time_toggle(query: CallbackQuery):
+@dp.callback_query(F.data == "bc_schedule")
+async def broadcast_schedule_week(query: CallbackQuery, state: FSMContext):
     if not await ensure_owner_callback(query):
         return
-    slot = query.data[len("bct_"):]
-    state = broadcast_manager.load()
-    times = set(state.get("broadcast_schedule", {}).get("times", BROADCAST_TIMES))
-    if slot in times:
-        times.discard(slot)
-    else:
-        times.add(slot)
-    # Защита: нельзя убрать все слоты
-    if not times:
-        await query.answer("❌ Нельзя убрать все слоты!", show_alert=True)
-        return
-    broadcast_manager.set_schedule_times(sorted(times))
-    state = broadcast_manager.load()
-    current = ", ".join(sorted(state.get("broadcast_schedule", {}).get("times", [])))
+    await state.set_state(MainMenu.viewing)
+    data = broadcast_manager.load()
     await query.message.edit_text(
-        f"⏰ <b>Время рассылки</b>\n\nАктивные слоты: <b>{current}</b>\n\nНажмите на время, чтобы включить или выключить слот.",
+        broadcast_week_text(data),
         parse_mode="HTML",
-        reply_markup=broadcast_times_keyboard(state),
+        reply_markup=broadcast_week_keyboard(),
+        disable_web_page_preview=True,
     )
     await query.answer()
+
+
+@dp.callback_query(F.data.startswith("bcs_day_"))
+async def broadcast_schedule_day_open(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    weekday = query.data[len("bcs_day_"):]
+    if weekday not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    await state.set_state(MainMenu.viewing)
+    data = broadcast_manager.load()
+    await query.message.edit_text(
+        broadcast_day_text(data, weekday),
+        parse_mode="HTML",
+        reply_markup=broadcast_day_keyboard(data, weekday),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("bcs_set_"))
+async def broadcast_schedule_day_set_prompt(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    weekday = query.data[len("bcs_set_"):]
+    if weekday not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    await state.set_state(MainMenu.setting_broadcast_weekday_time)
+    await state.update_data(bcs_weekday=weekday)
+    await query.message.edit_text(
+        f"✏️ <b>Установить время</b>\n\nДень: <b>{WEEKDAY_NAMES.get(weekday, weekday)}</b>\n"
+        "Введите время в формате <code>HH:MM</code> (например, <code>10:00</code> или <code>10.00</code>).\n\n"
+        "Ограничение MVP: 07:00–21:59.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"bcs_day_{weekday}")],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.message(MainMenu.setting_broadcast_weekday_time)
+async def broadcast_schedule_day_set_input(message: Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("⛔️ Доступ только для владельца.")
+        return
+    data = await state.get_data()
+    weekday = (data.get("bcs_weekday") or "").strip()
+    if weekday not in WEEKDAYS:
+        await message.answer("❌ Не выбран день недели. Откройте расписание заново.")
+        await state.set_state(MainMenu.viewing)
+        return
+
+    hhmm = _normalize_hhmm(message.text or "")
+    if not hhmm:
+        await message.answer("❌ Неверный формат. Пример: 10:00 или 10.00")
+        return
+    ok, err = _validate_allowed_time(hhmm)
+    if not ok:
+        await message.answer(err)
+        return
+
+    broadcast_manager.set_weekday_time(weekday, hhmm)
+    await state.set_state(MainMenu.viewing)
+    st = broadcast_manager.load()
+    await message.answer(
+        f"✅ Время сохранено: <b>{WEEKDAY_NAMES.get(weekday, weekday)} {hhmm}</b>",
+        parse_mode="HTML",
+        reply_markup=broadcast_day_keyboard(st, weekday),
+    )
+
+
+@dp.callback_query(F.data.startswith("bcs_clear_"))
+async def broadcast_schedule_day_clear(query: CallbackQuery):
+    if not await ensure_owner_callback(query):
+        return
+    weekday = query.data[len("bcs_clear_"):]
+    if weekday not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    data = broadcast_manager.set_weekday_time(weekday, None)
+    await query.message.edit_text(
+        broadcast_day_text(data, weekday),
+        parse_mode="HTML",
+        reply_markup=broadcast_day_keyboard(data, weekday),
+    )
+    await query.answer("Очищено")
+
+
+@dp.callback_query(F.data.startswith("bcs_toggle_"))
+async def broadcast_schedule_day_toggle(query: CallbackQuery):
+    if not await ensure_owner_callback(query):
+        return
+    weekday = query.data[len("bcs_toggle_"):]
+    if weekday not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    st = broadcast_manager.load()
+    meta = (st.get("weekly_schedule") or {}).get(weekday) or {}
+    new_enabled = not bool(meta.get("enabled"))
+    data = broadcast_manager.set_weekday_enabled(weekday, new_enabled)
+    await query.message.edit_text(
+        broadcast_day_text(data, weekday),
+        parse_mode="HTML",
+        reply_markup=broadcast_day_keyboard(data, weekday),
+    )
+    await query.answer("Обновлено")
+
+
+@dp.callback_query(F.data.startswith("bcs_copy_"))
+async def broadcast_schedule_copy_start(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    weekday = query.data[len("bcs_copy_"):]
+    if weekday not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    await state.set_state(MainMenu.copying_broadcast_weekday)
+    await state.update_data(bcs_copy_source=weekday)
+    await query.message.edit_text(
+        broadcast_copy_target_text(weekday),
+        parse_mode="HTML",
+        reply_markup=broadcast_copy_target_keyboard(weekday),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("bcs_copy_to_"))
+async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
+    parts = query.data.split("_")
+    if len(parts) < 5:
+        await query.answer("Неверная команда.", show_alert=True)
+        return
+    source = parts[3]
+    target = parts[4]
+    if source not in WEEKDAYS or target not in WEEKDAYS:
+        await query.answer("Неверный день.", show_alert=True)
+        return
+    broadcast_manager.copy_weekday(source, target)
+    await state.set_state(MainMenu.viewing)
+    data = broadcast_manager.load()
+    await query.message.edit_text(
+        broadcast_day_text(data, source),
+        parse_mode="HTML",
+        reply_markup=broadcast_day_keyboard(data, source),
+    )
+    await query.answer("Скопировано")
 
 
 @dp.callback_query(F.data == "bc_test")
@@ -926,7 +1400,7 @@ async def broadcast_test(query: CallbackQuery):
         parse_mode="HTML",
     )
     async with broadcast_lock:
-        result = await execute_broadcast(test_groups)
+        result = await execute_broadcast(test_groups, advance_rotation=False)
     for group, err in result.get("blocked_groups", {}).items():
         broadcast_manager.set_group_blocked(group, err)
 
@@ -973,7 +1447,7 @@ async def broadcast_mass(query: CallbackQuery):
         parse_mode="HTML",
     )
     async with broadcast_lock:
-        result = await execute_broadcast(groups)
+        result = await execute_broadcast(groups, advance_rotation=True)
     for group, err in result.get("blocked_groups", {}).items():
         broadcast_manager.set_group_blocked(group, err)
 

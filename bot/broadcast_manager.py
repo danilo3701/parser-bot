@@ -1,6 +1,10 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+import uuid
+
+
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 class BroadcastManager:
@@ -15,19 +19,25 @@ class BroadcastManager:
             "broadcast_groups_state": {},
             "broadcast_schedule": {
                 "enabled": True,
-                "times": list(self.default_times),
                 "tz": self.default_tz,
             },
             "campaign": {
                 "send_mode": "user",
                 "send_account": "",
                 "send_as_channel": "",
+                # Back-compat: older flows used a single source post reference.
                 "source_channel": "",
                 "source_message_id": None,
+                # New: pool of posts stored in a known channel for Telethon to re-send from.
+                # Each item: {id, channel, message_id, kind, preview}
+                "posts": [],
+                "rotation_index": 0,
                 "selected_groups": [],
                 "test_passed": False,
                 "last_test_at": None,
             },
+            # New schedule model: weekly day -> {enabled, time}
+            "weekly_schedule": {wd: {"enabled": False, "time": None} for wd in WEEKDAYS},
             "last_runs": {},
         }
 
@@ -54,6 +64,28 @@ class BroadcastManager:
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
         state["campaign"].setdefault("send_account", "")
+        state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+
+        # Back-compat migration: if old source post is set and posts pool is empty, seed it.
+        campaign = state.get("campaign", {})
+        posts = campaign.get("posts")
+        if not isinstance(posts, list):
+            posts = []
+            campaign["posts"] = posts
+        campaign.setdefault("rotation_index", 0)
+        if not posts and campaign.get("source_channel") and campaign.get("source_message_id"):
+            try:
+                mid = int(campaign["source_message_id"])
+            except Exception:
+                mid = None
+            if mid:
+                posts.append({
+                    "id": uuid.uuid4().hex[:8],
+                    "channel": str(campaign["source_channel"]),
+                    "message_id": mid,
+                    "kind": "legacy",
+                    "preview": f"{campaign['source_channel']} #{mid}",
+                })
         return state
 
     def save(self, state: dict) -> None:
@@ -115,6 +147,135 @@ class BroadcastManager:
         state = self.load()
         state["campaign"]["source_channel"] = source_channel
         state["campaign"]["source_message_id"] = source_message_id
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    # ─── Posts pool ─────────────────────────────────────────────────────────────
+
+    def list_posts(self) -> list[dict]:
+        state = self.load()
+        posts = state.get("campaign", {}).get("posts", [])
+        return posts if isinstance(posts, list) else []
+
+    def add_post(
+        self,
+        *,
+        channel: str,
+        message_id: int,
+        kind: str,
+        preview: str,
+        max_posts: int = 10,
+    ) -> dict:
+        state = self.load()
+        campaign = state["campaign"]
+        posts = campaign.setdefault("posts", [])
+        if not isinstance(posts, list):
+            posts = []
+            campaign["posts"] = posts
+
+        if len(posts) >= max_posts:
+            return state
+
+        posts.append({
+            "id": uuid.uuid4().hex[:8],
+            "channel": channel,
+            "message_id": int(message_id),
+            "kind": kind,
+            "preview": (preview or "").strip()[:140],
+        })
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def delete_post(self, post_id: str) -> dict:
+        state = self.load()
+        campaign = state["campaign"]
+        posts = campaign.get("posts", [])
+        if isinstance(posts, list):
+            campaign["posts"] = [p for p in posts if str(p.get("id")) != post_id]
+        # Clamp rotation index
+        try:
+            idx = int(campaign.get("rotation_index") or 0)
+        except Exception:
+            idx = 0
+        n = len(campaign.get("posts", []))
+        campaign["rotation_index"] = 0 if n <= 0 else min(idx, n - 1)
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def choose_next_post(self) -> dict | None:
+        state = self.load()
+        campaign = state.get("campaign", {})
+        posts = campaign.get("posts", [])
+        if not isinstance(posts, list) or not posts:
+            return None
+        try:
+            idx = int(campaign.get("rotation_index") or 0)
+        except Exception:
+            idx = 0
+        idx = max(0, min(idx, len(posts) - 1))
+        return posts[idx]
+
+    def advance_rotation_if_sent(self) -> dict:
+        state = self.load()
+        campaign = state.get("campaign", {})
+        posts = campaign.get("posts", [])
+        if not isinstance(posts, list) or not posts:
+            campaign["rotation_index"] = 0
+            self.save(state)
+            return state
+        try:
+            idx = int(campaign.get("rotation_index") or 0)
+        except Exception:
+            idx = 0
+        campaign["rotation_index"] = (idx + 1) % len(posts)
+        self.save(state)
+        return state
+
+    # ─── Weekly schedule ────────────────────────────────────────────────────────
+
+    def get_weekly_schedule(self) -> dict:
+        state = self.load()
+        sched = state.get("weekly_schedule")
+        if not isinstance(sched, dict):
+            sched = self._default_state()["weekly_schedule"]
+            state["weekly_schedule"] = sched
+            self.save(state)
+        return sched
+
+    def set_weekday_time(self, weekday: str, time_value: str | None) -> dict:
+        state = self.load()
+        sched = state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+        if weekday not in WEEKDAYS:
+            return state
+        day = sched.setdefault(weekday, {"enabled": False, "time": None})
+        day["time"] = time_value
+        if time_value:
+            day["enabled"] = True
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def set_weekday_enabled(self, weekday: str, enabled: bool) -> dict:
+        state = self.load()
+        sched = state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+        if weekday not in WEEKDAYS:
+            return state
+        day = sched.setdefault(weekday, {"enabled": False, "time": None})
+        day["enabled"] = bool(enabled)
+        self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def copy_weekday(self, source_weekday: str, target_weekday: str) -> dict:
+        state = self.load()
+        sched = state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+        if source_weekday not in WEEKDAYS or target_weekday not in WEEKDAYS:
+            return state
+        src = sched.get(source_weekday) or {"enabled": False, "time": None}
+        sched[target_weekday] = {"enabled": bool(src.get("enabled")), "time": src.get("time")}
         self.reset_test_flag_in_state(state)
         self.save(state)
         return state
