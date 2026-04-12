@@ -259,7 +259,7 @@ def main_keyboard(schedule_enabled: bool = True):
         ],
         [
             InlineKeyboardButton(
-                text="🟢 Рассылка ВКЛ" if schedule_enabled else "🔴 Рассылка ВЫКЛ",
+                text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
                 callback_data="main_bc_toggle",
             ),
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
@@ -364,6 +364,24 @@ async def ensure_owner_callback(query: CallbackQuery) -> bool:
     return False
 
 
+def get_setup_steps(user_id: int, state: dict, groups: list[str]) -> dict:
+    """
+    Returns a dict of booleans for each setup step required before mass broadcast.
+    Steps must be completed in order: account → posts → groups → schedule → test.
+    """
+    return {
+        "account": get_account(user_id) is not None,
+        "posts": len(state.get("campaign", {}).get("posts", [])) > 0,
+        "groups": len(get_active_selected_groups_from(state, groups)) > 0,
+        "schedule": any(
+            v.get("time")
+            for v in state.get("weekly_schedule", {}).values()
+            if isinstance(v, dict)
+        ),
+        "test": state.get("campaign", {}).get("test_passed", False),
+    }
+
+
 def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
     """
     Owner uses global broadcast_state.json; regular users have isolated state under bot/user_data/<user_id>/.
@@ -391,7 +409,7 @@ def get_active_selected_groups_from(state: dict, groups: list[str]) -> list[str]
     ]
 
 
-def broadcast_summary_text(state: dict, *, user_id: int | None = None) -> str:
+def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: list[str] | None = None) -> str:
     campaign = state.get("campaign", {})
     schedule = state.get("broadcast_schedule", {})
     send_mode = campaign.get("send_mode", "user")
@@ -426,14 +444,51 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None) -> str:
             account_label = f"@{username}" if username else (name or "аккаунт")
         else:
             account_label = "не подключен"
-    elif BROADCAST_ACCOUNTS:
-        account_label = account if account else "не выбран"
     else:
         account_label = "один аккаунт (env)"
 
     next_post_label = f" (следующий: <b>{rotation_index + 1}</b>)" if posts else ""
 
+    # Build step progress indicator (only for non-owner users)
+    step_progress = ""
+    if user_id is not None and not is_owner(user_id) and groups is not None:
+        steps = get_setup_steps(user_id, state, groups)
+        if not all(steps.values()):
+            step_symbols = []
+            step_names = [
+                "Подключить аккаунт",
+                "Добавить пост",
+                "Добавить группы рассылки",
+                "Настроить расписание (≥1 день)",
+                "Пройти тест",
+            ]
+            for i, (key, completed) in enumerate(steps.items(), 1):
+                symbol = "✅" if completed else "⬜"
+                step_symbols.append(f"{symbol} Шаг {i}: {step_names[i - 1]}")
+
+            # Find current step (first incomplete one)
+            current_step = next((k for k, v in steps.items() if not v), None)
+            current_text = ""
+            if current_step == "account":
+                current_text = "👉 Текущий шаг: Подключите аккаунт"
+            elif current_step == "posts":
+                current_text = "👉 Текущий шаг: Добавьте хотя бы один пост"
+            elif current_step == "groups":
+                current_text = "👉 Текущий шаг: Добавьте и выберите группы рассылки"
+            elif current_step == "schedule":
+                current_text = "👉 Текущий шаг: Настройте расписание — укажите время для дня"
+            elif current_step == "test":
+                current_text = "👉 Текущий шаг: Запустите тест (кнопка «🧪 Тест»)"
+
+            step_progress = (
+                "📋 <b>Настройка рассылки:</b>\n"
+                + "\n".join(step_symbols)
+                + f"\n{current_text}\n\n"
+                "────────────────────\n"
+            )
+
     return (
+        step_progress +
         "📣 <b>Рассылка</b>\n\n"
         f"Аккаунт: <b>{account_label}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
@@ -450,7 +505,6 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None) -> str:
 def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarkup:
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
-    enabled = state.get("broadcast_schedule", {}).get("enabled", True)
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
 
     rows = []
@@ -469,10 +523,6 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     ])
     rows.append([InlineKeyboardButton(text="🧭 Готовность", callback_data="bc_ready")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
-    rows.append([InlineKeyboardButton(
-        text="⏰ Расписание: ON" if enabled else "⏰ Расписание: OFF",
-        callback_data="bc_schedule_toggle",
-    )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -910,17 +960,71 @@ async def main_bc_toggle(query: CallbackQuery):
     bm = scoped_broadcast_manager(query.from_user.id)
     bm_state = bm.load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
-    new_enabled = not schedule_enabled
-    bm.set_schedule_enabled(new_enabled)
+
+    # If schedule is ON, show confirmation before stopping
+    if schedule_enabled:
+        confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, остановить", callback_data="main_bc_confirm_stop"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="main_bc_cancel_stop"),
+            ],
+        ])
+        await query.message.edit_text(
+            "⚠️ <b>Остановить авторассылку?</b>\n\n"
+            "Расписание сохранится, но рассылка не будет отправляться автоматически.\n\n"
+            "Вы сможете в любой момент возобновить рассылку.",
+            parse_mode="HTML",
+            reply_markup=confirm_keyboard,
+        )
+        await query.answer()
+        return
+
+    # If schedule is OFF, immediately resume
+    bm.set_schedule_enabled(True)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
     active_name = ""
     if active_dir:
         active_name = get_directions(cat_state).get(active_dir, {}).get("name", "")
     await query.message.edit_text(
-        main_menu_text(new_enabled, active_name),
+        main_menu_text(True, active_name),
         parse_mode="HTML",
-        reply_markup=main_keyboard(new_enabled),
+        reply_markup=main_keyboard(True),
+    )
+    await query.answer("✅ Рассылка возобновлена")
+
+
+@dp.callback_query(F.data == "main_bc_confirm_stop")
+async def main_bc_confirm_stop(query: CallbackQuery):
+    bm = scoped_broadcast_manager(query.from_user.id)
+    bm.set_schedule_enabled(False)
+    cat_state = load()
+    active_dir = get_active_direction(cat_state)
+    active_name = ""
+    if active_dir:
+        active_name = get_directions(cat_state).get(active_dir, {}).get("name", "")
+    await query.message.edit_text(
+        main_menu_text(False, active_name),
+        parse_mode="HTML",
+        reply_markup=main_keyboard(False),
+    )
+    await query.answer("⏸ Рассылка остановлена")
+
+
+@dp.callback_query(F.data == "main_bc_cancel_stop")
+async def main_bc_cancel_stop(query: CallbackQuery):
+    cat_state = load()
+    active_dir = get_active_direction(cat_state)
+    active_name = ""
+    if active_dir:
+        active_name = get_directions(cat_state).get(active_dir, {}).get("name", "")
+    bm = scoped_broadcast_manager(query.from_user.id)
+    bm_state = bm.load()
+    schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
+    await query.message.edit_text(
+        main_menu_text(schedule_enabled, active_name),
+        parse_mode="HTML",
+        reply_markup=main_keyboard(schedule_enabled),
     )
     await query.answer()
 
@@ -934,7 +1038,7 @@ async def broadcast_menu(query: CallbackQuery):
     groups = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
-        broadcast_summary_text(state, user_id=user_id),
+        broadcast_summary_text(state, user_id=user_id, groups=groups),
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
@@ -2209,11 +2313,12 @@ async def broadcast_group_toggle(query: CallbackQuery):
 async def broadcast_schedule_toggle(query: CallbackQuery):
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
     state = bm.load()
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
     state = bm.set_schedule_enabled(not enabled)
     await query.message.edit_text(
-        broadcast_summary_text(state, user_id=user_id),
+        broadcast_summary_text(state, user_id=user_id, groups=groups),
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
@@ -2389,6 +2494,22 @@ async def broadcast_test_v2(query: CallbackQuery):
     bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
+
+    # Step enforcement: check that all prerequisite steps are completed
+    steps = get_setup_steps(user_id, state, groups_all)
+    if not steps["account"]:
+        await query.answer("⚠️ Шаг 1: Сначала подключите аккаунт (кнопка «🔑 Подключить аккаунт»)", show_alert=True)
+        return
+    if not steps["posts"]:
+        await query.answer("⚠️ Шаг 2: Добавьте хотя бы один пост в пул (кнопка «🗂 Посты»)", show_alert=True)
+        return
+    if not steps["groups"]:
+        await query.answer("⚠️ Шаг 3: Добавьте и выберите группы рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        return
+    if not steps["schedule"]:
+        await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
+        return
+
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
@@ -2454,12 +2575,13 @@ async def broadcast_test_v2(query: CallbackQuery):
 async def broadcast_mode_toggle(query: CallbackQuery):
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
     state_data = bm.load()
     current = state_data.get("campaign", {}).get("send_mode", "user")
     new_mode = "channel" if current == "user" else "user"
     state_data = bm.set_send_mode(new_mode)
     await query.message.edit_text(
-        broadcast_summary_text(state_data, user_id=user_id),
+        broadcast_summary_text(state_data, user_id=user_id, groups=groups),
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state_data, user_id=user_id),
     )
@@ -2475,6 +2597,25 @@ async def broadcast_mass(query: CallbackQuery):
     bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
+
+    # Step enforcement: check all 5 setup steps
+    steps = get_setup_steps(user_id, state, groups_all)
+    if not steps["account"]:
+        await query.answer("⚠️ Шаг 1: Сначала подключите аккаунт (кнопка «🔑 Подключить аккаунт»)", show_alert=True)
+        return
+    if not steps["posts"]:
+        await query.answer("⚠️ Шаг 2: Добавьте хотя бы один пост в пул (кнопка «🗂 Посты»)", show_alert=True)
+        return
+    if not steps["groups"]:
+        await query.answer("⚠️ Шаг 3: Добавьте и выберите группы рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        return
+    if not steps["schedule"]:
+        await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
+        return
+    if not steps["test"]:
+        await query.answer("⚠️ Шаг 5: Сначала запустите тест (кнопка «🧪 Тест»). Тест определяет, в какие группы можно отправлять.", show_alert=True)
+        return
+
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
