@@ -1429,31 +1429,32 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
         await query.answer("Таймаут QR. Создайте заново.", show_alert=True)
         return
 
-    try:
-        await asyncio.wait_for(pending.qr_login.wait(), timeout=1.0)
-    except asyncio.TimeoutError:
-        await query.answer("Ещё не подтверждено. Отсканируйте QR и нажмите снова.", show_alert=True)
-        return
-    except Exception as exc:
-        await _cleanup_pending_login(user_id)
-        await query.answer(f"Ошибка QR: {type(exc).__name__}", show_alert=True)
-        return
+    await query.answer("⏳ Проверяю статус QR...")
 
-    # Пытаемся получить мета — выкинет ошибку если требуется пароль
+    # Сначала пробуем короткое ожидание, но если оно не удалось — пробуем напрямую вызвать get_me()
     try:
-        me = await pending.client.get_me()
-        # Успешно — авторизован
+        # Попробуем ждать, но с коротким таймаутом
+        await asyncio.wait_for(pending.qr_login.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        # Может быть, уже авторизован несмотря на timeout — проверим напрямую
+        pass
+    except Exception:
+        pass
+
+    # Теперь проверяем авторизацию напрямую
+    try:
+        me = await asyncio.wait_for(pending.client.get_me(), timeout=5.0)
+        # Успешно — авторизован, финализируем
         await _finalize_account_login(query.message, state, user_id=user_id, phone="")
-        await query.answer("✅ QR отсканирован и авторизован!")
+        await query.answer("✅ QR отсканирован и авторизован!", show_alert=True)
 
     except telethon.errors.SessionPasswordNeededError:
-        # Требуется пароль
-        # Если админ и есть переменная — пробуем автоматически
+        # Требуется пароль 2FA
         if user_id in OWNER_IDS and OWNER_2FA_PASSWORD:
             try:
                 await pending.client.sign_in(password=OWNER_2FA_PASSWORD)
                 await _finalize_account_login(query.message, state, user_id=user_id, phone="")
-                await query.answer("✅ QR авторизован! (пароль введён автоматически)")
+                await query.answer("✅ QR авторизован! (пароль введён автоматически)", show_alert=True)
                 return
             except telethon.errors.PasswordHashInvalidError:
                 await query.answer("❌ OWNER_2FA_PASSWORD неверный!", show_alert=True)
@@ -1464,9 +1465,8 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
                 await _cleanup_pending_login(user_id)
                 return
 
-        # Не админ или нет переменной — просим ввести
+        # Обычный пользователь — просим ввести пароль
         await state.set_state(MainMenu.connecting_account_password)
-        await query.answer()
         await _safe_edit_text(
             query.message,
             "🔐 <b>QR отсканирован!</b>\n\n"
@@ -1474,10 +1474,14 @@ async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
             "Введите пароль (не код, а именно пароль):",
             reply_markup=account_cancel_keyboard(),
         )
+        await query.answer("Требуется пароль", show_alert=True)
+
+    except asyncio.TimeoutError:
+        await query.answer("⏱ Не удалось подтвердить QR. Попробуйте снова.", show_alert=True)
 
     except Exception as exc:
         await _cleanup_pending_login(user_id)
-        await query.answer(f"Ошибка при проверке: {type(exc).__name__}", show_alert=True)
+        await query.answer(f"❌ Ошибка: {type(exc).__name__}", show_alert=True)
 
 
 @dp.callback_query(F.data == "acc_disconnect")
