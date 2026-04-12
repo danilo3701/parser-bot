@@ -56,6 +56,19 @@ def load_accounts() -> dict[str, dict]:
         return {}
 
 
+def list_connected_user_ids() -> list[int]:
+    """
+    Returns user ids that have an entry in MTProto accounts store.
+    """
+    out: list[int] = []
+    for k in load_accounts().keys():
+        try:
+            out.append(int(k))
+        except Exception:
+            pass
+    return sorted(set(out))
+
+
 def save_accounts(data: dict[str, dict]) -> None:
     path = accounts_path()
     path.parent.mkdir(parents=True, exist_ok=True)

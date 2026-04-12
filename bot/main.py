@@ -47,15 +47,25 @@ from scanner import scan_groups_history, monitor_groups_realtime
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
-from broadcast_sender import send_broadcast_campaign, verify_broadcast_messages
+from broadcast_sender import send_broadcast_campaign, send_broadcast_campaign_with_client, verify_broadcast_messages
 from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
     disconnect_account,
     get_account,
+    list_connected_user_ids,
     new_pending_login,
     session_file_for_user,
     set_connected_account,
+)
+from user_data import (
+    add_user_broadcast_group,
+    delete_user_broadcast_group,
+    format_group_ref,
+    list_user_ids_from_disk,
+    load_user_broadcast_groups,
+    normalize_group_ref,
+    user_broadcast_state_path,
 )
 
 # Подхватываем bot/.env независимо от того, из какой папки запускают бота
@@ -166,6 +176,21 @@ def _resolve_storage_channel_ref(state: dict) -> str | None:
         return str(campaign.get("source_channel"))
     return None
 
+
+def _bot_chat_id(ref: str | int) -> int | str:
+    """
+    aiogram Bot API accepts chat_id as int for numeric ids and as str for @username.
+    """
+    if isinstance(ref, int):
+        return ref
+    s = str(ref or "").strip()
+    if re.fullmatch(r"-?\d{5,}", s):
+        try:
+            return int(s)
+        except Exception:
+            return s
+    return s
+
 # ─── Инициализация ───────────────────────────────────────────────────────────
 
 bot = Bot(token=BOT_TOKEN)
@@ -202,6 +227,7 @@ class MainMenu(StatesGroup):
     adding_group = State()
     adding_anti_keyword = State()
     adding_broadcast_channel = State()
+    adding_broadcast_group = State()
     setting_broadcast_source = State()
     adding_broadcast_post = State()
     setting_broadcast_weekday_time = State()
@@ -366,7 +392,34 @@ async def ensure_owner_callback(query: CallbackQuery) -> bool:
     return False
 
 
-def broadcast_summary_text(state: dict) -> str:
+def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
+    """
+    Owner uses global broadcast_state.json; regular users have isolated state under bot/user_data/<user_id>/.
+    """
+    if is_owner(user_id):
+        return broadcast_manager
+    return BroadcastManager(
+        user_broadcast_state_path(user_id),
+        default_tz=BROADCAST_TZ,
+        default_times=BROADCAST_TIMES,
+    )
+
+
+def scoped_load_broadcast_groups(user_id: int) -> list[str]:
+    return load_groups() if is_owner(user_id) else load_user_broadcast_groups(user_id)
+
+
+def get_active_selected_groups_from(state: dict, groups: list[str]) -> list[str]:
+    selected = set(state.get("campaign", {}).get("selected_groups", []))
+    groups_state = state.get("broadcast_groups_state", {})
+    return [
+        group
+        for group in (groups or [])
+        if group in selected and groups_state.get(group, {}).get("status") != "blocked"
+    ]
+
+
+def broadcast_summary_text(state: dict, *, user_id: int | None = None) -> str:
     campaign = state.get("campaign", {})
     schedule = state.get("broadcast_schedule", {})
     send_mode = campaign.get("send_mode", "user")
@@ -394,7 +447,15 @@ def broadcast_summary_text(state: dict) -> str:
         channel = campaign.get("send_as_channel", "не выбран")
         mode_label = f"📢 От канала: {channel}"
 
-    if BROADCAST_ACCOUNTS:
+    if user_id is not None and not is_owner(user_id):
+        meta = get_account(user_id)
+        if meta:
+            username = (meta.get("username") or "").strip()
+            name = (meta.get("first_name") or "").strip()
+            account_label = f"@{username}" if username else (name or "аккаунт")
+        else:
+            account_label = "не подключен"
+    elif BROADCAST_ACCOUNTS:
         account_label = account if account else "не выбран"
     else:
         account_label = "один аккаунт (env)"
@@ -415,7 +476,7 @@ def broadcast_summary_text(state: dict) -> str:
     )
 
 
-def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
+def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarkup:
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
@@ -423,7 +484,7 @@ def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
 
     rows = []
-    if BROADCAST_ACCOUNTS:
+    if BROADCAST_ACCOUNTS and is_owner(user_id):
         rows.append([InlineKeyboardButton(text=f"👤 Аккаунт: {selected_account}", callback_data="bc_accounts")])
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
@@ -623,8 +684,13 @@ def broadcast_copy_target_keyboard(source_weekday: str) -> InlineKeyboardMarkup:
 BROADCAST_GROUPS_PER_PAGE = 6
 
 
-def broadcast_groups_keyboard(state: dict, page: int = 0) -> InlineKeyboardMarkup:
-    groups = load_groups()
+def broadcast_groups_keyboard(
+    state: dict,
+    *,
+    groups: list[str],
+    page: int = 0,
+    allow_manage: bool = False,
+) -> InlineKeyboardMarkup:
     campaign = state.get("campaign", {})
     selected = set(campaign.get("selected_groups", []))
     groups_state = state.get("broadcast_groups_state", {})
@@ -637,6 +703,8 @@ def broadcast_groups_keyboard(state: dict, page: int = 0) -> InlineKeyboardMarku
     page_groups = groups[start:start + BROADCAST_GROUPS_PER_PAGE]
 
     buttons = []
+    if allow_manage:
+        buttons.append([InlineKeyboardButton(text="➕ Добавить чат/группу", callback_data="bcg_add")])
     for group in page_groups:
         group_meta = groups_state.get(group, {})
         blocked = group_meta.get("status") == "blocked"
@@ -647,12 +715,16 @@ def broadcast_groups_keyboard(state: dict, page: int = 0) -> InlineKeyboardMarku
             "deleted": "🗑",
             "unknown": "⚠️",
         }.get(last_status, "")
+        label = format_group_ref(group)
         if blocked:
-            text = f"🚫 {status_icon} @{group}".replace("  ", " ").strip()
+            text = f"🚫 {status_icon} {label}".replace("  ", " ").strip()
         else:
             prefix = "✅" if group in selected else "▫️"
-            text = f"{prefix} {status_icon} @{group}".replace("  ", " ").strip()
-        buttons.append([InlineKeyboardButton(text=text, callback_data=f"bcg_{group}")])
+            text = f"{prefix} {status_icon} {label}".replace("  ", " ").strip()
+        row = [InlineKeyboardButton(text=text, callback_data=f"bcg_{group}")]
+        if allow_manage:
+            row.append(InlineKeyboardButton(text="🗑", callback_data=f"bcgd_{group}"))
+        buttons.append(row)
 
     nav = []
     if page > 0:
@@ -701,21 +773,15 @@ def parse_source_input(text: str) -> tuple[str, int] | None:
     return f"@{match.group(1)}", int(match.group(2))
 
 
-def get_active_selected_groups(state: dict) -> list[str]:
-    selected = set(state.get("campaign", {}).get("selected_groups", []))
-    groups_state = state.get("broadcast_groups_state", {})
-    groups = load_groups()
-    return [
-        group
-        for group in groups
-        if group in selected and groups_state.get(group, {}).get("status") != "blocked"
-    ]
+def get_active_selected_groups(state: dict, groups: list[str]) -> list[str]:
+    return get_active_selected_groups_from(state, groups)
 
 
-async def execute_broadcast(groups: list[str], *, advance_rotation: bool) -> dict:
-    state = broadcast_manager.load()
+async def execute_broadcast(user_id: int, groups: list[str], *, advance_rotation: bool) -> dict:
+    mgr = scoped_broadcast_manager(user_id)
+    state = mgr.load()
     campaign = state.get("campaign", {})
-    post = broadcast_manager.choose_next_post()
+    post = mgr.choose_next_post()
     if not post:
         return {"ok": False, "sent_count": 0, "skipped_count": len(groups), "summary": "Нет постов в пуле."}
 
@@ -723,32 +789,43 @@ async def execute_broadcast(groups: list[str], *, advance_rotation: bool) -> dic
     source_message_id = int(post.get("message_id") or 0)
     send_mode = campaign.get("send_mode", "user")
     send_as = campaign.get("send_as_channel", "") if send_mode == "channel" else None
-    result = await send_broadcast_campaign(
-        groups=groups,
-        source_channel=source_channel,
-        source_message_id=source_message_id,
-        send_as_channel=send_as,
-        account_alias=campaign.get("send_account") or None,
-        delay_seconds=5.0,
-        jitter_seconds=1.0,
-    )
+
+    ok, _, client, _ = await _readiness_check_connected_account(user_id)
+    if not ok or not client:
+        return {"ok": False, "sent_count": 0, "skipped_count": len(groups), "summary": "Аккаунт для рассылки не подключен."}
+
+    try:
+        result = await send_broadcast_campaign_with_client(
+            client=client,
+            groups=groups,
+            source_channel=source_channel,
+            source_message_id=source_message_id,
+            send_as_channel=send_as,
+            delay_seconds=5.0,
+            jitter_seconds=1.0,
+            as_copy=True,
+        )
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
     if advance_rotation and result.get("sent_count", 0) > 0:
-        broadcast_manager.advance_rotation_if_sent()
+        mgr.advance_rotation_if_sent()
     return result
 
 
-def is_campaign_ready(state: dict) -> tuple[bool, str]:
+def is_campaign_ready(state: dict, *, user_id: int, groups: list[str]) -> tuple[bool, str]:
     campaign = state.get("campaign", {})
-    if BROADCAST_ACCOUNTS:
-        acc = campaign.get("send_account", "")
-        if not acc or acc not in BROADCAST_ACCOUNTS:
-            return False, "Не выбран аккаунт отправки (TG_ACCOUNTS)."
+    if not get_account(user_id):
+        return False, "Аккаунт для рассылки не подключен. Нажмите «🔑 Подключить аккаунт»."
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     if not posts:
         return False, "Нет постов в пуле. Добавьте посты в «Посты»."
     if campaign.get("send_mode") == "channel" and not campaign.get("send_as_channel"):
         return False, "Режим 'от канала': не выбран канал send-as."
-    if not get_active_selected_groups(state):
+    if not get_active_selected_groups_from(state, groups):
         return False, "Нет активных выбранных групп."
     return True, ""
 
@@ -763,56 +840,65 @@ async def notify_owner(text: str):
         pass
 
 
+async def notify_user(user_id: int, text: str):
+    try:
+        await bot.send_message(int(user_id), text, parse_mode="HTML")
+    except Exception:
+        pass
+
+
 async def scheduler_loop():
-    tz_name = BROADCAST_TZ
     while True:
         try:
-            state = broadcast_manager.load()
-            schedule = state.get("broadcast_schedule", {})
-            if not schedule.get("enabled", True):
-                await asyncio.sleep(20)
-                continue
+            owner_id = list(OWNER_IDS)[0] if OWNER_IDS else None
+            user_ids = set(list_connected_user_ids() + list_user_ids_from_disk())
+            if owner_id is not None:
+                user_ids.add(int(owner_id))
 
-            tz_name = schedule.get("tz", BROADCAST_TZ)
-            now_local = datetime.now(ZoneInfo(tz_name))
-            date_str = now_local.strftime("%Y-%m-%d")
+            for user_id in sorted(user_ids):
+                bm = scoped_broadcast_manager(user_id)
+                groups_all = scoped_load_broadcast_groups(user_id)
+                state = bm.ensure_groups_known(groups_all)
 
-            weekday = WEEKDAYS[now_local.weekday()]
-            weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
-            meta = weekly.get(weekday) or {}
-            slot = meta.get("time")
-            if not (meta.get("enabled") and slot):
-                await asyncio.sleep(20)
-                continue
+                schedule = state.get("broadcast_schedule", {})
+                if not schedule.get("enabled", True):
+                    continue
 
-            # Run only at the exact minute; if missed (downtime), skip for the day.
-            if now_local.strftime("%H:%M") != slot:
-                await asyncio.sleep(20)
-                continue
+                tz_name = schedule.get("tz", BROADCAST_TZ)
+                now_local = datetime.now(ZoneInfo(tz_name))
+                date_str = now_local.strftime("%Y-%m-%d")
 
-            if broadcast_manager.was_slot_run(date_str, slot):
-                await asyncio.sleep(20)
-                continue
-            if broadcast_lock.locked():
-                await asyncio.sleep(20)
-                continue
+                weekday = WEEKDAYS[now_local.weekday()]
+                weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+                meta = weekly.get(weekday) or {}
+                slot = meta.get("time")
+                if not (meta.get("enabled") and slot):
+                    continue
 
-            ready, reason = is_campaign_ready(state)
-            if not ready:
-                broadcast_manager.mark_slot_run(date_str, slot, "skipped", reason)
-                await notify_owner(f"📣 Авторассылка пропущена ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {reason}")
-                await asyncio.sleep(20)
-                continue
+                # Run only at the exact minute; if missed (downtime), skip for the day.
+                if now_local.strftime("%H:%M") != slot:
+                    continue
 
-            groups = get_active_selected_groups(state)
-            async with broadcast_lock:
-                result = await execute_broadcast(groups, advance_rotation=True)
-            for group, err in result.get("blocked_groups", {}).items():
-                broadcast_manager.set_group_blocked(group, err)
+                if bm.was_slot_run(date_str, slot):
+                    continue
+                if broadcast_lock.locked():
+                    continue
 
-            status = "ok" if result.get("ok") else "failed"
-            broadcast_manager.mark_slot_run(date_str, slot, status, result.get("summary", ""))
-            await notify_owner(f"📣 Авторассылка ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {result.get('summary', '')}")
+                ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
+                if not ready:
+                    bm.mark_slot_run(date_str, slot, "skipped", reason)
+                    await notify_user(user_id, f"📣 Авторассылка пропущена ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {reason}")
+                    continue
+
+                groups = get_active_selected_groups(state, groups_all)
+                async with broadcast_lock:
+                    result = await execute_broadcast(user_id, groups, advance_rotation=True)
+                for group, err in result.get("blocked_groups", {}).items():
+                    bm.set_group_blocked(group, err)
+
+                status = "ok" if result.get("ok") else "failed"
+                bm.mark_slot_run(date_str, slot, status, result.get("summary", ""))
+                await notify_user(user_id, f"📣 Авторассылка ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {result.get('summary', '')}")
 
             await asyncio.sleep(20)
         except Exception:
@@ -824,7 +910,7 @@ async def scheduler_loop():
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(MainMenu.viewing)
-    bm_state = broadcast_manager.load()
+    bm_state = scoped_broadcast_manager(message.from_user.id).load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
@@ -852,7 +938,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def back_to_main(query: CallbackQuery, state: FSMContext):
     await query.answer()
     await state.set_state(MainMenu.viewing)
-    bm_state = broadcast_manager.load()
+    bm_state = scoped_broadcast_manager(query.from_user.id).load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
@@ -869,12 +955,11 @@ async def back_to_main(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "main_bc_toggle")
 async def main_bc_toggle(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
-    bm_state = broadcast_manager.load()
+    bm = scoped_broadcast_manager(query.from_user.id)
+    bm_state = bm.load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     new_enabled = not schedule_enabled
-    broadcast_manager.set_schedule_enabled(new_enabled)
+    bm.set_schedule_enabled(new_enabled)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
     active_name = ""
@@ -892,11 +977,14 @@ async def main_bc_toggle(query: CallbackQuery):
 
 @dp.callback_query(F.data == "broadcast")
 async def broadcast_menu(query: CallbackQuery):
-    state = broadcast_manager.ensure_groups_known(load_groups())
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
-        broadcast_summary_text(state),
+        broadcast_summary_text(state, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state),
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer()
 
@@ -982,10 +1070,10 @@ async def _readiness_check_connected_account(user_id: int) -> tuple[bool, str, o
 
 @dp.callback_query(F.data == "bc_ready")
 async def broadcast_readiness(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
-
-    state = broadcast_manager.load()
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
     campaign = state.get("campaign", {})
     selected_groups = campaign.get("selected_groups", []) if isinstance(campaign.get("selected_groups", []), list) else []
     send_mode = campaign.get("send_mode", "user")
@@ -995,7 +1083,7 @@ async def broadcast_readiness(query: CallbackQuery):
         await query.answer("Сначала выберите группы рассылки.", show_alert=True)
         return
 
-    ok, _, client, who = await _readiness_check_connected_account(query.from_user.id)
+    ok, _, client, who = await _readiness_check_connected_account(user_id)
     if not ok or not client:
         await query.message.edit_text(
             "🧭 <b>Готовность</b>\n\n"
@@ -1664,6 +1752,8 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
 
 @dp.callback_query(F.data == "bc_accounts")
 async def broadcast_accounts(query: CallbackQuery):
+    if not await ensure_owner_callback(query):
+        return
     state = broadcast_manager.load()
     if not BROADCAST_ACCOUNTS:
         await query.answer("TG_ACCOUNTS не задано.", show_alert=True)
@@ -1680,7 +1770,8 @@ async def broadcast_accounts(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_channels")
 async def broadcast_channels(query: CallbackQuery):
-    state = broadcast_manager.load()
+    user_id = query.from_user.id
+    state = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\n"
         "Выберите активный канал отправки или добавьте новый.",
@@ -1706,19 +1797,18 @@ async def broadcast_add_channel_prompt(query: CallbackQuery, state: FSMContext):
 
 @dp.message(MainMenu.adding_broadcast_channel)
 async def broadcast_add_channel_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔️ Доступ только для владельца.")
-        return
+    user_id = message.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     value = (message.text or "").strip()
     if not re.match(r"^@[A-Za-z0-9_]{5,32}$", value):
         await message.answer("❌ Неверный формат. Используйте @channel_username")
         return
-    current = broadcast_manager.load().get("campaign", {}).get("send_as_channel")
-    broadcast_manager.add_send_as_channel(value)
+    current = bm.load().get("campaign", {}).get("send_as_channel")
+    bm.add_send_as_channel(value)
     if not current:
-        broadcast_manager.set_send_as_channel(value)
+        bm.set_send_as_channel(value)
     await state.set_state(MainMenu.viewing)
-    state_data = broadcast_manager.load()
+    state_data = bm.load()
     await message.answer(
         "✅ Канал добавлен.",
         reply_markup=broadcast_channels_keyboard(state_data),
@@ -1728,11 +1818,13 @@ async def broadcast_add_channel_input(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("bc_set_"))
 async def broadcast_set_channel(query: CallbackQuery):
     channel = query.data[len("bc_set_"):]
-    state = broadcast_manager.load()
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
     if channel not in state.get("send_as_channels", []):
         await query.answer("Канал не найден.", show_alert=True)
         return
-    state = broadcast_manager.set_send_as_channel(channel)
+    state = bm.set_send_as_channel(channel)
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\nАктивный канал обновлён.",
         parse_mode="HTML",
@@ -1743,12 +1835,14 @@ async def broadcast_set_channel(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_del_selected_channel")
 async def broadcast_delete_selected_channel(query: CallbackQuery):
-    state = broadcast_manager.load()
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
     selected = state.get("campaign", {}).get("send_as_channel")
     if not selected:
         await query.answer("Сначала выберите канал.", show_alert=True)
         return
-    state = broadcast_manager.remove_send_as_channel(selected)
+    state = bm.remove_send_as_channel(selected)
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\nВыбранный канал удалён.",
         parse_mode="HTML",
@@ -1785,6 +1879,8 @@ async def broadcast_account_set(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_source")
 async def broadcast_source_prompt(query: CallbackQuery, state: FSMContext):
+    if not await ensure_owner_callback(query):
+        return
     await query.message.edit_text(
         "📝 <b>Источник поста</b>\n\n"
         "Отправьте: <code>@channel message_id</code>\n"
@@ -1814,16 +1910,15 @@ async def broadcast_source_input(message: Message, state: FSMContext):
     await message.answer(
         "✅ Источник поста сохранён.",
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(current),
+        reply_markup=broadcast_main_keyboard(current, user_id=message.from_user.id),
     )
 
 
 @dp.callback_query(F.data == "bc_posts")
 async def broadcast_posts(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
     await state.set_state(MainMenu.viewing)
-    data = broadcast_manager.load()
+    data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
         broadcast_posts_text(data),
         parse_mode="HTML",
@@ -1835,9 +1930,8 @@ async def broadcast_posts(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "bcp_add")
 async def broadcast_posts_add_prompt(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
-    data = broadcast_manager.load()
+    user_id = query.from_user.id
+    data = scoped_broadcast_manager(user_id).load()
     storage_ref = _resolve_storage_channel_ref(data)
     if not storage_ref:
         await query.answer("Не задан канал для хранения постов (storage).", show_alert=True)
@@ -1856,18 +1950,15 @@ async def broadcast_posts_add_prompt(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "bcp_more")
 async def broadcast_posts_add_more(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
     await state.set_state(MainMenu.adding_broadcast_post)
     await query.answer("Жду следующий пост")
 
 
 @dp.callback_query(F.data == "bcp_done")
 async def broadcast_posts_add_done(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
     await state.set_state(MainMenu.viewing)
-    data = broadcast_manager.load()
+    data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
         broadcast_posts_text(data),
         parse_mode="HTML",
@@ -1879,10 +1970,10 @@ async def broadcast_posts_add_done(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("bcp_del_"))
 async def broadcast_posts_delete(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     post_id = query.data[len("bcp_del_"):]
-    data = broadcast_manager.delete_post(post_id)
+    data = bm.delete_post(post_id)
     await query.message.edit_text(
         broadcast_posts_text(data),
         parse_mode="HTML",
@@ -1894,11 +1985,9 @@ async def broadcast_posts_delete(query: CallbackQuery):
 
 @dp.message(MainMenu.adding_broadcast_post)
 async def broadcast_posts_add_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔️ Доступ только для владельца.")
-        return
-
-    data = broadcast_manager.load()
+    user_id = message.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    data = bm.load()
     campaign = data.get("campaign", {})
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     if len(posts) >= 10:
@@ -1928,7 +2017,7 @@ async def broadcast_posts_add_input(message: Message, state: FSMContext):
 
     try:
         copied = await bot.copy_message(
-            chat_id=storage_ref,
+            chat_id=_bot_chat_id(storage_ref),
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
@@ -1939,7 +2028,7 @@ async def broadcast_posts_add_input(message: Message, state: FSMContext):
         await message.answer(f"❌ Не удалось сохранить пост в storage: {type(exc).__name__}", reply_markup=broadcast_posts_add_keyboard())
         return
 
-    broadcast_manager.add_post(
+    bm.add_post(
         channel=str(storage_ref),
         message_id=stored_message_id,
         kind=kind,
@@ -1955,13 +2044,16 @@ async def broadcast_posts_add_input(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "bc_groups")
 async def broadcast_groups(query: CallbackQuery):
-    state = broadcast_manager.ensure_groups_known(load_groups())
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
         "👥 <b>Выбор групп для рассылки</b>\n\n"
         "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
         "Нажмите на группу, чтобы переключить.",
         parse_mode="HTML",
-        reply_markup=broadcast_groups_keyboard(state, page=0),
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=not is_owner(user_id)),
     )
     await query.answer()
 
@@ -1969,21 +2061,121 @@ async def broadcast_groups(query: CallbackQuery):
 @dp.callback_query(F.data.startswith("bcgp_"))
 async def broadcast_groups_page(query: CallbackQuery):
     page = int(query.data.split("_")[-1])
-    state = broadcast_manager.ensure_groups_known(load_groups())
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
         "👥 <b>Выбор групп для рассылки</b>\n\n"
         "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
         "Нажмите на группу, чтобы переключить.",
         parse_mode="HTML",
-        reply_markup=broadcast_groups_keyboard(state, page=page),
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=page, allow_manage=not is_owner(user_id)),
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == "bcg_add")
+async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
+    user_id = query.from_user.id
+    if is_owner(user_id):
+        await query.answer("Для админа список групп фиксированный.", show_alert=True)
+        return
+    await state.set_state(MainMenu.adding_broadcast_group)
+    await query.message.edit_text(
+        "➕ <b>Добавить чат/группу</b>\n\n"
+        "Способы:\n"
+        "1) Напишите <code>@username</code> или <code>t.me/username</code> или просто <code>username</code>\n"
+        "2) Перешлите сюда сообщение из нужной группы/чата (я сохраню chat_id)\n\n"
+        "Примечание: рассылка возможна только если подключенный аккаунт состоит в этой группе/чате.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+        ]),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.message(MainMenu.adding_broadcast_group)
+async def broadcast_groups_add_input(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    if is_owner(user_id):
+        await state.set_state(MainMenu.viewing)
+        await message.answer("⛔️ Доступ только для пользователей.", reply_markup=back_button())
+        return
+
+    ref = None
+    # Forwarded message: try to extract chat id from multiple Bot API variants
+    forward_from_chat = getattr(message, "forward_from_chat", None)
+    if forward_from_chat and getattr(forward_from_chat, "id", None):
+        ref = str(forward_from_chat.id)
+    if not ref:
+        origin = getattr(message, "forward_origin", None)
+        sender_chat = getattr(origin, "sender_chat", None) if origin else None
+        if sender_chat and getattr(sender_chat, "id", None):
+            ref = str(sender_chat.id)
+    if not ref:
+        # Some clients forward with a nested "chat" object
+        origin = getattr(message, "forward_origin", None)
+        chat_obj = getattr(origin, "chat", None) if origin else None
+        if chat_obj and getattr(chat_obj, "id", None):
+            ref = str(chat_obj.id)
+
+    if not ref:
+        ref = normalize_group_ref(message.text or "")
+
+    if not ref:
+        await message.answer("❌ Не удалось распознать группу/чат. Пришлите @username или перешлите сообщение из чата.")
+        return
+
+    added = add_user_broadcast_group(user_id, ref)
+    if not added:
+        await message.answer("⚠️ Уже есть в списке.")
+    else:
+        await message.answer(f"✅ Добавлено: <code>{format_group_ref(ref)}</code>", parse_mode="HTML")
+
+    await state.set_state(MainMenu.viewing)
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    data = bm.ensure_groups_known(groups)
+    await message.answer(
+        "👥 <b>Выбор групп для рассылки</b>\n\n"
+        "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
+        "Нажмите на группу, чтобы переключить.",
+        parse_mode="HTML",
+        reply_markup=broadcast_groups_keyboard(data, groups=groups, page=0, allow_manage=True),
+    )
+
+
+@dp.callback_query(F.data.startswith("bcgd_"))
+async def broadcast_group_delete(query: CallbackQuery):
+    user_id = query.from_user.id
+    if is_owner(user_id):
+        await query.answer("Для админа список групп фиксированный.", show_alert=True)
+        return
+    group = query.data[len("bcgd_"):]
+    bm = scoped_broadcast_manager(user_id)
+    if delete_user_broadcast_group(user_id, group):
+        bm.unselect_groups([group])
+        await query.answer("Удалено")
+    else:
+        await query.answer("Не найдено", show_alert=True)
+
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
+    await query.message.edit_reply_markup(
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=True)
+    )
 
 
 @dp.callback_query(F.data.startswith("bcg_"))
 async def broadcast_group_toggle(query: CallbackQuery):
     group = query.data[len("bcg_"):]
-    state = broadcast_manager.ensure_groups_known(load_groups())
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
     group_meta = state.get("broadcast_groups_state", {}).get(group, {})
     last_status = (group_meta.get("last_test_status") or "").strip()
     last_reason = (group_meta.get("last_test_reason") or "").strip()
@@ -1994,10 +2186,10 @@ async def broadcast_group_toggle(query: CallbackQuery):
         "unknown": "⚠️",
     }.get(last_status, "")
     if group_meta.get("status") == "blocked":
-        state = broadcast_manager.set_group_active(group)
+        state = bm.set_group_active(group)
         await query.answer("Группа разблокирована")
     else:
-        state = broadcast_manager.toggle_group_selected(group)
+        state = bm.toggle_group_selected(group)
         if last_status and last_status != "ok":
             hint = f"{status_icon} последний тест: {last_status}"
             if last_reason:
@@ -2005,28 +2197,31 @@ async def broadcast_group_toggle(query: CallbackQuery):
             await query.answer(hint)
         else:
             await query.answer()
-    await query.message.edit_reply_markup(reply_markup=broadcast_groups_keyboard(state, page=0))
+    await query.message.edit_reply_markup(
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=not is_owner(user_id))
+    )
 
 
 @dp.callback_query(F.data == "bc_schedule_toggle")
 async def broadcast_schedule_toggle(query: CallbackQuery):
-    state = broadcast_manager.load()
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
     enabled = state.get("broadcast_schedule", {}).get("enabled", True)
-    state = broadcast_manager.set_schedule_enabled(not enabled)
+    state = bm.set_schedule_enabled(not enabled)
     await query.message.edit_text(
-        broadcast_summary_text(state),
+        broadcast_summary_text(state, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state),
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer("Обновлено")
 
 
 @dp.callback_query(F.data == "bc_schedule")
 async def broadcast_schedule_week(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
     await state.set_state(MainMenu.viewing)
-    data = broadcast_manager.load()
+    data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
         broadcast_week_text(data),
         parse_mode="HTML",
@@ -2038,14 +2233,13 @@ async def broadcast_schedule_week(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("bcs_day_"))
 async def broadcast_schedule_day_open(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
     weekday = query.data[len("bcs_day_"):]
     if weekday not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
         return
     await state.set_state(MainMenu.viewing)
-    data = broadcast_manager.load()
+    data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
         broadcast_day_text(data, weekday),
         parse_mode="HTML",
@@ -2057,8 +2251,6 @@ async def broadcast_schedule_day_open(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("bcs_set_"))
 async def broadcast_schedule_day_set_prompt(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
     weekday = query.data[len("bcs_set_"):]
     if weekday not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
@@ -2079,9 +2271,8 @@ async def broadcast_schedule_day_set_prompt(query: CallbackQuery, state: FSMCont
 
 @dp.message(MainMenu.setting_broadcast_weekday_time)
 async def broadcast_schedule_day_set_input(message: Message, state: FSMContext):
-    if not is_owner(message.from_user.id):
-        await message.answer("⛔️ Доступ только для владельца.")
-        return
+    user_id = message.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     data = await state.get_data()
     weekday = (data.get("bcs_weekday") or "").strip()
     if weekday not in WEEKDAYS:
@@ -2098,9 +2289,9 @@ async def broadcast_schedule_day_set_input(message: Message, state: FSMContext):
         await message.answer(err)
         return
 
-    broadcast_manager.set_weekday_time(weekday, hhmm)
+    bm.set_weekday_time(weekday, hhmm)
     await state.set_state(MainMenu.viewing)
-    st = broadcast_manager.load()
+    st = bm.load()
     await message.answer(
         f"✅ Время сохранено: <b>{WEEKDAY_NAMES.get(weekday, weekday)} {hhmm}</b>",
         parse_mode="HTML",
@@ -2110,13 +2301,13 @@ async def broadcast_schedule_day_set_input(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("bcs_clear_"))
 async def broadcast_schedule_day_clear(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     weekday = query.data[len("bcs_clear_"):]
     if weekday not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
         return
-    data = broadcast_manager.set_weekday_time(weekday, None)
+    data = bm.set_weekday_time(weekday, None)
     await query.message.edit_text(
         broadcast_day_text(data, weekday),
         parse_mode="HTML",
@@ -2127,16 +2318,16 @@ async def broadcast_schedule_day_clear(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("bcs_toggle_"))
 async def broadcast_schedule_day_toggle(query: CallbackQuery):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     weekday = query.data[len("bcs_toggle_"):]
     if weekday not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
         return
-    st = broadcast_manager.load()
+    st = bm.load()
     meta = (st.get("weekly_schedule") or {}).get(weekday) or {}
     new_enabled = not bool(meta.get("enabled"))
-    data = broadcast_manager.set_weekday_enabled(weekday, new_enabled)
+    data = bm.set_weekday_enabled(weekday, new_enabled)
     await query.message.edit_text(
         broadcast_day_text(data, weekday),
         parse_mode="HTML",
@@ -2147,8 +2338,6 @@ async def broadcast_schedule_day_toggle(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("bcs_copy_"))
 async def broadcast_schedule_copy_start(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
     weekday = query.data[len("bcs_copy_"):]
     if weekday not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
@@ -2165,8 +2354,8 @@ async def broadcast_schedule_copy_start(query: CallbackQuery, state: FSMContext)
 
 @dp.callback_query(F.data.startswith("bcs_copy_to_"))
 async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContext):
-    if not await ensure_owner_callback(query):
-        return
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
     parts = query.data.split("_")
     if len(parts) < 5:
         await query.answer("Неверная команда.", show_alert=True)
@@ -2176,9 +2365,9 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
     if source not in WEEKDAYS or target not in WEEKDAYS:
         await query.answer("Неверный день.", show_alert=True)
         return
-    broadcast_manager.copy_weekday(source, target)
+    bm.copy_weekday(source, target)
     await state.set_state(MainMenu.viewing)
-    data = broadcast_manager.load()
+    data = bm.load()
     await query.message.edit_text(
         broadcast_day_text(data, source),
         parse_mode="HTML",
@@ -2192,31 +2381,34 @@ async def broadcast_test(query: CallbackQuery):
     if broadcast_lock.locked():
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-    state = broadcast_manager.ensure_groups_known(load_groups())
-    ready, reason = is_campaign_ready(state)
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups_all)
+    ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
         return
-    test_groups = get_active_selected_groups(state)
+    test_groups = get_active_selected_groups(state, groups_all)
 
     await query.message.edit_text(
         f"🧪 <b>Тест-рассылка</b>\n\nГрупп: <code>{len(test_groups)}</code>\nВыполняю отправку...",
         parse_mode="HTML",
     )
     async with broadcast_lock:
-        result = await execute_broadcast(test_groups, advance_rotation=False)
+        result = await execute_broadcast(user_id, test_groups, advance_rotation=False)
     for group, err in result.get("blocked_groups", {}).items():
-        broadcast_manager.set_group_blocked(group, err)
+        bm.set_group_blocked(group, err)
 
     if result.get("sent_count", 0) > 0:
-        broadcast_manager.mark_test_passed()
+        bm.mark_test_passed()
     else:
-        broadcast_manager.reset_test_flag()
-    state = broadcast_manager.load()
+        bm.reset_test_flag()
+    state = bm.load()
     await query.message.edit_text(
         f"🧪 <b>Тест завершён</b>\n\n{result.get('summary', '')}",
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state),
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer()
 
@@ -2227,15 +2419,16 @@ async def broadcast_test_v2(query: CallbackQuery):
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
 
-    state = broadcast_manager.ensure_groups_known(load_groups())
-    ready, reason = is_campaign_ready(state)
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups_all)
+    ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
         return
 
-    campaign = state.get("campaign", {})
-    test_groups = get_active_selected_groups(state)
-    verify_seconds = max(0, int(BROADCAST_TEST_VERIFY_SECONDS or 0))
+    test_groups = get_active_selected_groups(state, groups_all)
 
     await query.message.edit_text(
         "🧪 <b>Тест-рассылка</b>\n\n"
@@ -2246,149 +2439,46 @@ async def broadcast_test_v2(query: CallbackQuery):
 
     started_at = datetime.now(timezone.utc).isoformat()
     async with broadcast_lock:
-        result = await execute_broadcast(test_groups, advance_rotation=False)
+        result = await execute_broadcast(user_id, test_groups, advance_rotation=False)
 
     sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
     send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
     blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
 
-    verify_map: dict[str, dict] = {}
-    if verify_seconds > 0 and sent_message_ids:
-        await query.message.edit_text(
-            "🧪 <b>Тест-рассылка</b>\n\n"
-            f"Отправлено: <b>{len(sent_message_ids)}</b>\n"
-            f"Жду <b>{verify_seconds} сек</b> и проверяю наличие сообщений…",
-            parse_mode="HTML",
-        )
-        await asyncio.sleep(verify_seconds)
-        verify_map = await verify_broadcast_messages(
-            sent_message_ids,
-            account_alias=campaign.get("send_account") or None,
-        )
+    for group, err in blocked.items():
+        bm.set_group_blocked(group, err)
 
-    verified_at = datetime.now(timezone.utc).isoformat()
-
-    delivered_ok: list[str] = []
-    deleted_after_send: list[str] = []
-    unknown_after_send: list[str] = []
-    for group in sent_message_ids.keys():
-        meta = verify_map.get(group) or {}
-        st = meta.get("status") or "unknown_after_send"
-        if st == "delivered_ok":
-            delivered_ok.append(group)
-        elif st == "deleted_after_send":
-            deleted_after_send.append(group)
+    for group in test_groups:
+        if group in sent_message_ids:
+            bm.set_group_last_test(
+                group,
+                status="ok",
+                reason="ok",
+                message_id=int(sent_message_ids.get(group) or 0) if sent_message_ids.get(group) else None,
+                sent_at=started_at,
+                verified_at=None,
+            )
         else:
-            unknown_after_send.append(group)
+            bm.set_group_last_test(
+                group,
+                status="failed",
+                reason=str(send_errors.get(group) or "other"),
+                message_id=None,
+                sent_at=started_at,
+                verified_at=None,
+            )
 
-    send_failed: list[str] = [g for g in test_groups if g not in sent_message_ids]
-
-    new_state = broadcast_manager.load()
-    groups_state = new_state.setdefault("broadcast_groups_state", {})
-
-    def ensure_group_meta(g: str) -> dict:
-        meta = groups_state.get(g)
-        if not isinstance(meta, dict):
-            meta = {}
-            groups_state[g] = meta
-        meta.setdefault("status", "active")
-        meta.setdefault("reason", "")
-        meta.setdefault("updated_at", None)
-        meta.setdefault("last_test_status", None)
-        meta.setdefault("last_test_reason", None)
-        meta.setdefault("last_test_message_id", None)
-        meta.setdefault("last_test_sent_at", None)
-        meta.setdefault("last_test_verified_at", None)
-        return meta
-
-    for g, err in blocked.items():
-        meta = ensure_group_meta(g)
-        meta["status"] = "blocked"
-        meta["reason"] = str(err)
-        meta["updated_at"] = verified_at
-
-    for g in delivered_ok:
-        meta = ensure_group_meta(g)
-        meta["last_test_status"] = "ok"
-        meta["last_test_reason"] = "ok"
-        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
-        meta["last_test_sent_at"] = started_at
-        meta["last_test_verified_at"] = verified_at
-        meta["updated_at"] = verified_at
-
-    for g in deleted_after_send:
-        meta = ensure_group_meta(g)
-        meta["last_test_status"] = "deleted"
-        meta["last_test_reason"] = "deleted_after_send"
-        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
-        meta["last_test_sent_at"] = started_at
-        meta["last_test_verified_at"] = verified_at
-        meta["updated_at"] = verified_at
-
-    for g in unknown_after_send:
-        meta = ensure_group_meta(g)
-        reason_code = (verify_map.get(g) or {}).get("reason") or "other"
-        meta["last_test_status"] = "unknown"
-        meta["last_test_reason"] = str(reason_code)
-        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
-        meta["last_test_sent_at"] = started_at
-        meta["last_test_verified_at"] = verified_at
-        meta["updated_at"] = verified_at
-
-    for g in send_failed:
-        meta = ensure_group_meta(g)
-        meta["last_test_status"] = "failed"
-        meta["last_test_reason"] = str(send_errors.get(g) or "other")
-        meta["last_test_message_id"] = None
-        meta["last_test_sent_at"] = started_at
-        meta["last_test_verified_at"] = verified_at
-        meta["updated_at"] = verified_at
-
-    removed = sorted(set(send_failed + deleted_after_send))
-    if removed:
-        selected = set(new_state.get("campaign", {}).get("selected_groups", []))
-        for g in removed:
-            selected.discard(g)
-        new_state["campaign"]["selected_groups"] = sorted(selected)
-
-    if delivered_ok:
-        new_state["campaign"]["test_passed"] = True
-        new_state["campaign"]["last_test_at"] = verified_at
+    if result.get("sent_count", 0) > 0:
+        bm.mark_test_passed()
     else:
-        new_state["campaign"]["test_passed"] = False
-        new_state["campaign"]["last_test_at"] = None
+        bm.reset_test_flag()
 
-    broadcast_manager.save(new_state)
-
-    lines = [
-        "🧪 <b>Тест завершён</b>\n",
-        f"Выбрано групп: <b>{len(test_groups)}</b>",
-        f"Отправлено: <b>{len(sent_message_ids)}</b>",
-        f"OK (есть через {verify_seconds}с): <b>{len(delivered_ok)}</b>",
-        f"Удалено после отправки: <b>{len(deleted_after_send)}</b>",
-        f"Не удалось проверить: <b>{len(unknown_after_send)}</b>",
-        f"Не отправилось: <b>{len(send_failed)}</b>",
-    ]
-    if removed:
-        lines.append(f"\n⚠️ Проблемные группы сняты с выбора: <b>{len(removed)}</b>")
-
-    problems: list[tuple[str, str]] = []
-    for g in deleted_after_send:
-        problems.append((g, "deleted_after_send"))
-    for g in send_failed:
-        problems.append((g, str(send_errors.get(g) or "other")))
-    if problems:
-        lines.append("\n<b>Проблемные группы (первые 15):</b>")
-        for g, why in problems[:15]:
-            lines.append(f"- <code>@{g}</code> — <code>{why}</code>")
-        if len(problems) > 15:
-            lines.append(f"…и ещё <b>{len(problems) - 15}</b>")
-
-    updated = broadcast_manager.load()
+    updated = bm.load()
     await query.message.edit_text(
-        "\n".join(lines),
+        "🧪 <b>Тест завершён</b>\n\n"
+        f"{result.get('summary', '')}",
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(updated),
+        reply_markup=broadcast_main_keyboard(updated, user_id=user_id),
         disable_web_page_preview=True,
     )
     await query.answer()
@@ -2396,14 +2486,16 @@ async def broadcast_test_v2(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_mode_toggle")
 async def broadcast_mode_toggle(query: CallbackQuery):
-    state_data = broadcast_manager.load()
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state_data = bm.load()
     current = state_data.get("campaign", {}).get("send_mode", "user")
     new_mode = "channel" if current == "user" else "user"
-    state_data = broadcast_manager.set_send_mode(new_mode)
+    state_data = bm.set_send_mode(new_mode)
     await query.message.edit_text(
-        broadcast_summary_text(state_data),
+        broadcast_summary_text(state_data, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state_data),
+        reply_markup=broadcast_main_keyboard(state_data, user_id=user_id),
     )
     await query.answer()
 
@@ -2413,26 +2505,29 @@ async def broadcast_mass(query: CallbackQuery):
     if broadcast_lock.locked():
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-    state = broadcast_manager.ensure_groups_known(load_groups())
-    ready, reason = is_campaign_ready(state)
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups_all)
+    ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
         return
-    groups = get_active_selected_groups(state)
+    groups = get_active_selected_groups(state, groups_all)
     await query.message.edit_text(
         f"📣 <b>Массовая рассылка</b>\n\nГрупп к отправке: <b>{len(groups)}</b>\nВыполняю...",
         parse_mode="HTML",
     )
     async with broadcast_lock:
-        result = await execute_broadcast(groups, advance_rotation=True)
+        result = await execute_broadcast(user_id, groups, advance_rotation=True)
     for group, err in result.get("blocked_groups", {}).items():
-        broadcast_manager.set_group_blocked(group, err)
+        bm.set_group_blocked(group, err)
 
-    state = broadcast_manager.load()
+    state = bm.load()
     await query.message.edit_text(
         f"📣 <b>Массовая рассылка завершена</b>\n\n{result.get('summary', '')}",
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state),
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer()
 

@@ -109,6 +109,174 @@ def _choose_credentials(account_alias: str | None) -> tuple[dict | None, str | N
     return creds, "tutor_bot_broadcast", None
 
 
+def _as_entity_ref(value: str | int | None):
+    """
+    Best-effort conversion of a group/channel reference into something Telethon can resolve.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"-?\d{5,}", s):
+        try:
+            return int(s)
+        except Exception:
+            return s
+    return s
+
+
+async def send_broadcast_campaign_with_client(
+    *,
+    client,
+    groups: list[str],
+    source_channel: str | int,
+    source_message_id: int,
+    send_as_channel: str | None = None,
+    delay_seconds: float = 5.0,
+    jitter_seconds: float = 1.0,
+    as_copy: bool = True,
+) -> dict:
+    """
+    Sends campaign using an already connected/authorized Telethon client.
+    Uses forward as copy by default to avoid "Forwarded from ..." header.
+    """
+    result = {
+        "ok": False,
+        "matched_groups": len(groups),
+        "sent_count": 0,
+        "skipped_count": 0,
+        "blocked_groups": {},
+        "skipped_groups": {},
+        "failed_groups": {},
+        "sent_message_ids": {},
+        "send_errors": {},
+        "summary": "",
+        "account": "connected",
+    }
+
+    try:
+        # Warm up dialogs cache to help resolving numeric ids (private chats)
+        try:
+            await client.get_dialogs(limit=200)
+        except Exception:
+            pass
+
+        source_entity = await client.get_entity(_as_entity_ref(source_channel))
+        source_message = await client.get_messages(source_entity, ids=int(source_message_id))
+        if not source_message:
+            result["summary"] = "Исходный пост не найден."
+            return result
+
+        source_text = source_message.raw_text or ""
+        if URL_RE.search(source_text):
+            result["summary"] = "Исходный пост содержит URL (http/https/t.me). Политика v1 запрещает такие ссылки."
+            return result
+
+        send_as_entity = None
+        if send_as_channel:
+            try:
+                send_as_entity = await client.get_entity(_as_entity_ref(send_as_channel))
+            except Exception:
+                send_as_entity = None
+    except Exception as exc:
+        result["summary"] = f"Ошибка подготовки рассылки: {type(exc).__name__}"
+        return result
+
+    for idx, group in enumerate(groups):
+        try:
+            group_entity = await client.get_entity(_as_entity_ref(group))
+        except Exception as exc:
+            result["failed_groups"][group] = f"resolve_failed: {type(exc).__name__}"
+            result["send_errors"][group] = "resolve_failed"
+            result["skipped_count"] += 1
+            continue
+
+        sent = False
+        sent_message_id = None
+        try:
+            if as_copy:
+                kwargs = {"as_copy": True}
+                if send_as_entity is not None:
+                    kwargs["send_as"] = send_as_entity
+                try:
+                    forwarded = await client.forward_messages(
+                        entity=group_entity,
+                        messages=[source_message_id],
+                        from_peer=source_entity,
+                        **kwargs,
+                    )
+                except TypeError:
+                    # Older Telethon builds may not support send_as/as_copy in forward_messages
+                    forwarded = await client.forward_messages(
+                        entity=group_entity,
+                        messages=[source_message_id],
+                        from_peer=source_entity,
+                        as_copy=True,
+                    )
+                if isinstance(forwarded, list) and forwarded:
+                    sent_message_id = getattr(forwarded[0], "id", None)
+                else:
+                    sent_message_id = getattr(forwarded, "id", None)
+                sent = True
+            else:
+                kwargs = {"link_preview": False}
+                if send_as_entity is not None:
+                    kwargs["send_as"] = send_as_entity
+                sent_msg = await client.send_message(group_entity, source_message, **kwargs)
+                sent = True
+                sent_message_id = getattr(sent_msg, "id", None)
+        except telethon.errors.FloodWaitError as exc:
+            await asyncio.sleep(exc.seconds + 1)
+            try:
+                forwarded = await client.forward_messages(
+                    entity=group_entity,
+                    messages=[source_message_id],
+                    from_peer=source_entity,
+                    as_copy=True,
+                )
+                if isinstance(forwarded, list) and forwarded:
+                    sent_message_id = getattr(forwarded[0], "id", None)
+                else:
+                    sent_message_id = getattr(forwarded, "id", None)
+                sent = True
+            except Exception as retry_exc:
+                reason = _normalize_reason(retry_exc)
+                if _is_hard_permission_reason(reason):
+                    result["blocked_groups"][group] = type(retry_exc).__name__
+                else:
+                    result["failed_groups"][group] = type(retry_exc).__name__
+                result["send_errors"][group] = reason
+        except Exception as exc:
+            reason = _normalize_reason(exc)
+            if _is_hard_permission_reason(reason):
+                result["blocked_groups"][group] = type(exc).__name__
+            else:
+                result["failed_groups"][group] = type(exc).__name__
+            result["send_errors"][group] = reason
+
+        if sent:
+            result["sent_count"] += 1
+            if isinstance(sent_message_id, int):
+                result["sent_message_ids"][group] = sent_message_id
+        else:
+            result["skipped_count"] += 1
+            result["send_errors"].setdefault(group, "other")
+
+        if idx < len(groups) - 1:
+            await asyncio.sleep(delay_seconds + random.uniform(0, jitter_seconds))
+
+    result["ok"] = result["sent_count"] > 0
+    result["summary"] = (
+        f"Групп: {result['matched_groups']} | "
+        f"Отправлено: {result['sent_count']} | "
+        f"Пропущено: {result['skipped_count']} | "
+        f"Автоблок: {len(result['blocked_groups'])}"
+    )
+    return result
+
 async def send_broadcast_campaign(
     groups: list[str],
     source_channel: str,

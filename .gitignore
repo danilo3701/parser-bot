@@ -55,6 +55,7 @@ logs/
 *.session-journal
 bot/mt_sessions/
 bot/mtproto_accounts.json
+bot/user_data/
 
 # OS
 Thumbs.db
