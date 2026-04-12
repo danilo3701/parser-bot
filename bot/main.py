@@ -1142,13 +1142,25 @@ async def _cleanup_pending_login(user_id: int) -> None:
         pass
 
 
+async def _safe_edit_text(msg: Message, text: str, *, parse_mode: str = "HTML", reply_markup=None, disable_web_page_preview: bool = False) -> None:
+    """Edit message text, or delete+reply if the message is a photo/media (e.g. QR code)."""
+    if msg.photo or msg.document or msg.sticker or msg.video or msg.animation:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        await msg.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
+    else:
+        await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
+
+
 @dp.callback_query(F.data == "acc_menu")
 async def account_menu(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(query.from_user.id)
     await state.set_state(MainMenu.viewing)
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         account_menu_text(query.from_user.id),
-        parse_mode="HTML",
         reply_markup=account_menu_keyboard(query.from_user.id),
         disable_web_page_preview=True,
     )
@@ -1159,13 +1171,13 @@ async def account_menu(query: CallbackQuery, state: FSMContext):
 async def account_methods(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(query.from_user.id)
     await state.set_state(MainMenu.viewing)
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         "🧩 <b>Выберите метод подключения аккаунта</b>\n\n"
         "1) По номеру телефона — код придёт в Telegram\n"
         "2) QR — отсканируйте код из Telegram\n"
         "3) API ID/Hash — расширенный режим\n\n"
         f"Таймаут кода: <b>{code_ttl_seconds()} сек</b> (я проверяю своим таймером).",
-        parse_mode="HTML",
         reply_markup=account_methods_keyboard(),
         disable_web_page_preview=True,
     )
@@ -1176,9 +1188,9 @@ async def account_methods(query: CallbackQuery, state: FSMContext):
 async def account_cancel(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(query.from_user.id)
     await state.set_state(MainMenu.viewing)
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         account_menu_text(query.from_user.id),
-        parse_mode="HTML",
         reply_markup=account_menu_keyboard(query.from_user.id),
     )
     await query.answer("Отменено")
@@ -1272,9 +1284,9 @@ async def account_disconnect(query: CallbackQuery, state: FSMContext):
             pass
 
     await state.set_state(MainMenu.viewing)
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         account_menu_text(user_id),
-        parse_mode="HTML",
         reply_markup=account_menu_keyboard(user_id),
     )
     await query.answer("Отключено" if existed else "Не было подключения")
