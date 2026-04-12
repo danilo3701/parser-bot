@@ -56,20 +56,31 @@ URL_RE = re.compile(r"(https?://|t\.me/)", re.IGNORECASE)
 HARD_PERMISSION_ERRORS = (
     telethon.errors.ChatWriteForbiddenError,
     telethon.errors.ChatAdminRequiredError,
+    telethon.errors.UserNotParticipantError,
     telethon.errors.UserBannedInChannelError,
     telethon.errors.ChannelPrivateError,
     telethon.errors.ChatRestrictedError,
 )
 
 
-def _classify_error(exc: Exception) -> str:
-    if isinstance(exc, HARD_PERMISSION_ERRORS):
-        return "hard_permission"
+def _normalize_reason(exc: Exception) -> str:
+    if isinstance(exc, telethon.errors.UserNotParticipantError):
+        return "not_participant"
+    if isinstance(exc, (telethon.errors.ChatWriteForbiddenError, telethon.errors.ChatRestrictedError)):
+        return "restricted"
+    if isinstance(exc, (telethon.errors.ChatAdminRequiredError, telethon.errors.UserBannedInChannelError)):
+        return "admin_required"
+    if isinstance(exc, telethon.errors.ChannelPrivateError):
+        return "resolve_failed"
     if isinstance(exc, telethon.errors.PeerFloodError):
         return "peer_flood"
     if isinstance(exc, telethon.errors.FloodWaitError):
         return "flood_wait"
     return "other"
+
+
+def _is_hard_permission_reason(reason: str) -> bool:
+    return reason in {"not_participant", "restricted", "admin_required", "resolve_failed"}
 
 
 def _choose_credentials(account_alias: str | None) -> tuple[dict | None, str | None, str | None]:
@@ -115,6 +126,8 @@ async def send_broadcast_campaign(
         "blocked_groups": {},
         "skipped_groups": {},
         "failed_groups": {},
+        "sent_message_ids": {},
+        "send_errors": {},
         "summary": "",
         "account": account_alias or "default",
     }
@@ -162,43 +175,52 @@ async def send_broadcast_campaign(
             group_entity = await client.get_entity(group)
         except Exception as exc:
             result["failed_groups"][group] = f"resolve_failed: {type(exc).__name__}"
+            result["send_errors"][group] = "resolve_failed"
             result["skipped_count"] += 1
             continue
 
         sent = False
+        sent_message_id = None
         try:
             kwargs = {"link_preview": False}
             if send_as_entity:
                 kwargs["send_as"] = send_as_entity
-            await client.send_message(group_entity, source_message, **kwargs)
+            sent_msg = await client.send_message(group_entity, source_message, **kwargs)
             sent = True
+            sent_message_id = getattr(sent_msg, "id", None)
         except telethon.errors.FloodWaitError as exc:
             await asyncio.sleep(exc.seconds + 1)
             try:
-                await client.send_message(
+                sent_msg = await client.send_message(
                     group_entity,
                     source_message,
                     send_as=send_as_entity,
                     link_preview=False,
                 )
                 sent = True
+                sent_message_id = getattr(sent_msg, "id", None)
             except Exception as retry_exc:
-                category = _classify_error(retry_exc)
-                if category == "hard_permission":
+                reason = _normalize_reason(retry_exc)
+                if _is_hard_permission_reason(reason):
                     result["blocked_groups"][group] = type(retry_exc).__name__
                 else:
                     result["failed_groups"][group] = type(retry_exc).__name__
+                result["send_errors"][group] = reason
         except Exception as exc:
-            category = _classify_error(exc)
-            if category == "hard_permission":
+            reason = _normalize_reason(exc)
+            if _is_hard_permission_reason(reason):
                 result["blocked_groups"][group] = type(exc).__name__
             else:
                 result["failed_groups"][group] = type(exc).__name__
+            result["send_errors"][group] = reason
 
         if sent:
             result["sent_count"] += 1
+            if isinstance(sent_message_id, int):
+                result["sent_message_ids"][group] = sent_message_id
         else:
             result["skipped_count"] += 1
+            result["send_errors"].setdefault(group, "other")
 
         if idx < len(groups) - 1:
             await asyncio.sleep(delay_seconds + random.uniform(0, jitter_seconds))
@@ -213,4 +235,54 @@ async def send_broadcast_campaign(
         f"Автоблок: {len(result['blocked_groups'])} | "
         f"Аккаунт: {result['account']}"
     )
+    return result
+
+
+async def verify_broadcast_messages(
+    sent_message_ids: dict[str, int],
+    *,
+    account_alias: str | None = None,
+) -> dict[str, dict]:
+    """
+    Verify that previously sent messages still exist after some delay.
+
+    Returns mapping group -> {status, reason}.
+      status: delivered_ok | deleted_after_send | unknown_after_send
+      reason: resolve_failed | not_participant | restricted | admin_required | other | ok
+    """
+    result: dict[str, dict] = {}
+    if not sent_message_ids:
+        return result
+
+    creds, session_name, err = _choose_credentials(account_alias)
+    if err:
+        for g in sent_message_ids.keys():
+            result[g] = {"status": "unknown_after_send", "reason": "other"}
+        return result
+
+    client = TelegramClient(session_name, creds["api_id"], creds["api_hash"])
+    try:
+        await client.start(phone=creds["phone"], password=creds.get("password"))
+    except Exception:
+        for g in sent_message_ids.keys():
+            result[g] = {"status": "unknown_after_send", "reason": "other"}
+        return result
+
+    for group, mid in sent_message_ids.items():
+        try:
+            entity = await client.get_entity(group)
+        except Exception as exc:
+            result[group] = {"status": "unknown_after_send", "reason": _normalize_reason(exc)}
+            continue
+
+        try:
+            msg = await client.get_messages(entity, ids=int(mid))
+            if not msg:
+                result[group] = {"status": "deleted_after_send", "reason": "other"}
+            else:
+                result[group] = {"status": "delivered_ok", "reason": "ok"}
+        except Exception as exc:
+            result[group] = {"status": "unknown_after_send", "reason": _normalize_reason(exc)}
+
+    await client.disconnect()
     return result

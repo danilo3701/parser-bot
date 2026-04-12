@@ -46,7 +46,7 @@ from scanner import scan_groups_history, monitor_groups_realtime
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
-from broadcast_sender import send_broadcast_campaign
+from broadcast_sender import send_broadcast_campaign, verify_broadcast_messages
 from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
@@ -67,6 +67,7 @@ SOURCE_HEADER_CHANNEL_ID = int(os.getenv("SOURCE_HEADER_CHANNEL_ID", "-100373934
 BROADCAST_TZ = os.getenv("BROADCAST_TZ", "Europe/Madrid")
 BROADCAST_TIMES = ["08:12", "11:33", "17:40", "22:30"]
 BROADCAST_TIME_OPTIONS = ["07:00", "08:12", "09:00", "11:33", "12:00", "15:00", "17:40", "18:00", "21:00", "22:30"]
+BROADCAST_TEST_VERIFY_SECONDS = int(os.getenv("BROADCAST_TEST_VERIFY_SECONDS", "60") or "60")
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
     int(item.strip())
@@ -638,10 +639,18 @@ def broadcast_groups_keyboard(state: dict, page: int = 0) -> InlineKeyboardMarku
     for group in page_groups:
         group_meta = groups_state.get(group, {})
         blocked = group_meta.get("status") == "blocked"
+        last_status = (group_meta.get("last_test_status") or "").strip()
+        status_icon = {
+            "ok": "✅",
+            "failed": "🚫",
+            "deleted": "🗑",
+            "unknown": "⚠️",
+        }.get(last_status, "")
         if blocked:
-            text = f"🚫 @{group}"
+            text = f"🚫 {status_icon} @{group}".replace("  ", " ").strip()
         else:
-            text = f"{'✅' if group in selected else '▫️'} @{group}"
+            prefix = "✅" if group in selected else "▫️"
+            text = f"{prefix} {status_icon} @{group}".replace("  ", " ").strip()
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"bcg_{group}")])
 
     nav = []
@@ -1856,12 +1865,26 @@ async def broadcast_group_toggle(query: CallbackQuery):
     group = query.data[len("bcg_"):]
     state = broadcast_manager.ensure_groups_known(load_groups())
     group_meta = state.get("broadcast_groups_state", {}).get(group, {})
+    last_status = (group_meta.get("last_test_status") or "").strip()
+    last_reason = (group_meta.get("last_test_reason") or "").strip()
+    status_icon = {
+        "ok": "✅",
+        "failed": "🚫",
+        "deleted": "🗑",
+        "unknown": "⚠️",
+    }.get(last_status, "")
     if group_meta.get("status") == "blocked":
         state = broadcast_manager.set_group_active(group)
         await query.answer("Группа разблокирована")
     else:
         state = broadcast_manager.toggle_group_selected(group)
-        await query.answer()
+        if last_status and last_status != "ok":
+            hint = f"{status_icon} последний тест: {last_status}"
+            if last_reason:
+                hint += f" ({last_reason})"
+            await query.answer(hint)
+        else:
+            await query.answer()
     await query.message.edit_reply_markup(reply_markup=broadcast_groups_keyboard(state, page=0))
 
 
@@ -2044,7 +2067,7 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
     await query.answer("Скопировано")
 
 
-@dp.callback_query(F.data == "bc_test")
+@dp.callback_query(F.data == "bc_test_legacy")
 async def broadcast_test(query: CallbackQuery):
     if broadcast_lock.locked():
         await query.answer("Рассылка уже выполняется.", show_alert=True)
@@ -2074,6 +2097,179 @@ async def broadcast_test(query: CallbackQuery):
         f"🧪 <b>Тест завершён</b>\n\n{result.get('summary', '')}",
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_test")
+async def broadcast_test_v2(query: CallbackQuery):
+    if broadcast_lock.locked():
+        await query.answer("Рассылка уже выполняется.", show_alert=True)
+        return
+
+    state = broadcast_manager.ensure_groups_known(load_groups())
+    ready, reason = is_campaign_ready(state)
+    if not ready:
+        await query.answer(reason, show_alert=True)
+        return
+
+    campaign = state.get("campaign", {})
+    test_groups = get_active_selected_groups(state)
+    verify_seconds = max(0, int(BROADCAST_TEST_VERIFY_SECONDS or 0))
+
+    await query.message.edit_text(
+        "🧪 <b>Тест-рассылка</b>\n\n"
+        f"Групп: <code>{len(test_groups)}</code>\n"
+        "Выполняю отправку…",
+        parse_mode="HTML",
+    )
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    async with broadcast_lock:
+        result = await execute_broadcast(test_groups, advance_rotation=False)
+
+    sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
+    send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
+    blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+
+    verify_map: dict[str, dict] = {}
+    if verify_seconds > 0 and sent_message_ids:
+        await query.message.edit_text(
+            "🧪 <b>Тест-рассылка</b>\n\n"
+            f"Отправлено: <b>{len(sent_message_ids)}</b>\n"
+            f"Жду <b>{verify_seconds} сек</b> и проверяю наличие сообщений…",
+            parse_mode="HTML",
+        )
+        await asyncio.sleep(verify_seconds)
+        verify_map = await verify_broadcast_messages(
+            sent_message_ids,
+            account_alias=campaign.get("send_account") or None,
+        )
+
+    verified_at = datetime.now(timezone.utc).isoformat()
+
+    delivered_ok: list[str] = []
+    deleted_after_send: list[str] = []
+    unknown_after_send: list[str] = []
+    for group in sent_message_ids.keys():
+        meta = verify_map.get(group) or {}
+        st = meta.get("status") or "unknown_after_send"
+        if st == "delivered_ok":
+            delivered_ok.append(group)
+        elif st == "deleted_after_send":
+            deleted_after_send.append(group)
+        else:
+            unknown_after_send.append(group)
+
+    send_failed: list[str] = [g for g in test_groups if g not in sent_message_ids]
+
+    new_state = broadcast_manager.load()
+    groups_state = new_state.setdefault("broadcast_groups_state", {})
+
+    def ensure_group_meta(g: str) -> dict:
+        meta = groups_state.get(g)
+        if not isinstance(meta, dict):
+            meta = {}
+            groups_state[g] = meta
+        meta.setdefault("status", "active")
+        meta.setdefault("reason", "")
+        meta.setdefault("updated_at", None)
+        meta.setdefault("last_test_status", None)
+        meta.setdefault("last_test_reason", None)
+        meta.setdefault("last_test_message_id", None)
+        meta.setdefault("last_test_sent_at", None)
+        meta.setdefault("last_test_verified_at", None)
+        return meta
+
+    for g, err in blocked.items():
+        meta = ensure_group_meta(g)
+        meta["status"] = "blocked"
+        meta["reason"] = str(err)
+        meta["updated_at"] = verified_at
+
+    for g in delivered_ok:
+        meta = ensure_group_meta(g)
+        meta["last_test_status"] = "ok"
+        meta["last_test_reason"] = "ok"
+        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
+        meta["last_test_sent_at"] = started_at
+        meta["last_test_verified_at"] = verified_at
+        meta["updated_at"] = verified_at
+
+    for g in deleted_after_send:
+        meta = ensure_group_meta(g)
+        meta["last_test_status"] = "deleted"
+        meta["last_test_reason"] = "deleted_after_send"
+        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
+        meta["last_test_sent_at"] = started_at
+        meta["last_test_verified_at"] = verified_at
+        meta["updated_at"] = verified_at
+
+    for g in unknown_after_send:
+        meta = ensure_group_meta(g)
+        reason_code = (verify_map.get(g) or {}).get("reason") or "other"
+        meta["last_test_status"] = "unknown"
+        meta["last_test_reason"] = str(reason_code)
+        meta["last_test_message_id"] = int(sent_message_ids.get(g) or 0) or None
+        meta["last_test_sent_at"] = started_at
+        meta["last_test_verified_at"] = verified_at
+        meta["updated_at"] = verified_at
+
+    for g in send_failed:
+        meta = ensure_group_meta(g)
+        meta["last_test_status"] = "failed"
+        meta["last_test_reason"] = str(send_errors.get(g) or "other")
+        meta["last_test_message_id"] = None
+        meta["last_test_sent_at"] = started_at
+        meta["last_test_verified_at"] = verified_at
+        meta["updated_at"] = verified_at
+
+    removed = sorted(set(send_failed + deleted_after_send))
+    if removed:
+        selected = set(new_state.get("campaign", {}).get("selected_groups", []))
+        for g in removed:
+            selected.discard(g)
+        new_state["campaign"]["selected_groups"] = sorted(selected)
+
+    if delivered_ok:
+        new_state["campaign"]["test_passed"] = True
+        new_state["campaign"]["last_test_at"] = verified_at
+    else:
+        new_state["campaign"]["test_passed"] = False
+        new_state["campaign"]["last_test_at"] = None
+
+    broadcast_manager.save(new_state)
+
+    lines = [
+        "🧪 <b>Тест завершён</b>\n",
+        f"Выбрано групп: <b>{len(test_groups)}</b>",
+        f"Отправлено: <b>{len(sent_message_ids)}</b>",
+        f"OK (есть через {verify_seconds}с): <b>{len(delivered_ok)}</b>",
+        f"Удалено после отправки: <b>{len(deleted_after_send)}</b>",
+        f"Не удалось проверить: <b>{len(unknown_after_send)}</b>",
+        f"Не отправилось: <b>{len(send_failed)}</b>",
+    ]
+    if removed:
+        lines.append(f"\n⚠️ Проблемные группы сняты с выбора: <b>{len(removed)}</b>")
+
+    problems: list[tuple[str, str]] = []
+    for g in deleted_after_send:
+        problems.append((g, "deleted_after_send"))
+    for g in send_failed:
+        problems.append((g, str(send_errors.get(g) or "other")))
+    if problems:
+        lines.append("\n<b>Проблемные группы (первые 15):</b>")
+        for g, why in problems[:15]:
+            lines.append(f"- <code>@{g}</code> — <code>{why}</code>")
+        if len(problems) > 15:
+            lines.append(f"…и ещё <b>{len(problems) - 15}</b>")
+
+    updated = broadcast_manager.load()
+    await query.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=broadcast_main_keyboard(updated),
+        disable_web_page_preview=True,
     )
     await query.answer()
 

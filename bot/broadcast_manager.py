@@ -102,6 +102,11 @@ class BroadcastManager:
                     "status": "active",
                     "reason": "",
                     "updated_at": None,
+                    "last_test_status": None,
+                    "last_test_reason": None,
+                    "last_test_message_id": None,
+                    "last_test_sent_at": None,
+                    "last_test_verified_at": None,
                 }
         state["campaign"]["selected_groups"] = [
             g for g in state["campaign"].get("selected_groups", []) if g in groups
@@ -314,6 +319,53 @@ class BroadcastManager:
         group_state["reason"] = ""
         group_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    def unselect_groups(self, groups: list[str]) -> dict:
+        state = self.load()
+        selected = set(state["campaign"].get("selected_groups", []))
+        changed = False
+        for g in groups or []:
+            if g in selected:
+                selected.remove(g)
+                changed = True
+        if changed:
+            state["campaign"]["selected_groups"] = sorted(selected)
+            self.reset_test_flag_in_state(state)
+            self.save(state)
+        return state
+
+    def set_group_last_test(
+        self,
+        group: str,
+        *,
+        status: str,
+        reason: str | None = None,
+        message_id: int | None = None,
+        sent_at: str | None = None,
+        verified_at: str | None = None,
+    ) -> dict:
+        state = self.load()
+        group_state = state["broadcast_groups_state"].setdefault(
+            group,
+            {
+                "status": "active",
+                "reason": "",
+                "updated_at": None,
+                "last_test_status": None,
+                "last_test_reason": None,
+                "last_test_message_id": None,
+                "last_test_sent_at": None,
+                "last_test_verified_at": None,
+            },
+        )
+        group_state["last_test_status"] = status
+        group_state["last_test_reason"] = reason or ""
+        group_state["last_test_message_id"] = int(message_id) if message_id is not None else None
+        group_state["last_test_sent_at"] = sent_at
+        group_state["last_test_verified_at"] = verified_at
+        group_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.save(state)
         return state
 
