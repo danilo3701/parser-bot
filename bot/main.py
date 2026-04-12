@@ -2719,7 +2719,11 @@ async def broadcast_mass(query: CallbackQuery):
         await query.answer("⚠️ Шаг 2: Добавьте хотя бы один пост в пул (кнопка «🗂 Посты»)", show_alert=True)
         return
     if not steps["groups"]:
-        await query.answer("⚠️ Шаг 3: Добавьте и выберите группы рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        await query.answer("⚠️ Шаг 3: Добавьте хотя бы одну группу рассылки (кнопка «👥 Группы рассылки»)", show_alert=True)
+        return
+    active_groups = get_active_selected_groups(state, groups_all)
+    if not active_groups:
+        await query.answer("⚠️ Выберите хотя бы одну группу для отправки", show_alert=True)
         return
     if not steps["schedule"]:
         await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
