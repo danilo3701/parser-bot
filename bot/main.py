@@ -259,13 +259,7 @@ def main_keyboard(schedule_enabled: bool = True):
             InlineKeyboardButton(text="📊 Статус", callback_data="status"),
         ],
         [
-            InlineKeyboardButton(
-                text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
-                callback_data="main_bc_toggle",
-            ),
             InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings"),
-        ],
-        [
             InlineKeyboardButton(text="ℹ️ Справка", callback_data="help"),
         ],
     ])
@@ -488,8 +482,11 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
                 "────────────────────\n"
             )
 
+    status_indicator = "✅ Рассылка активна" if schedule.get("enabled", True) else "❌ Рассылка остановлена"
+
     return (
         step_progress +
+        f"{status_indicator}\n\n"
         "📣 <b>Рассылка</b>\n\n"
         f"Аккаунт: <b>{account_label}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
@@ -507,6 +504,7 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    schedule_enabled = state.get("broadcast_schedule", {}).get("enabled", True)
 
     rows = []
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
@@ -524,6 +522,10 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     ])
     rows.append([InlineKeyboardButton(text="🧭 Готовность", callback_data="bc_ready")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
+    rows.append([InlineKeyboardButton(
+        text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
+        callback_data="main_bc_toggle",
+    )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
