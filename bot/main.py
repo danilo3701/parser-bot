@@ -10,13 +10,14 @@ import re
 import json
 import math
 import contextlib
+import io
 from pathlib import Path
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -46,6 +47,15 @@ from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
 from broadcast_sender import send_broadcast_campaign
+from mtproto_accounts import (
+    PendingLogin,
+    code_ttl_seconds,
+    disconnect_account,
+    get_account,
+    new_pending_login,
+    session_file_for_user,
+    set_connected_account,
+)
 
 # Подхватываем bot/.env независимо от того, из какой папки запускают бота
 load_dotenv(Path(__file__).parent / ".env")
@@ -168,6 +178,7 @@ scheduler_task: asyncio.Task | None = None
 current_scan_task: asyncio.Task | None = None
 current_monitor_task: asyncio.Task | None = None
 monitor_stop_event: asyncio.Event | None = None
+pending_logins: dict[int, PendingLogin] = {}
 
 
 # ─── Состояния ───────────────────────────────────────────────────────────────
@@ -193,6 +204,10 @@ class MainMenu(StatesGroup):
     adding_broadcast_post = State()
     setting_broadcast_weekday_time = State()
     copying_broadcast_weekday = State()
+    connecting_account_phone = State()
+    connecting_account_code = State()
+    connecting_account_password = State()
+    connecting_account_api = State()
 
 
 # ─── Хелперы для клавиатур ───────────────────────────────────────────────────
@@ -416,10 +431,12 @@ def broadcast_main_keyboard(state: dict) -> InlineKeyboardMarkup:
 
     rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
     rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
+    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_menu")])
     rows.append([
         InlineKeyboardButton(text="🧪 Тест", callback_data="bc_test"),
         InlineKeyboardButton(text="✅ Массовая", callback_data="bc_mass"),
     ])
+    rows.append([InlineKeyboardButton(text="🧭 Готовность", callback_data="bc_ready")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
     rows.append([InlineKeyboardButton(
         text="⏰ Расписание: ON" if enabled else "⏰ Расписание: OFF",
@@ -872,6 +889,648 @@ async def broadcast_menu(query: CallbackQuery):
         reply_markup=broadcast_main_keyboard(state),
     )
     await query.answer()
+
+
+def _readiness_reason_label(code: str) -> str:
+    mapping = {
+        "ok": "✅ OK",
+        "not_connected": "❌ Аккаунт не подключен",
+        "send_as_missing": "❌ Не выбран send-as канал",
+        "send_as_no_access": "❌ Нет доступа к send-as каналу",
+        "resolve_failed": "❌ Не найден/не доступен",
+        "not_participant": "🚫 Не участник",
+        "restricted": "🚫 Ограничен на отправку",
+        "admin_required": "🚫 Нужны права админа",
+        "unknown": "⚠️ Неизвестно",
+    }
+    return mapping.get(code, code)
+
+
+async def _telethon_can_send_to_entity(client, entity) -> tuple[bool, str]:
+    """
+    Лёгкая проверка (без отправки сообщений).
+    Возвращает (ok, reason_code).
+    """
+    import telethon.errors
+
+    try:
+        perms = await client.get_permissions(entity, "me")
+    except telethon.errors.UserNotParticipantError:
+        return False, "not_participant"
+    except Exception:
+        # Некоторые приватные/недоступные чаты ломаются здесь
+        return False, "resolve_failed"
+
+    banned = getattr(perms, "banned_rights", None)
+    if banned and getattr(banned, "send_messages", False):
+        return False, "restricted"
+
+    # Для каналов (broadcast=True) нужно право постинга (обычно админ)
+    is_channel = bool(getattr(entity, "broadcast", False))
+    if is_channel:
+        if getattr(perms, "is_creator", False):
+            return True, "ok"
+        if getattr(perms, "is_admin", False):
+            rights = getattr(perms, "admin_rights", None)
+            if rights is None or getattr(rights, "post_messages", True):
+                return True, "ok"
+            return False, "admin_required"
+        return False, "admin_required"
+
+    # Для обычных групп/супергрупп считаем ок, если не забанен
+    return True, "ok"
+
+
+async def _readiness_check_connected_account(user_id: int) -> tuple[bool, str, object | None, str]:
+    meta = get_account(user_id)
+    if not meta:
+        return False, "not_connected", None, ""
+    api_id = int(meta.get("api_id") or 0)
+    api_hash = (meta.get("api_hash") or "").strip()
+    if not api_id or not api_hash:
+        return False, "not_connected", None, ""
+
+    from telethon import TelegramClient
+
+    session_file = session_file_for_user(user_id)
+    client = TelegramClient(str(session_file), api_id, api_hash)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return False, "not_connected", None, ""
+        me = await client.get_me()
+        who = f"@{me.username}" if getattr(me, "username", None) else (getattr(me, "first_name", None) or "аккаунт")
+        return True, "ok", client, who
+    except Exception:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return False, "not_connected", None, ""
+
+
+@dp.callback_query(F.data == "bc_ready")
+async def broadcast_readiness(query: CallbackQuery):
+    if not await ensure_owner_callback(query):
+        return
+
+    state = broadcast_manager.load()
+    campaign = state.get("campaign", {})
+    selected_groups = campaign.get("selected_groups", []) if isinstance(campaign.get("selected_groups", []), list) else []
+    send_mode = campaign.get("send_mode", "user")
+    send_as_channel = (campaign.get("send_as_channel") or "").strip()
+
+    if not selected_groups:
+        await query.answer("Сначала выберите группы рассылки.", show_alert=True)
+        return
+
+    ok, _, client, who = await _readiness_check_connected_account(query.from_user.id)
+    if not ok or not client:
+        await query.message.edit_text(
+            "🧭 <b>Готовность</b>\n\n"
+            "❌ Аккаунт для рассылки не подключен.\n\n"
+            "Нажмите <b>🔑 Подключить аккаунт</b> и подключите отдельный Telegram-аккаунт (телефон/QR).",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_menu")],
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+            ]),
+        )
+        await query.answer()
+        return
+
+    problems: list[tuple[str, str]] = []
+    oks: list[str] = []
+
+    # Check send-as channel if needed
+    send_as_status = "ok"
+    send_as_note = ""
+    if send_mode == "channel":
+        if not send_as_channel:
+            send_as_status = "send_as_missing"
+        else:
+            try:
+                ent = await client.get_entity(send_as_channel)
+                ok_send_as, reason = await _telethon_can_send_to_entity(client, ent)
+                if not ok_send_as:
+                    send_as_status = "send_as_no_access" if reason in ("not_participant", "admin_required", "resolve_failed") else reason
+            except Exception:
+                send_as_status = "send_as_no_access"
+
+        if send_as_status != "ok":
+            send_as_note = f"\n{_readiness_reason_label(send_as_status)}: <code>{send_as_channel or 'не выбран'}</code>"
+
+    # Check each selected group
+    for group in selected_groups:
+        try:
+            entity = await client.get_entity(group)
+        except Exception:
+            problems.append((group, "resolve_failed"))
+            continue
+
+        ok_group, reason = await _telethon_can_send_to_entity(client, entity)
+        if ok_group:
+            oks.append(group)
+        else:
+            problems.append((group, reason))
+
+    await client.disconnect()
+
+    # Render summary
+    lines = [
+        "🧭 <b>Готовность</b>\n",
+        f"Аккаунт: <b>{who}</b>",
+        f"Режим: <b>{'от канала' if send_mode == 'channel' else 'от пользователя'}</b>",
+        f"Групп выбрано: <b>{len(selected_groups)}</b>",
+        f"OK: <b>{len(oks)}</b>",
+        f"Проблемы: <b>{len(problems) + (1 if send_as_status != 'ok' else 0)}</b>",
+    ]
+    if send_as_note:
+        lines.append(send_as_note)
+
+    if problems:
+        lines.append("\n<b>Проблемные группы (первые 12):</b>")
+        for group, reason in problems[:12]:
+            lines.append(f"- <code>@{group}</code> — {_readiness_reason_label(reason)}")
+        if len(problems) > 12:
+            lines.append(f"…и ещё <b>{len(problems) - 12}</b>")
+
+    lines.append("\nЧто делать:")
+    lines.append("- добавьте аккаунт в проблемные группы и снимите ограничения")
+    if send_mode == "channel":
+        lines.append("- добавьте аккаунт админом в send-as канал и выдайте право постинга")
+
+    await query.message.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Обновить", callback_data="bc_ready")],
+            [InlineKeyboardButton(text="🔑 Аккаунт", callback_data="acc_menu")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        ]),
+    )
+    await query.answer()
+
+
+def account_menu_text(user_id: int) -> str:
+    meta = get_account(user_id)
+    if not meta:
+        return (
+            "🔑 <b>Подключить аккаунт</b>\n\n"
+            "Аккаунт не подключен.\n\n"
+            "Рекомендация: подключайте <b>отдельный</b> аккаунт Telegram для рассылок."
+        )
+    username = (meta.get("username") or "").strip()
+    name = (meta.get("first_name") or "").strip()
+    who = f"@{username}" if username else (name or "аккаунт")
+    phone_masked = meta.get("phone_mask") or ""
+    connected_at = meta.get("connected_at") or ""
+    return (
+        "🔑 <b>Подключить аккаунт</b>\n\n"
+        "Статус: <b>подключен</b>\n"
+        f"Аккаунт: <b>{who}</b>\n"
+        f"Телефон: <code>{phone_masked}</code>\n"
+        f"Дата: <code>{connected_at}</code>"
+    )
+
+
+def account_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    connected = bool(get_account(user_id))
+    rows: list[list[InlineKeyboardButton]] = []
+    rows.append([InlineKeyboardButton(text="🧩 Методы подключения", callback_data="acc_methods")])
+    if connected:
+        rows.append([InlineKeyboardButton(text="🔎 Проверить доступ", callback_data="acc_check")])
+        rows.append([InlineKeyboardButton(text="🗑 Отключить", callback_data="acc_disconnect")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def account_methods_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Подключение по номеру телефона", callback_data="acc_phone")],
+        [InlineKeyboardButton(text="📷 Подключение по QR-коду", callback_data="acc_qr")],
+        [InlineKeyboardButton(text="🪪 Подключение по API ID / API Hash", callback_data="acc_api")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="acc_menu")],
+    ])
+
+
+def account_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="acc_cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="acc_menu")],
+    ])
+
+
+async def _cleanup_pending_login(user_id: int) -> None:
+    pending = pending_logins.pop(user_id, None)
+    if not pending:
+        return
+    try:
+        await pending.client.disconnect()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data == "acc_menu")
+async def account_menu(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        account_menu_text(query.from_user.id),
+        parse_mode="HTML",
+        reply_markup=account_menu_keyboard(query.from_user.id),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_methods")
+async def account_methods(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        "🧩 <b>Выберите метод подключения аккаунта</b>\n\n"
+        "1) По номеру телефона — код придёт в Telegram\n"
+        "2) QR — отсканируйте код из Telegram\n"
+        "3) API ID/Hash — расширенный режим\n\n"
+        f"Таймаут кода: <b>{code_ttl_seconds()} сек</b> (я проверяю своим таймером).",
+        parse_mode="HTML",
+        reply_markup=account_methods_keyboard(),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_cancel")
+async def account_cancel(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        account_menu_text(query.from_user.id),
+        parse_mode="HTML",
+        reply_markup=account_menu_keyboard(query.from_user.id),
+    )
+    await query.answer("Отменено")
+
+
+@dp.callback_query(F.data == "acc_phone")
+async def account_connect_phone_prompt(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await query.message.edit_text(
+        "📱 <b>Подключение по номеру</b>\n\n"
+        "Отправьте номер в формате <code>+79990001122</code>.\n\n"
+        "Совет: используйте отдельный аккаунт для рассылок.",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+        disable_web_page_preview=True,
+    )
+    await state.set_state(MainMenu.connecting_account_phone)
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_api")
+async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await query.message.edit_text(
+        "🪪 <b>Подключение по API ID / API Hash</b>\n\n"
+        "Этот режим для тех, у кого есть своё приложение Telegram (my.telegram.org).\n"
+        "Отправьте одним сообщением:\n"
+        "<code>api_id api_hash +79990001122</code>\n\n"
+        "Пример:\n"
+        "<code>123456 0123456789abcdef0123456789abcdef +79990001122</code>",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+        disable_web_page_preview=True,
+    )
+    await state.set_state(MainMenu.connecting_account_api)
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_qr")
+async def account_connect_qr(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await _start_qr_login(query, state, refresh=False)
+
+
+@dp.callback_query(F.data == "acc_qr_refresh")
+async def account_connect_qr_refresh(query: CallbackQuery, state: FSMContext):
+    await _cleanup_pending_login(query.from_user.id)
+    await _start_qr_login(query, state, refresh=True)
+
+
+@dp.callback_query(F.data == "acc_qr_check")
+async def account_connect_qr_check(query: CallbackQuery, state: FSMContext):
+    user_id = query.from_user.id
+    pending = pending_logins.get(user_id)
+    if not pending or pending.method != "qr" or not pending.qr_login:
+        await query.answer("Нет активного QR.", show_alert=True)
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_pending_login(user_id)
+        await query.answer("Таймаут QR. Создайте заново.", show_alert=True)
+        return
+
+    try:
+        await asyncio.wait_for(pending.qr_login.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        await query.answer("Ещё не подтверждено. Отсканируйте QR и нажмите снова.", show_alert=True)
+        return
+    except Exception as exc:
+        await _cleanup_pending_login(user_id)
+        await query.answer(f"Ошибка QR: {type(exc).__name__}", show_alert=True)
+        return
+
+    await _finalize_account_login(query.message, state, user_id=user_id, phone="")
+    await query.answer("OK")
+
+
+@dp.callback_query(F.data == "acc_disconnect")
+async def account_disconnect(query: CallbackQuery, state: FSMContext):
+    user_id = query.from_user.id
+    await _cleanup_pending_login(user_id)
+    existed = disconnect_account(user_id)
+
+    base = session_file_for_user(user_id)
+    for suffix in (".session", ".session-journal"):
+        p = Path(str(base) + suffix)
+        try:
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception:
+            pass
+
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        account_menu_text(user_id),
+        parse_mode="HTML",
+        reply_markup=account_menu_keyboard(user_id),
+    )
+    await query.answer("Отключено" if existed else "Не было подключения")
+
+
+@dp.callback_query(F.data == "acc_check")
+async def account_check(query: CallbackQuery):
+    meta = get_account(query.from_user.id)
+    if not meta:
+        await query.answer("Аккаунт не подключен.", show_alert=True)
+        return
+
+    api_id = int(meta.get("api_id") or 0)
+    api_hash = (meta.get("api_hash") or "").strip()
+    if not api_id or not api_hash:
+        await query.answer("Нет api_id/api_hash для проверки. Переподключите аккаунт.", show_alert=True)
+        return
+
+    session_file = session_file_for_user(query.from_user.id)
+    try:
+        from telethon import TelegramClient
+
+        client = TelegramClient(str(session_file), api_id, api_hash)
+        await client.connect()
+        me = await client.get_me()
+        await client.disconnect()
+        who = f"@{me.username}" if getattr(me, "username", None) else (getattr(me, "first_name", None) or "аккаунт")
+        await query.answer(f"OK: {who}", show_alert=True)
+    except Exception:
+        await query.answer("Не удалось проверить сессию. Переподключите аккаунт.", show_alert=True)
+
+
+@dp.message(MainMenu.connecting_account_api)
+async def account_connect_api_input(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    parts = raw.split()
+    if len(parts) != 3:
+        await message.answer("❌ Формат: <code>api_id api_hash +phone</code>", parse_mode="HTML", reply_markup=account_cancel_keyboard())
+        return
+    try:
+        api_id = int(parts[0])
+    except Exception:
+        await message.answer("❌ api_id должен быть числом.", reply_markup=account_cancel_keyboard())
+        return
+    api_hash = parts[1].strip()
+    phone = parts[2].strip()
+    await _start_phone_login(message, state, api_id=api_id, api_hash=api_hash, phone=phone)
+
+
+@dp.message(MainMenu.connecting_account_phone)
+async def account_connect_phone_input(message: Message, state: FSMContext):
+    phone = (message.text or "").strip()
+    api_id = int(os.getenv("TG_API_ID", "0") or "0")
+    api_hash = (os.getenv("TG_API_HASH") or "").strip()
+    await _start_phone_login(message, state, api_id=api_id, api_hash=api_hash, phone=phone)
+
+
+async def _start_phone_login(message: Message, state: FSMContext, *, api_id: int, api_hash: str, phone: str) -> None:
+    user_id = message.from_user.id
+    await _cleanup_pending_login(user_id)
+
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if len(digits) < 7:
+        await message.answer("❌ Номер не похож на телефон. Пример: <code>+79990001122</code>", parse_mode="HTML", reply_markup=account_cancel_keyboard())
+        return
+    if not api_id or not api_hash:
+        await message.answer("❌ Не настроены api_id/api_hash для подключения.", reply_markup=account_cancel_keyboard())
+        return
+
+    from telethon import TelegramClient
+    import telethon.errors
+
+    session_file = session_file_for_user(user_id)
+    client = TelegramClient(str(session_file), api_id, api_hash)
+    try:
+        await client.connect()
+        await client.send_code_request(phone)
+    except telethon.errors.PhoneNumberInvalidError:
+        await client.disconnect()
+        await message.answer("❌ Неверный номер.", reply_markup=account_cancel_keyboard())
+        return
+    except telethon.errors.PhoneNumberBannedError:
+        await client.disconnect()
+        await message.answer("❌ Номер заблокирован Telegram.", reply_markup=account_cancel_keyboard())
+        return
+    except telethon.errors.FloodWaitError as exc:
+        await client.disconnect()
+        await message.answer(f"❌ FloodWait: попробуйте позже ({exc.seconds} сек).", reply_markup=account_cancel_keyboard())
+        return
+    except Exception as exc:
+        await client.disconnect()
+        await message.answer(f"❌ Ошибка отправки кода: {type(exc).__name__}", reply_markup=account_cancel_keyboard())
+        return
+
+    pending = new_pending_login(method="phone", api_id=api_id, api_hash=api_hash, phone=phone, client=client, session_file=session_file)
+    pending_logins[user_id] = pending
+    await state.set_state(MainMenu.connecting_account_code)
+    await message.answer(
+        "✅ Код отправлен.\n\n"
+        "Введите код (обычно 5 цифр), пример: <code>12345</code>\n\n"
+        f"Я жду код <b>{code_ttl_seconds()} сек</b>, потом попрошу запросить заново.",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+    )
+
+
+@dp.message(MainMenu.connecting_account_code)
+async def account_connect_code_input(message: Message, state: FSMContext):
+    import telethon.errors
+
+    user_id = message.from_user.id
+    pending = pending_logins.get(user_id)
+    if not pending:
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Нет активного подключения.", reply_markup=account_menu_keyboard(user_id))
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Таймаут. Запросите код заново.", reply_markup=account_menu_keyboard(user_id))
+        return
+
+    code = "".join(ch for ch in (message.text or "") if ch.isdigit())
+    if len(code) < 4 or len(code) > 8:
+        await message.answer("❌ Введите только цифры, например <code>12345</code>.", parse_mode="HTML", reply_markup=account_cancel_keyboard())
+        return
+
+    try:
+        await pending.client.sign_in(phone=pending.phone, code=code)
+    except telethon.errors.SessionPasswordNeededError:
+        await state.set_state(MainMenu.connecting_account_password)
+        await message.answer("🔐 Включена 2FA. Введите пароль:", reply_markup=account_cancel_keyboard())
+        return
+    except telethon.errors.PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуйте ещё раз.", reply_markup=account_cancel_keyboard())
+        return
+    except telethon.errors.PhoneCodeExpiredError:
+        await _cleanup_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Код истёк. Запросите заново.", reply_markup=account_menu_keyboard(user_id))
+        return
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка авторизации: {type(exc).__name__}", reply_markup=account_cancel_keyboard())
+        return
+
+    await _finalize_account_login(message, state, user_id=user_id, phone=pending.phone)
+
+
+@dp.message(MainMenu.connecting_account_password)
+async def account_connect_password_input(message: Message, state: FSMContext):
+    import telethon.errors
+
+    user_id = message.from_user.id
+    pending = pending_logins.get(user_id)
+    if not pending:
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Нет активного подключения.", reply_markup=account_menu_keyboard(user_id))
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Таймаут. Запросите код заново.", reply_markup=account_menu_keyboard(user_id))
+        return
+
+    password = (message.text or "").strip()
+    if not password:
+        await message.answer("❌ Пароль пуст.", reply_markup=account_cancel_keyboard())
+        return
+
+    try:
+        await pending.client.sign_in(password=password)
+    except telethon.errors.PasswordHashInvalidError:
+        await message.answer("❌ Неверный пароль. Попробуйте ещё раз.", reply_markup=account_cancel_keyboard())
+        return
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка 2FA: {type(exc).__name__}", reply_markup=account_cancel_keyboard())
+        return
+
+    await _finalize_account_login(message, state, user_id=user_id, phone=pending.phone)
+
+
+async def _finalize_account_login(message: Message, state: FSMContext, *, user_id: int, phone: str) -> None:
+    pending = pending_logins.get(user_id)
+    if not pending:
+        return
+
+    me = None
+    try:
+        me = await pending.client.get_me()
+    except Exception:
+        me = None
+
+    set_connected_account(
+        user_id=user_id,
+        phone=phone,
+        api_id=pending.api_id,
+        api_hash=pending.api_hash,
+        me_id=getattr(me, "id", None) if me else None,
+        username=getattr(me, "username", None) if me else None,
+        first_name=getattr(me, "first_name", None) if me else None,
+    )
+
+    await _cleanup_pending_login(user_id)
+    await state.set_state(MainMenu.viewing)
+    await message.answer("✅ Аккаунт подключен.", reply_markup=account_menu_keyboard(user_id))
+
+
+async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: bool) -> None:
+    api_id = int(os.getenv("TG_API_ID", "0") or "0")
+    api_hash = (os.getenv("TG_API_HASH") or "").strip()
+    if not api_id or not api_hash:
+        await query.answer("Не настроены TG_API_ID/TG_API_HASH.", show_alert=True)
+        return
+
+    from telethon import TelegramClient
+
+    user_id = query.from_user.id
+    session_file = session_file_for_user(user_id)
+    client = TelegramClient(str(session_file), api_id, api_hash)
+    try:
+        await client.connect()
+        qr_login = await client.qr_login()
+    except Exception as exc:
+        await client.disconnect()
+        await query.answer(f"Не удалось создать QR: {type(exc).__name__}", show_alert=True)
+        return
+
+    pending = new_pending_login(method="qr", api_id=api_id, api_hash=api_hash, phone="", client=client, session_file=session_file)
+    pending.qr_login = qr_login
+    pending_logins[user_id] = pending
+
+    try:
+        import qrcode
+
+        img = qrcode.make(qr_login.url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        photo = BufferedInputFile(buf.getvalue(), filename="login-qr.png")
+    except Exception:
+        await _cleanup_pending_login(user_id)
+        await query.answer("Нужен пакет qrcode для QR.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я отсканировал", callback_data="acc_qr_check")],
+        [InlineKeyboardButton(text="🔄 Обновить QR", callback_data="acc_qr_refresh")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="acc_cancel")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="acc_menu")],
+    ])
+
+    await state.set_state(MainMenu.viewing)
+    await query.message.answer_photo(
+        photo=photo,
+        caption=(
+            "📷 <b>QR-вход</b>\n\n"
+            "Откройте Telegram → Settings → Devices → Scan QR.\n\n"
+            f"Таймаут: <b>{code_ttl_seconds()} сек</b>."
+        ),
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    await query.answer("QR готов" if not refresh else "QR обновлён")
 
 
 @dp.callback_query(F.data == "bc_accounts")

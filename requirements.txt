@@ -3,3 +3,4 @@ python-dotenv
 telethon
 aiofiles
 pydantic==2.5.3
+qrcode[pil]

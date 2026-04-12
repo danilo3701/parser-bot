@@ -50,6 +50,12 @@ htmlcov/
 *.log
 logs/
 
+# Telethon sessions / per-user auth data
+*.session
+*.session-journal
+bot/mt_sessions/
+bot/mtproto_accounts.json
+
 # OS
 Thumbs.db
 .DS_Store
