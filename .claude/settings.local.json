@@ -6,7 +6,8 @@
       "Bash(taskkill /F /IM python.exe)",
       "Bash(python:*)",
       "Bash(grep -r \"Создатели\\\\|yana_lehka\\\\|admin_3701\" --include=*.py)",
-      "Bash(xargs grep:*)"
+      "Bash(xargs grep:*)",
+      "WebSearch"
     ]
   }
 }

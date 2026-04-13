@@ -1,419 +1,346 @@
-# Фаза 6: Система уведомлений (8 типов + меню настроек)
+# Фаза 6: Система уведомлений (4 типа + меню настроек)
 
 ## Контекст
-Полная система уведомлений: баланс, рассылка, платежи, обновления и т.д. Пользователь может включить/отключить каждое уведомление и настроить параметры. Меню "Настройки уведомлений" в главном Settings.
+Минималистичная система уведомлений — только то что реально нужно пользователю.
+Из 4 типов только 1 настраивается, остальные 3 обязательные.
 
-**8 типов уведомлений:**
-1. Баланс заканчивается (⚠️ настраивается)
-2. Рассылка завершена (✅ всегда)
-3. Группы в черном списке (🚫 отключаемо)
-4. Расписание отключено (📅 отключаемо)
-5. Ошибки при рассылке (❌ отключаемо)
-6. Платеж успешен (💳 обязательное)
-7. Платеж отклонен (⚠️ обязательное)
-8. Обновления бота (🔔 отключаемо)
+**4 типа уведомлений:**
+| # | Тип | Можно отключить | Когда |
+|---|-----|-----------------|-------|
+| 1 | ⚠️ Баланс заканчивается | ✅ Да | Когда баланс ≤ порог (настраивается) |
+| 2 | 📊 Аналитика авторассылки | ❌ Нет | После каждой авторассылки по расписанию |
+| 3 | 💳 Платеж успешен | ❌ Нет | Stripe подтвердил оплату |
+| 4 | ❌ Платеж отклонен | ❌ Нет | Stripe отклонил карту |
 
 ---
 
 ## Архитектура
 
 ### Где искать:
-- `bot/broadcast_manager.py` — методы управления уведомлениями
-- `bot/main.py` — scheduler_loop() (строка ~857) — отправка уведомлений
-- `bot/main.py` — меню Settings → Notifications (новое)
-- `bot/broadcast_state.json` — структура notifications preferences
+- `bot/broadcast_manager.py` — методы уведомлений
+- `bot/main.py` — scheduler_loop() (строка ~857) — отправка аналитики и проверка баланса
+- `bot/main.py` — handlers для меню настроек уведомлений
+- `bot/broadcast_state.json` — структура notifications
 
 ### Что меняется в JSON:
 
 ```json
 {
   "notifications": {
-    "enabled": true,
-    "preferences": {
-      "balance_low": {"enabled": true, "threshold": 30},
-      "broadcast_completed": {"enabled": true},
-      "groups_blocked": {"enabled": true},
-      "schedule_disabled": {"enabled": true},
-      "broadcast_error": {"enabled": true},
-      "payment_success": {"enabled": true},   // ОБЯЗАТЕЛЬНОЕ
-      "payment_failed": {"enabled": true},    // ОБЯЗАТЕЛЬНОЕ
-      "bot_updates": {"enabled": true}
-    },
-    "last_notifications_sent": {
-      "balance_low": "2026-04-13T08:30:00Z",
-      "schedule_disabled": "2026-04-13T09:00:00Z"
+    "balance_low": {
+      "enabled": true,
+      "threshold": 30,
+      "last_sent": null
     }
   }
 }
 ```
 
+> Простая структура: только баланс хранит настройки. Остальные 3 уведомления — без состояния, отправляются всегда.
+
 ---
 
 ## 🎨 Визуальный дизайн
 
-### 1. Главное меню настроек
+### 1. Меню настроек → Уведомления
 
-```
-⚙️ НАСТРОЙКИ
-
-→ 🔔 Уведомления (новое!)
-  └─ [Настроить]
-
-→ 💰 Баланс постов
-  └─ Порог: 30
-
-→ 🌍 Язык
-→ 🕐 Временная зона
-→ 📞 Помощь
-```
-
-### 2. Меню уведомлений (список)
+**Путь:** ⚙️ Настройки → 🔔 Уведомления
 
 ```
 🔔 УВЕДОМЛЕНИЯ
 
-Выберите что получать:
+☑️ Баланс заканчивается
+   Порог: 30 постов
+   [Изменить порог] [Отключить]
 
-1️⃣ Баланс заканчивается ☑️
-   Порог: 30 постов [Изменить]
+✅ Аналитика рассылки (обязательное)
+   Приходит после каждой авторассылки
 
-2️⃣ Рассылка завершена ☑️
-   Результаты после отправки
+✅ Платёж успешен (обязательное)
+✅ Платёж отклонён (обязательное)
 
-3️⃣ Группы в черном списке ☑️
-   Подробные ошибки
-
-4️⃣ Расписание отключено ☑️
-   Напоминание включить
-
-5️⃣ Ошибки при рассылке ☑️
-   Как исправить
-
-6️⃣ Платеж успешен ☑️
-   (не отключается)
-
-7️⃣ Платеж отклонен ☑️
-   (не отключается)
-
-8️⃣ Обновления бота ☑️
-   Важные новости
-
-[◀️ Назад] [Сбросить на умолчанию]
+[◀️ Назад]
 ```
 
-### 3. Меню настройки одного уведомления
+### 2. Меню изменения порога баланса
 
 ```
-🔔 Баланс заканчивается
+⚠️ ПОРОГ УВЕДОМЛЕНИЯ О БАЛАНСЕ
 
-📋 ОПИСАНИЕ:
-Уведомление когда баланс < порога
+Текущий порог: 30 постов
 
-⚙️ ПАРАМЕТРЫ:
+Уведомить когда остаётся ≤ X постов:
 
-Порог уведомления:
-[10] [20] [30] [50] [100] [Свое]
+[10]  [20]  [30]  [50]  [100]
 
-Текущий: 30 постов
-
-☑️ Включено  ☐ Отключено
-
-[Сохранить] [◀️ Назад]
+[◀️ Назад]
 ```
 
-### 4. Примеры уведомлений
+---
 
-**Баланс заканчивается:**
+## 📲 Примеры уведомлений
+
+### 1. Баланс заканчивается
+
 ```
 ⚠️ БАЛАНС ЗАКАНЧИВАЕТСЯ
 
 Осталось: 20 постов
 
-Можете опубликовать:
+Вы можете опубликовать ещё:
 • 2 рассылки по 10 групп
 • 4 рассылки по 5 групп
 
-[💳 Купить] [Позже]
+[💳 Купить тариф]
 ```
 
-**Рассылка завершена:**
+### 2. Аналитика авторассылки (по расписанию)
+
 ```
-✅ РАССЫЛКА ЗАВЕРШЕНА
+📊 АВТОРАССЫЛКА ЗАВЕРШЕНА
+🕐 Пн 14 апр, 08:12
 
-Результаты:
-├─ Отправлено: 8 из 10
-├─ Потрачено: 8 постов
-└─ Баланс: 92 поста
+Группы: 10
+├─ ✅ Отправлено: 8
+└─ ❌ Не отправлено: 2
 
-⚠️ Забаны: @group1, @group2
+💰 Потрачено: 8 постов
+📉 Баланс: 92 поста
+
+⚠️ 2 группы не ответили — проверьте тест
 ```
 
-**Платеж успешен:**
+### 3. Платёж успешен
+
 ```
-💳 ПЛАТЕЖ УСПЕШЕН
+💳 ПЛАТЁЖ УСПЕШЕН
 
-Вы купили: 600 постов / €20
-Новый баланс: 750 постов
+Пакет: Оптимальный (600 постов)
+Сумма: €20
 
-[📢 Рассылка] [Еще пакеты]
+Новый баланс: 692 поста
+
+[📢 Начать рассылку]
+```
+
+### 4. Платёж отклонён
+
+```
+❌ ПЛАТЁЖ ОТКЛОНЁН
+
+Причина: Недостаточно средств
+
+Попробуйте другую карту.
+
+[💳 Попробовать снова]
 ```
 
 ---
 
 ## 💻 Бэкэнд логика
 
-### 1. broadcast_manager.py — новые методы
+### 1. broadcast_manager.py — методы уведомлений
 
 ```python
 def init_notifications(self):
-    """Инициализировать настройки уведомлений"""
+    """Инициализировать настройки уведомлений (только баланс)"""
     if "notifications" not in self.state:
         self.state["notifications"] = {
-            "enabled": True,
-            "preferences": {
-                "balance_low": {"enabled": True, "threshold": 30},
-                "broadcast_completed": {"enabled": True},
-                "groups_blocked": {"enabled": True},
-                "schedule_disabled": {"enabled": True},
-                "broadcast_error": {"enabled": True},
-                "payment_success": {"enabled": True},  # ОБЯЗАТЕЛЬНОЕ
-                "payment_failed": {"enabled": True},   # ОБЯЗАТЕЛЬНОЕ
-                "bot_updates": {"enabled": True},
-            },
-            "last_notifications_sent": {},
+            "balance_low": {
+                "enabled": True,
+                "threshold": 30,
+                "last_sent": None,
+            }
         }
         self.save()
 
-def is_notification_enabled(self, notification_type: str) -> bool:
-    """Проверить включено ли уведомление"""
-    prefs = self.state.get("notifications", {}).get("preferences", {})
-    return prefs.get(notification_type, {}).get("enabled", True)
+def get_balance_notif_enabled(self) -> bool:
+    return self.state.get("notifications", {}).get("balance_low", {}).get("enabled", True)
 
-def set_notification_enabled(self, notification_type: str, enabled: bool):
-    """Включить/отключить уведомление"""
-    # Платежи нельзя отключить
-    if notification_type in ["payment_success", "payment_failed"]:
-        return
-    
-    notif = self.state.setdefault("notifications", {}).setdefault("preferences", {})
-    if notification_type not in notif:
-        notif[notification_type] = {}
-    notif[notification_type]["enabled"] = enabled
+def set_balance_notif_enabled(self, enabled: bool):
+    self.state.setdefault("notifications", {}).setdefault("balance_low", {})["enabled"] = enabled
     self.save()
 
-def get_notification_threshold(self, notification_type: str) -> int:
-    """Получить порог для уведомления"""
-    prefs = self.state.get("notifications", {}).get("preferences", {})
-    return prefs.get(notification_type, {}).get("threshold", 30)
+def get_balance_notif_threshold(self) -> int:
+    return self.state.get("notifications", {}).get("balance_low", {}).get("threshold", 30)
 
-def set_notification_threshold(self, notification_type: str, threshold: int):
-    """Установить порог"""
+def set_balance_notif_threshold(self, threshold: int):
     if threshold < 10 or threshold > 500:
         raise ValueError("Threshold must be between 10 and 500")
-    
-    notif = self.state.setdefault("notifications", {}).setdefault("preferences", {})
-    if notification_type not in notif:
-        notif[notification_type] = {}
-    notif[notification_type]["threshold"] = threshold
+    self.state.setdefault("notifications", {}).setdefault("balance_low", {})["threshold"] = threshold
     self.save()
 
-def was_notification_sent_today(self, notification_type: str) -> bool:
-    """Проверить было ли уведомление отправлено сегодня"""
-    last_sent = self.state.get("notifications", {}).get("last_notifications_sent", {}).get(notification_type)
-    if not last_sent:
+def was_balance_notif_sent_today(self) -> bool:
+    last = self.state.get("notifications", {}).get("balance_low", {}).get("last_sent")
+    if not last:
         return False
-    
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    last_date = last_sent[:10]
-    return last_date == today
+    return last[:10] == today
 
-def mark_notification_sent(self, notification_type: str):
-    """Отметить что уведомление отправлено"""
-    notif = self.state.setdefault("notifications", {}).setdefault("last_notifications_sent", {})
-    notif[notification_type] = datetime.now(timezone.utc).isoformat()
+def mark_balance_notif_sent(self):
+    self.state.setdefault("notifications", {}).setdefault("balance_low", {})["last_sent"] = \
+        datetime.now(timezone.utc).isoformat()
     self.save()
 ```
 
-### 2. main.py — обновить /start
+### 2. main.py — scheduler_loop() — аналитика + баланс
 
-**В handler /start добавить:**
-```python
-bm = scoped_broadcast_manager(message.from_user.id)
-bm.init_free_balance()
-bm.init_notifications()  # ДОБАВИТЬ ЭТУ СТРОКУ
-```
-
-### 3. main.py — обновить scheduler_loop()
-
-**Добавить проверку уведомлений (после существующего кода):**
+**После каждой авторассылки добавить (в конец цикла):**
 
 ```python
-# НОВОЕ: Отправить уведомление о низком балансе
-if bm.is_notification_enabled("balance_low"):
-    balance = bm.get_balance()
-    threshold = bm.get_notification_threshold("balance_low")
-    
-    if balance <= threshold and not bm.was_notification_sent_today("balance_low"):
-        text = f"""⚠️ БАЛАНС ЗАКАНЧИВАЕТСЯ
+# Уже существует: result = await execute_broadcast(...)
+# НОВОЕ: Отправить аналитику автоматической рассылки
 
-Осталось: {balance} постов
+sent_count = result.get("sent_count", 0)
+total_groups = len(groups)
+failed_count = total_groups - sent_count
+new_balance = bm.get_balance()
+slot_display = f"{weekday.capitalize()} {now_local.strftime('%d %b, %H:%M')}"
 
-При таком балансе вы сможете опубликовать:
-• {balance // 10} рассылок по 10 групп
-• {balance // 5} рассылок по 5 групп
+analytic_text = f"""📊 АВТОРАССЫЛКА ЗАВЕРШЕНА
+🕐 {slot_display}
 
-Пополните баланс!"""
-        
-        rows = [
-            [InlineKeyboardButton(text="💳 Купить", callback_data="bc_tariffs")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_notifications")],
-        ]
-        
+Группы: {total_groups}
+├─ ✅ Отправлено: {sent_count}
+└─ ❌ Не отправлено: {failed_count}
+
+💰 Потрачено: {sent_count} постов
+📉 Баланс: {new_balance} постов"""
+
+if failed_count > 0:
+    analytic_text += "\n\n⚠️ Есть неудачные группы — запустите тест"
+
+await bot.send_message(user_id, analytic_text)
+
+# НОВОЕ: Проверить низкий баланс (раз в день)
+if bm.get_balance_notif_enabled():
+    threshold = bm.get_balance_notif_threshold()
+    if new_balance <= threshold and not bm.was_balance_notif_sent_today():
+        rows = [[InlineKeyboardButton(text="💳 Купить тариф", callback_data="bc_tariffs")]]
         await bot.send_message(
             user_id,
-            text,
+            f"""⚠️ БАЛАНС ЗАКАНЧИВАЕТСЯ
+
+Осталось: {new_balance} постов
+
+Вы можете опубликовать ещё:
+• {new_balance // max(1, total_groups)} рассылок
+
+[Пополните баланс!]""",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
         )
-        
-        bm.mark_notification_sent("balance_low")
+        bm.mark_balance_notif_sent()
 ```
 
-### 4. main.py — новые handlers для меню уведомлений
+### 3. main.py — handlers меню уведомлений
 
 ```python
 @dp.callback_query(F.data == "settings_notifications")
 async def settings_notifications(query: CallbackQuery):
-    """Главное меню уведомлений"""
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
-    prefs = bm.state.get("notifications", {}).get("preferences", {})
-    
-    text = """🔔 УВЕДОМЛЕНИЯ
 
-Выберите что получать:
+    enabled = bm.get_balance_notif_enabled()
+    threshold = bm.get_balance_notif_threshold()
+    status_icon = "☑️" if enabled else "☐"
 
-1️⃣ Баланс заканчивается
-2️⃣ Рассылка завершена
-3️⃣ Группы в черном списке
-4️⃣ Расписание отключено
-5️⃣ Ошибки при рассылке
-6️⃣ Платеж успешен (обязательное)
-7️⃣ Платеж отклонен (обязательное)
-8️⃣ Обновления бота"""
-    
+    text = f"""🔔 УВЕДОМЛЕНИЯ
+
+{status_icon} Баланс заканчивается
+   Порог: {threshold} постов
+
+✅ Аналитика рассылки (обязательное)
+✅ Платёж успешен (обязательное)
+✅ Платёж отклонён (обязательное)"""
+
+    toggle_label = "Отключить баланс" if enabled else "Включить баланс"
+
     rows = [
-        [InlineKeyboardButton(text="⚠️ Баланс", callback_data="notif_balance_low")],
-        [InlineKeyboardButton(text="✅ Рассылка", callback_data="notif_broadcast_completed")],
-        [InlineKeyboardButton(text="🚫 Группы", callback_data="notif_groups_blocked")],
-        [InlineKeyboardButton(text="📅 Расписание", callback_data="notif_schedule_disabled")],
-        [InlineKeyboardButton(text="❌ Ошибки", callback_data="notif_broadcast_error")],
-        [InlineKeyboardButton(text="🔔 Обновления", callback_data="notif_bot_updates")],
+        [InlineKeyboardButton(text="⚠️ Изменить порог", callback_data="notif_threshold_menu")],
+        [InlineKeyboardButton(text=toggle_label, callback_data="notif_balance_toggle")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
     ]
-    
+
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await query.answer()
 
-@dp.callback_query(F.data.startswith("notif_"))
-async def notif_detail(query: CallbackQuery):
-    """Детальные настройки уведомления"""
-    notif_type = query.data[6:]  # Remove "notif_"
+
+@dp.callback_query(F.data == "notif_threshold_menu")
+async def notif_threshold_menu(query: CallbackQuery):
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
-    
-    enabled = bm.is_notification_enabled(notif_type)
-    threshold = bm.get_notification_threshold(notif_type)
-    is_required = notif_type in ["payment_success", "payment_failed"]
-    
-    status = "☑️ Включено" if enabled else "☐ Отключено"
-    required_text = " (обязательное)" if is_required else ""
-    
-    text = f"""🔔 {notif_type.replace('_', ' ').upper()}{required_text}
+    current = bm.get_balance_notif_threshold()
 
-Статус: {status}"""
-    
-    if notif_type == "balance_low":
-        text += f"\n\nПорог: {threshold} постов"
-    
-    rows = []
-    
-    if notif_type == "balance_low":
-        rows.extend([
-            [
-                InlineKeyboardButton(text="10", callback_data="notif_threshold_10"),
-                InlineKeyboardButton(text="20", callback_data="notif_threshold_20"),
-                InlineKeyboardButton(text="30", callback_data="notif_threshold_30"),
-            ],
-            [
-                InlineKeyboardButton(text="50", callback_data="notif_threshold_50"),
-                InlineKeyboardButton(text="100", callback_data="notif_threshold_100"),
-            ],
-        ])
-    
-    if not is_required:
-        toggle_text = "Отключить" if enabled else "Включить"
-        rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"notif_toggle_{notif_type}")])
-    
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings_notifications")])
-    
+    text = f"""⚠️ ПОРОГ УВЕДОМЛЕНИЯ О БАЛАНСЕ
+
+Текущий порог: {current} постов
+
+Уведомить когда остаётся ≤ X постов:"""
+
+    rows = [
+        [
+            InlineKeyboardButton(text="10", callback_data="notif_set_threshold_10"),
+            InlineKeyboardButton(text="20", callback_data="notif_set_threshold_20"),
+            InlineKeyboardButton(text="30", callback_data="notif_set_threshold_30"),
+        ],
+        [
+            InlineKeyboardButton(text="50", callback_data="notif_set_threshold_50"),
+            InlineKeyboardButton(text="100", callback_data="notif_set_threshold_100"),
+        ],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="settings_notifications")],
+    ]
+
     await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await query.answer()
 
-@dp.callback_query(F.data.startswith("notif_toggle_"))
-async def notif_toggle(query: CallbackQuery):
-    """Включить/отключить уведомление"""
-    notif_type = query.data[13:]  # Remove "notif_toggle_"
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
-    
-    current = bm.is_notification_enabled(notif_type)
-    bm.set_notification_enabled(notif_type, not current)
-    
-    new_status = "включено" if not current else "отключено"
-    await query.answer(f"✅ Уведомление {new_status}")
-    
-    # Обновить экран
-    await notif_detail(query)
 
-@dp.callback_query(F.data.startswith("notif_threshold_"))
-async def notif_threshold(query: CallbackQuery):
-    """Установить порог"""
-    threshold = int(query.data.split("_")[2])
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
-    
-    bm.set_notification_threshold("balance_low", threshold)
-    
+@dp.callback_query(F.data.startswith("notif_set_threshold_"))
+async def notif_set_threshold(query: CallbackQuery):
+    threshold = int(query.data.split("_")[-1])
+    bm = scoped_broadcast_manager(query.from_user.id)
+    bm.set_balance_notif_threshold(threshold)
     await query.answer(f"✅ Порог: {threshold} постов")
-    
-    # Обновить экран
-    query.data = "notif_balance_low"
-    await notif_detail(query)
+    await notif_threshold_menu(query)
+
+
+@dp.callback_query(F.data == "notif_balance_toggle")
+async def notif_balance_toggle(query: CallbackQuery):
+    bm = scoped_broadcast_manager(query.from_user.id)
+    current = bm.get_balance_notif_enabled()
+    bm.set_balance_notif_enabled(not current)
+    new_label = "включено" if not current else "отключено"
+    await query.answer(f"✅ Уведомление о балансе {new_label}")
+    await settings_notifications(query)
+```
+
+### 4. Инициализация при /start
+
+```python
+bm.init_free_balance()
+bm.init_notifications()  # ДОБАВИТЬ
 ```
 
 ---
 
 ## 🔍 Проверка (Verification)
 
-### Что тестировать:
-1. `/start` → инициализация notifications
-2. "⚙️ Настройки" → "🔔 Уведомления"
-3. Открыть "⚠️ Баланс" → показывает текущий порог (30)
-4. Нажать "[20]" → порог изменился на 20
-5. Баланс упал до 20 → уведомление (один раз в день)
-6. "🔔 Обновления" → нажать "Отключить" → ☐ Отключено
-7. Проверить JSON → структура notifications обновлена
+1. `/start` → JSON обновлён с `notifications.balance_low`
+2. ⚙️ Настройки → 🔔 Уведомления → показывает 4 типа
+3. Нажать "Изменить порог" → выбрать 50 → порог изменился
+4. Нажать "Отключить баланс" → ☐ уведомление выключено
+5. Дождаться авторассылки → пришло аналитическое сообщение
+6. Если баланс ≤ порог → пришло уведомление раз в день
 
 ---
 
 ## 📝 Файлы для изменения
 
-1. `bot/broadcast_manager.py` — добавить методы управления уведомлениями
-2. `bot/main.py` — обновить /start, scheduler_loop(), добавить handlers
+1. `bot/broadcast_manager.py` — добавить методы уведомлений
+2. `bot/main.py` — scheduler_loop(), handlers настроек, init в /start
 
 ---
 
-## 📋 Предусловия для Фазы 6
+## 📋 Предусловия
 
 - ✅ Фаза 5 закончена
 
@@ -421,10 +348,8 @@ async def notif_threshold(query: CallbackQuery):
 
 ## 🎯 Результат
 
-После этой фазы:
-- ✅ Полная система уведомлений (8 типов)
-- ✅ Меню "Настройки уведомлений" в Settings
-- ✅ Каждое уведомление можно включить/отключить
-- ✅ Параметры для каждого уведомления (порог, частота)
-- ✅ Платежные уведомления обязательные (нельзя отключить)
-- ✅ История последних уведомлений в JSON
+- ✅ 4 уведомления (только нужные)
+- ✅ Только баланс настраивается (порог + вкл/выкл)
+- ✅ Аналитика приходит после каждой авторассылки (обязательное)
+- ✅ Платёжные уведомления обязательные
+- ✅ Простая структура JSON (нет лишних полей)
