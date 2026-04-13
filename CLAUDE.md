@@ -2,11 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+---
+
+## 🎯 Context Files by Feature (READ FIRST!)
+
+**When user mentions broadcast/rассылка/mail/posting:**
+→ **READ:** `CLAUDE_BROADCAST.md` immediately
+- Contains: full menu structure, all callbacks (bc_*, bcp_*, bcg_*), flows, pricing
+- Gives: exact line numbers, handler patterns, visuals
+- Saves: tokens on investigation, precise answers
+
+**When user mentions phases/implementation/plan:**
+→ **READ:** `План/FULL_PLAN.md` 
+- Contains: all 7 phases with details, dependencies, checklist
+- Gives: context on what's needed, file changes, psychology
+- Saves: research time on architecture
+
+**When user mentions payment/balance/Stripe:**
+→ **SECTION:** "Payment and Balance System" below in this file
+- OR read `План/FINAL_PRICING.md` for pricing strategy
+
+---
+
 ## Project Overview
 
-**Tutor Finder Bot** is a Telegram bot that searches for Spanish tutors in Spanish Telegram groups. It has two main components:
-1. **Bot** (`bot/main.py`) — aiogram 3.x Telegram bot with inline keyboard UI for managing searches and broadcasts
-2. **Parser** (`parser/`) — Telethon-based scrapers for scanning group history and monitoring new messages in real-time
+**Tutor Finder Bot** is a Telegram bot that helps service providers (tutors, hairdressers, plumbers, etc.) automate posting their service announcements to Telegram groups. It has three main components:
+
+1. **Bot** (`bot/main.py`) — aiogram 3.x Telegram bot with inline keyboard UI for managing broadcasts, groups, scheduling, and payment
+2. **Parser** (`parser/`) — Telethon-based scrapers for scanning group history and sending broadcast messages
+3. **Payment System** (Stripe integration) — Manages post packages (3 tiers: 100/300/1500 posts), tracks user balance, deducts posts only on successful delivery
 
 ## Architecture
 
@@ -24,8 +48,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `groups_manager.py` — CRUD for `groups.json` (list of Telegram groups to scan/broadcast to)
 
 **Key state files (persisted JSON):**
-- `broadcast_state.json` — Campaign settings, send mode (user/channel), send-as channels, selected groups, schedule enabled/disabled, active times (e.g., `["08:12", "11:33"]`), timezone
-- `categories.json` — Keyword search categories (name, keywords, active flag)
+- `broadcast_state.json` — Campaign settings, send mode (user/channel), send-as channels, selected groups, schedule enabled/disabled, active times (e.g., `["08:12", "11:33"]`), timezone, **balance** (posts count, history), **notifications** (settings for balance alerts and broadcast analytics)
+- `categories.json` — Keyword search categories (name, keywords, active flag) [legacy for tutor search]
 - `groups.json` — List of group usernames (@groupname) to include in scans/broadcasts
 
 ### Parser Component (`parser/`)
@@ -66,6 +90,26 @@ python main.py
   - `OWNER_ID` — User ID(s) to restrict access (CSV for multiple)
   - `BROADCAST_TZ` — Timezone for scheduled broadcasts (default: `Europe/Madrid`)
   - `TG_API_ID`, `TG_API_HASH`, `TG_PHONE` — Telethon credentials (for parser; optional if not running parser)
+  - `STRIPE_SECRET_KEY` — Stripe API secret key (test or live)
+  - `STRIPE_WEBHOOK_SECRET` — Stripe webhook signing secret for verification
+
+## Payment and Balance System
+
+**Key concepts:**
+- **Posts balance:** Stored in `broadcast_state.json["balance"]`, tracks available posts per user
+- **Free balance:** 30 free posts granted on first `/start`
+- **Post packages (3 tiers via Stripe):**
+  - Small: 100 posts / €3.99 (€0.0399/post)
+  - Medium: 300 posts / €7.99 (€0.0266/post) — **primary conversion target**
+  - Large: 1500 posts / €33.99 (€0.0226/post) — anchor price to make medium look attractive
+- **Deduction logic:** Posts deducted ONLY after successful broadcast (confirmed delivery within 60 seconds)
+- **Balance notifications:** Alerts sent once per day when balance ≤ threshold (user-configurable)
+
+**Stripe integration:**
+- `stripe_handler.py` — Handles Stripe webhook for payment confirmations
+- `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` in `.env`
+- Webhook endpoint: `/stripe-webhook` receives `payment_intent.succeeded` events
+- On success: add posts to user balance via `broadcast_manager.set_balance()`
 
 ## Important Patterns
 
@@ -73,6 +117,7 @@ python main.py
 - All callback handlers check `await ensure_owner_callback(query)` to restrict to owner(s) defined in `OWNER_IDS`
 - Message handlers check `is_owner(message.from_user.id)` before processing
 - Owner IDs are parsed from `OWNER_IDS_ENV` (comma-separated list)
+- **Owner special privileges:** Can run unlimited tests (no cooldown), bypass balance checks for development
 
 ### Inline Keyboard Callback Data
 - **Format convention:** `callback_data="noun_action"` or `callback_data="noun_value"` (e.g., `"bc_schedule_toggle"`, `"bct_08:12"`, `"bcg_@groupname"`)
@@ -113,9 +158,37 @@ python main.py
 2. Implement `load()`, `save()`, and mutation methods
 3. Call `load()` before reads, `save()` after writes; return the state dict for chaining
 
+### Post balance and deduction workflow
+1. **Pre-broadcast check:** `bm.get_balance() >= len(selected_groups)` — verify user has enough posts
+2. **Execute broadcast:** `execute_broadcast(..., is_test=False)` returns `result` with `sent_count`
+3. **Deduct posts:** `bm.subtract_balance(sent_count)` — only deduct successfully sent messages
+4. **Update balance file:** `bm.save()` persists to JSON in Railway volume
+5. **Notify user:** Send analytics message with posts spent, remaining balance
+
+### Test broadcasts (no balance deduction)
+- Tests marked with `is_test=True` parameter
+- `send_broadcast_campaign()` appends 🧪 marker to message
+- After 60 seconds: verify message still in group, then auto-delete
+- Test results do NOT deduct from balance
+- Rate limit: 30-second cooldown between tests, max 5 tests/day (OWNER_ID exempt)
+
+## Implementation Roadmap (Phased Approach)
+
+See `План/` folder for detailed implementation plans:
+- **Фаза 1** (01_phase_balance_system.md) — Balance UI, 30 free posts, package selection menu
+- **Фаза 2** (02_phase_stripe_integration.md) — Stripe webhook, payment processing, balance updates
+- **Фаза 3** (03_phase_balance_check.md) — Pre-broadcast balance validation, test exemptions
+- **Фаза 4** (04_phase_deduction_logic.md) — Post-broadcast deduction based on actual sent count
+- **Фаза 5** (05_phase_test_safety.md) — Test message verification and auto-deletion
+- **Фаза 6** (06_phase_balance_notifications.md) — Balance alerts and broadcast analytics notifications
+- **Фаза 7** (07_phase_abuse_protection.md) — Cooldown, daily limits, suspicious activity logging
+
+**Key decision:** Posts deduct ONLY on success (sent_count), never on errors or failed broadcasts.
+
 ## Notes for Future Work
 
-- **No database layer** — If the project scales, consider migrating state to a database (SQLite for local, PostgreSQL for production)
-- **Telethon session files** — `*.session` files are created in the bot directory when Telethon connects; they cache authentication; do not delete unless you want to re-login
-- **Error handling in scanner/broadcast** — Parser scripts have minimal error handling; consider adding exponential backoff and retries for network issues
-- **Broadcast concurrency** — Only one broadcast can run at a time (protected by `broadcast_lock`); multiple scheduled slots at the same time will queue
+- **No database layer** — All state in JSON files on Railway volume. For production scale, migrate to PostgreSQL
+- **Telethon session files** — `*.session` files persist authentication; do not delete unless re-login needed
+- **Stripe webhook verification** — Always validate `stripe-signature` header; currently done via `stripe.Webhook.construct_event()`
+- **Broadcast concurrency** — Protected by global `broadcast_lock`; scheduler runs every 20s; multiple simultaneous requests queue
+- **Post deduction atomicity** — `subtract_balance()` decrements and saves to JSON in single operation; if process crashes, retrying is safe (duplicate detection by message ID in Telethon)
