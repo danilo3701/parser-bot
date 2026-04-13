@@ -1135,15 +1135,32 @@ async def main_bc_cancel_stop(query: CallbackQuery):
 # ─── Рассылка ─────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "broadcast")
-async def broadcast_menu(query: CallbackQuery):
+async def broadcast_menu(query: CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
+
+    # Check if account is connected
+    account = get_account(user_id)
+    if not account:
+        # Account not connected - show warning pages instead
+        await state.set_state(MainMenu.viewing_account_warning)
+        await state.update_data(warning_page=1)
+        await query.message.edit_text(
+            account_warning_page_text(1),
+            parse_mode="HTML",
+            reply_markup=account_warning_keyboard(1),
+            disable_web_page_preview=True,
+        )
+        await query.answer()
+        return
+
+    # Account connected - show broadcast menu
     bm = scoped_broadcast_manager(user_id)
     groups = scoped_load_broadcast_groups(user_id)
-    state = bm.ensure_groups_known(groups)
+    broadcast_state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
-        broadcast_summary_text(state, user_id=user_id, groups=groups),
+        broadcast_summary_text(broadcast_state, user_id=user_id, groups=groups),
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
+        reply_markup=broadcast_main_keyboard(broadcast_state, user_id=user_id),
     )
     await query.answer()
 
@@ -1431,7 +1448,7 @@ def account_warning_keyboard(page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
     if page == 1:
-        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_menu"),
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="back_main"),
                      InlineKeyboardButton(text="Далее →", callback_data="acc_warn_page_2")])
     elif page == 2:
         rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_warn_page_1"),
