@@ -530,8 +530,8 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     # Add balance button at the top
     rows.append([InlineKeyboardButton(text=f"💰 Баланс: {balance} постов", callback_data="bc_balance")])
 
-    # Add account connection button first
-    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_menu")])
+    # Add account connection button first (goes directly to warning pages)
+    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_methods")])
 
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
@@ -1135,32 +1135,15 @@ async def main_bc_cancel_stop(query: CallbackQuery):
 # ─── Рассылка ─────────────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "broadcast")
-async def broadcast_menu(query: CallbackQuery, state: FSMContext):
+async def broadcast_menu(query: CallbackQuery):
     user_id = query.from_user.id
-
-    # Check if account is connected
-    account = get_account(user_id)
-    if not account:
-        # Account not connected - show warning pages instead
-        await state.set_state(MainMenu.viewing_account_warning)
-        await state.update_data(warning_page=1)
-        await query.message.edit_text(
-            account_warning_page_text(1),
-            parse_mode="HTML",
-            reply_markup=account_warning_keyboard(1),
-            disable_web_page_preview=True,
-        )
-        await query.answer()
-        return
-
-    # Account connected - show broadcast menu
     bm = scoped_broadcast_manager(user_id)
     groups = scoped_load_broadcast_groups(user_id)
-    broadcast_state = bm.ensure_groups_known(groups)
+    state = bm.ensure_groups_known(groups)
     await query.message.edit_text(
-        broadcast_summary_text(broadcast_state, user_id=user_id, groups=groups),
+        broadcast_summary_text(state, user_id=user_id, groups=groups),
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(broadcast_state, user_id=user_id),
+        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer()
 
@@ -1448,7 +1431,7 @@ def account_warning_keyboard(page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
 
     if page == 1:
-        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="back_main"),
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="broadcast"),
                      InlineKeyboardButton(text="Далее →", callback_data="acc_warn_page_2")])
     elif page == 2:
         rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_warn_page_1"),
