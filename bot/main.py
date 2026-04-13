@@ -204,6 +204,7 @@ class MainMenu(StatesGroup):
     adding_broadcast_group = State()
     setting_broadcast_source = State()
     adding_broadcast_post = State()
+    viewing_account_warning = State()
     setting_broadcast_weekday_time = State()
     copying_broadcast_weekday = State()
     connecting_account_phone = State()
@@ -529,6 +530,9 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     # Add balance button at the top
     rows.append([InlineKeyboardButton(text=f"💰 Баланс: {balance} постов", callback_data="bc_balance")])
 
+    # Add account connection button first
+    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_menu")])
+
     mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
@@ -537,7 +541,6 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
 
     rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
     rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
-    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_menu")])
     rows.append([
         InlineKeyboardButton(text="🧪 Тест", callback_data="bc_test"),
         InlineKeyboardButton(text="✅ Массовая", callback_data="bc_mass"),
@@ -1367,6 +1370,79 @@ def account_methods_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def account_warning_page_text(page: int) -> str:
+    """Get warning page text (page 1, 2, or 3)"""
+    if page == 1:
+        return (
+            "🚨 <b>САМЫЙ ВАЖНЫЙ ШАГ ИЗ ВСЕХ</b> 🚨\n\n"
+            "⚠️ ЭТО САМОЕ ВАЖНОЕ РЕШЕНИЕ ПЕРЕД ПОДКЛЮЧЕНИЕМ\n\n"
+            "──────────────────────────────\n"
+            "🔴 <b>ЖИЗНЕННО ВАЖНАЯ РЕКОМЕНДАЦИЯ:</b>\n\n"
+            "<b>СОЗДАЙТЕ ОТДЕЛЬНЫЙ TELEGRAM-АККАУНТ</b> на другой номер телефона\n"
+            "специально для рассылок.\n\n"
+            "<b>ЗАТЕМ ПОДКЛЮЧИТЕ ЭТОТ НОВЫЙ АККАУНТ К БОТУ (НЕ ОСНОВНОЙ).</b>\n"
+            "──────────────────────────────\n\n"
+            "<b>При подключении аккаунта бот работает от вашего имени</b>\n"
+            "через официальный Telegram API.\n\n"
+            "<b>Бот технически получает доступ к:</b>\n"
+            "📩 личным сообщениям\n"
+            "👥 контактам и группам\n"
+            "📁 файлам и медиа в ваших чатах\n\n"
+            "Это неизбежно при подключении любого аккаунта.\n\n"
+            "Страница 1 из 3"
+        )
+    elif page == 2:
+        return (
+            "❌ <b>ЧТО ПРОИЗОЙДЁТ, ЕСЛИ ИСПОЛЬЗОВАТЬ ОСНОВНОЙ АККАУНТ?</b>\n\n"
+            "1️⃣ <b>Бот видит все ваши личные данные</b>\n"
+            "   Личные сообщения, контакты, файлы — всё доступно боту\n\n"
+            "2️⃣ <b>Telegram заблокирует аккаунт на 24 часа</b>\n"
+            "   (или больше, если жалоб много)\n\n"
+            "3️⃣ <b>Вы не сможете отправлять сообщения людям</b>\n"
+            "   Личные чаты, группы, друзья — всё заблокировано на время блокировки\n\n"
+            "───────────────────────────────\n\n"
+            "Это НЕ гарантия, что произойдёт.\n"
+            "Но это реальный риск, который вы берёте на себя.\n\n"
+            "Страница 2 из 3"
+        )
+    else:  # page == 3
+        return (
+            "✅ <b>ПОЧЕМУ НУЖЕН ОТДЕЛЬНЫЙ АККАУНТ?</b>\n\n"
+            "Если рассылка идёт с отдельного аккаунта:\n"
+            "✓ Бот видит только то, что в отдельном аккаунте (практически ничего)\n"
+            "✓ Основной аккаунт и все ваши данные остаются приватными\n"
+            "✓ Основной аккаунт остаётся свободным для общения\n"
+            "✓ Блокировка рассылочного аккаунта вас не затронет\n\n"
+            "───────────────────────────────\n"
+            "📱 <b>КАК СДЕЛАТЬ ПРАВИЛЬНО:</b>\n\n"
+            "<b>1. Создайте новый Telegram-аккаунт</b> (на отдельный номер)\n"
+            "<b>2. С ЭТОГО НОВОГО АККАУНТА откройте бот и подключите его</b>\n"
+            "<b>3. Ваш основной аккаунт остаётся полностью приватным</b>\n\n"
+            "Это займёт 5 минут. Номер телефона можно купить дёшево.\n\n"
+            "───────────────────────────────\n\n"
+            "Если вы всё прочитали и готовы создать отдельный аккаунт —\n"
+            "нажмите кнопку ниже.\n\n"
+            "Страница 3 из 3"
+        )
+
+
+def account_warning_keyboard(page: int) -> InlineKeyboardMarkup:
+    """Get warning page keyboard with navigation buttons"""
+    rows: list[list[InlineKeyboardButton]] = []
+
+    if page == 1:
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_menu"),
+                     InlineKeyboardButton(text="Далее →", callback_data="acc_warn_page_2")])
+    elif page == 2:
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_warn_page_1"),
+                     InlineKeyboardButton(text="Далее →", callback_data="acc_warn_page_3")])
+    else:  # page == 3
+        rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="acc_warn_page_2"),
+                     InlineKeyboardButton(text="✅ Прочитал/а", callback_data="acc_warn_complete")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def account_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Отмена", callback_data="acc_cancel")],
@@ -1414,6 +1490,65 @@ async def account_menu(query: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "acc_methods")
 async def account_methods(query: CallbackQuery, state: FSMContext):
     await _cleanup_pending_login(query.from_user.id)
+    await state.set_state(MainMenu.viewing_account_warning)
+    # Store current page in context data
+    await state.update_data(warning_page=1)
+    await _safe_edit_text(
+        query.message,
+        account_warning_page_text(1),
+        reply_markup=account_warning_keyboard(1),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_warn_page_2")
+async def account_warning_page_2(query: CallbackQuery, state: FSMContext):
+    await state.update_data(warning_page=2)
+    await _safe_edit_text(
+        query.message,
+        account_warning_page_text(2),
+        reply_markup=account_warning_keyboard(2),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_warn_page_1")
+async def account_warning_page_1(query: CallbackQuery, state: FSMContext):
+    await state.update_data(warning_page=1)
+    await _safe_edit_text(
+        query.message,
+        account_warning_page_text(1),
+        reply_markup=account_warning_keyboard(1),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_warn_page_3")
+async def account_warning_page_3(query: CallbackQuery, state: FSMContext):
+    await state.update_data(warning_page=3)
+    await _safe_edit_text(
+        query.message,
+        account_warning_page_text(3),
+        reply_markup=account_warning_keyboard(3),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "acc_warn_complete")
+async def account_warning_complete(query: CallbackQuery, state: FSMContext):
+    """User clicked 'Прочитал/а' button - show methods"""
+    data = await state.get_data()
+    current_page = data.get("warning_page", 1)
+
+    # Only allow completion from page 3
+    if current_page != 3:
+        await query.answer("⚠️ Вы не прочитали все условия. Дочитайте до конца.", show_alert=True)
+        return
+
     await state.set_state(MainMenu.viewing)
     await _safe_edit_text(
         query.message,
