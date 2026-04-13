@@ -292,10 +292,10 @@ async def verify_and_delete_test_messages(
                     else:
                         deleted = False
                         delete_error = type(exc).__name__
-        except Exception:
+        except Exception as exc:
             found = False
             deleted = False
-            verify_error = "resolve_or_fetch_failed"
+            verify_error = type(exc).__name__
 
         row: dict[str, bool | str] = {"found": bool(found), "deleted": bool(deleted)}
         if delete_error:

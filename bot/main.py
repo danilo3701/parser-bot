@@ -3294,6 +3294,11 @@ async def broadcast_confirm_mass(query: CallbackQuery):
     state = bm.ensure_groups_known(groups_all)
     groups = get_active_selected_groups(state, groups_all)
 
+    steps = get_setup_steps(user_id, state, groups_all)
+    if not steps["account"] or not steps["posts"] or not steps["groups"] or not steps["schedule"] or not steps["test"]:
+        await query.answer("Кампания не готова. Откройте раздел «📣 Рассылка» и завершите шаги настройки.", show_alert=True)
+        return
+
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
         await query.answer(reason, show_alert=True)
