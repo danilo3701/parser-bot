@@ -24,17 +24,17 @@
 Когда создашь цены в Stripe → вставь эти Price ID:
 
 ```python
-# bot/stripe_handler.py
+# bot/stripe_handler.py — АКТУАЛЬНЫЕ PRICE ID'Ы
 
 STRIPE_PRICES = {
     "small": {
-        "price_id": "price_...",  # ← Вставить Price ID для €3.99 (100 постов)
+        "price_id": "price_1TLetkLhGc6RmyWQCzBtrlmH",
         "posts": 100,
         "price_eur": 3.99,
         "price_per_post": 0.0399,
     },
     "medium": {
-        "price_id": "price_...",  # ← Вставить Price ID для €7.99 (300 постов)
+        "price_id": "price_1TLetkLhGc6RmyWQLcHxycOa",
         "posts": 300,
         "price_eur": 7.99,
         "price_per_post": 0.0266,
@@ -42,7 +42,7 @@ STRIPE_PRICES = {
         "discount_value_eur": 3.98,  # €11.97 - €7.99
     },
     "large": {
-        "price_id": "price_...",  # ← Вставить Price ID для €33.99 (1500 постов)
+        "price_id": "price_1TLetkLhGc6RmyWQ8cvtIsTI",
         "posts": 1500,
         "price_eur": 33.99,
         "price_per_post": 0.0226,
@@ -143,19 +143,21 @@ Lookup key: large_1500_posts
 
 ## 📋 ЧЕКЛИСТ ДЛЯ ТЕБЯ
 
-После создания в Stripe собери:
+✅ ГОТОВО:
 
 ```
-☐ STRIPE PRODUCT ID:
-  product_...
+✅ STRIPE PRODUCT ID:
+   prod_UKJFdB9FyfDGSU
 
-☐ PRICE IDs (вставить в STRIPE_PRICES):
-  small:   price_...
-  medium:  price_...
-  large:   price_...
+✅ PRICE IDs (вставлены в STRIPE_PRICES):
+   small:   price_1TLetkLhGc6RmyWQCzBtrlmH
+   medium:  price_1TLetkLhGc6RmyWQLcHxycOa
+   large:   price_1TLetkLhGc6RmyWQ8cvtIsTI
+
+⏳ НУЖНО СОБРАТЬ:
 
 ☐ API KEY:
-  STRIPE_SECRET_KEY = sk_test_...
+  STRIPE_SECRET_KEY = sk_test_... или sk_live_...
 
 ☐ WEBHOOK SECRET:
   STRIPE_WEBHOOK_SECRET = whsec_...
@@ -164,7 +166,7 @@ Lookup key: large_1500_posts
   https://your-railway-app.up.railway.app/stripe-webhook
 ```
 
-Когда соберёшь → дай мне, вставлю в код! 🚀
+**Далее:** Дай мне STRIPE_SECRET_KEY и STRIPE_WEBHOOK_SECRET → вставлю в Railway! 🚀
 
 ---
 

@@ -11,6 +11,7 @@ import json
 import math
 import contextlib
 import io
+import logging
 from pathlib import Path
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
@@ -21,6 +22,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
+from aiohttp import web
 
 # Добавляем пути
 sys.path.insert(0, str(Path(__file__).parent))
@@ -47,8 +49,9 @@ from scanner import scan_groups_history, monitor_groups_realtime
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
-from balance_manager import BalanceManager
+from balance_manager import BalanceManager, scoped_balance_manager
 from broadcast_sender import send_broadcast_campaign_with_client
+from stripe_handler import create_checkout_session, process_webhook, STRIPE_PRICES
 from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
@@ -715,11 +718,10 @@ def broadcast_balance_text(balance: int) -> str:
     """Format balance display with tariff options."""
     return (
         f"💰 <b>Баланс постов: {balance}</b>\n\n"
-        "Выберите тариф и пополните баланс:\n\n"
-        "<b>🟢 Пробный:</b> 80 постов / €5 (€0.0625/пост)\n"
-        "<b>🔵 Стартовый:</b> 250 постов / €12 (€0.048/пост, -23% 📉)\n"
-        "<b>🔥 Оптимальный:</b> 600 постов / €20 (€0.0333/пост, -47% 📉) — <b>Популярный!</b>\n"
-        "<b>💎 Оптовый:</b> 1500 постов / €40 (€0.0267/пост, -57% 📉)\n\n"
+        "Выберите пакет и пополните баланс:\n\n"
+        "<b>📦 Small:</b> 100 постов / €3.99 (€0.0399/пост)\n"
+        "<b>⭐ Medium:</b> 300 постов / €7.99 (€0.0266/пост, -33% 📉) — <b>Популярный!</b>\n"
+        "<b>💎 Large:</b> 1500 постов / €33.99 (€0.0226/пост, -73% 📉)\n\n"
         "Платите только за успешные публикации."
     )
 
@@ -727,13 +729,10 @@ def broadcast_balance_text(balance: int) -> str:
 def broadcast_balance_keyboard() -> InlineKeyboardMarkup:
     """Balance menu with tariff purchase buttons."""
     buttons = [
+        [InlineKeyboardButton(text="⭐ €7.99 (300 постов)", callback_data="bc_buy_medium")],
         [
-            InlineKeyboardButton(text="🔥 €20 (600)", callback_data="bc_buy_optimal"),
-            InlineKeyboardButton(text="💎 €40 (1500)", callback_data="bc_buy_wholesale"),
-        ],
-        [
-            InlineKeyboardButton(text="🔵 €12 (250)", callback_data="bc_buy_starter"),
-            InlineKeyboardButton(text="🟢 €5 (80)", callback_data="bc_buy_trial"),
+            InlineKeyboardButton(text="📦 €3.99 (100)", callback_data="bc_buy_small"),
+            InlineKeyboardButton(text="💎 €33.99 (1500)", callback_data="bc_buy_large"),
         ],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ]
@@ -3128,48 +3127,47 @@ async def broadcast_balance(query: CallbackQuery):
     await query.answer()
 
 
-@dp.callback_query(F.data == "bc_buy_trial")
-async def broadcast_buy_trial(query: CallbackQuery):
-    """Pробный тариф: 80 posts / €5"""
-    await query.answer(
-        "🟢 Пробный тариф: 80 постов / €5\n\n"
-        "Переходим на Stripe...\n"
-        "(Позже подключим VIP hook для автоматической обработки платежей)",
-        show_alert=True,
-    )
+@dp.callback_query(F.data == "bc_buy_small")
+async def broadcast_buy_small(query: CallbackQuery):
+    await _handle_purchase(query, "small")
 
 
-@dp.callback_query(F.data == "bc_buy_starter")
-async def broadcast_buy_starter(query: CallbackQuery):
-    """Стартовый тариф: 250 posts / €12"""
-    await query.answer(
-        "🔵 Стартовый тариф: 250 постов / €12\n\n"
-        "Переходим на Stripe...\n"
-        "(Позже подключим VIP hook для автоматической обработки платежей)",
-        show_alert=True,
-    )
+@dp.callback_query(F.data == "bc_buy_medium")
+async def broadcast_buy_medium(query: CallbackQuery):
+    await _handle_purchase(query, "medium")
 
 
-@dp.callback_query(F.data == "bc_buy_optimal")
-async def broadcast_buy_optimal(query: CallbackQuery):
-    """Оптимальный тариф: 600 posts / €20"""
-    await query.answer(
-        "🔥 Оптимальный тариф: 600 постов / €20 (самый популярный!)\n\n"
-        "Переходим на Stripe...\n"
-        "(Позже подключим VIP hook для автоматической обработки платежей)",
-        show_alert=True,
-    )
+@dp.callback_query(F.data == "bc_buy_large")
+async def broadcast_buy_large(query: CallbackQuery):
+    await _handle_purchase(query, "large")
 
 
-@dp.callback_query(F.data == "bc_buy_wholesale")
-async def broadcast_buy_wholesale(query: CallbackQuery):
-    """Оптовый тариф: 1500 posts / €40"""
-    await query.answer(
-        "💎 Оптовый тариф: 1500 постов / €40\n\n"
-        "Переходим на Stripe...\n"
-        "(Позже подключим VIP hook для автоматической обработки платежей)",
-        show_alert=True,
-    )
+async def _handle_purchase(query: CallbackQuery, tier: str):
+    """Handle tariff purchase - create Stripe Checkout and send link."""
+    await query.answer()
+    try:
+        checkout_url = await create_checkout_session(query.from_user.id, tier)
+        price_data = STRIPE_PRICES[tier]
+        text = (
+            f"🛒 <b>{price_data['label']} / €{price_data['price_eur']}</b>\n\n"
+            "Нажмите кнопку ниже для оплаты через Stripe:"
+        )
+        rows = [
+            [InlineKeyboardButton(text="💳 Перейти к оплате", url=checkout_url)],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_balance")],
+        ]
+        await query.message.edit_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.error(f"Stripe checkout error: {e}")
+        await query.message.edit_text(
+            "❌ Ошибка при создании платежа. Попробуйте позже.",
+            reply_markup=broadcast_balance_keyboard(),
+        )
 
 
 @dp.callback_query(F.data == "bc_test_disable_failed")
@@ -4586,6 +4584,88 @@ async def help_callback(query: CallbackQuery):
     await query.answer()
 
 
+# ─── Stripe Webhook HTTP Handlers ──────────────────────────────────────────────
+
+async def stripe_webhook_handler(request: web.Request) -> web.Response:
+    """Handle Stripe webhook events."""
+    payload = await request.read()
+    sig_header = request.headers.get("stripe-signature", "")
+
+    result = await process_webhook(payload, sig_header)
+
+    if "error" in result:
+        return web.Response(status=400, text=result["error"])
+
+    event_type = result.get("event")
+    user_id = result.get("user_id", 0)
+    bot_app = request.app["bot"]
+    logger = logging.getLogger(__name__)
+
+    if event_type == "succeeded" and user_id:
+        tier = result["tier"]
+        posts = result["posts"]
+        bm = scoped_balance_manager(user_id)
+        bm.add_posts(posts, STRIPE_PRICES[tier]["price_id"])
+        try:
+            await bot_app.send_message(
+                user_id,
+                f"✅ <b>Оплата подтверждена!</b>\n\n"
+                f"Добавлено: <b>{posts} постов</b>\n"
+                f"Текущий баланс: <b>{bm.get_balance()} постов</b>\n\n"
+                "Возвращайтесь в бот и запускайте рассылку! 🚀",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id}: {e}")
+
+    elif event_type == "payment_failed" and user_id:
+        error_msg = result.get("error", "Неизвестная ошибка")
+        try:
+            await bot_app.send_message(
+                user_id,
+                f"❌ <b>Платеж не прошел</b>\n\n"
+                f"Причина: {error_msg}\n\n"
+                "Попробуйте другую карту или обратитесь в поддержку.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id}: {e}")
+
+    elif event_type == "payment_canceled" and user_id:
+        try:
+            await bot_app.send_message(
+                user_id,
+                "🚫 <b>Платеж отменен</b>\n\n"
+                "Ваш баланс не изменился. Попробуйте ещё раз.",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user {user_id}: {e}")
+
+    elif event_type == "dispute_created":
+        for owner_id in OWNER_IDS:
+            try:
+                await bot_app.send_message(
+                    owner_id,
+                    f"⚠️ <b>CHARGEBACK ALERT!</b>\n\nCharge ID: {result.get('charge_id')}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+    return web.Response(status=200, text="ok")
+
+
+async def stripe_success_handler(request: web.Request) -> web.Response:
+    """Success page after Stripe payment."""
+    return web.Response(text="✅ Оплата успешна! Вернитесь в Telegram бот.", content_type="text/plain; charset=utf-8")
+
+
+async def stripe_cancel_handler(request: web.Request) -> web.Response:
+    """Cancel page if user cancels payment."""
+    return web.Response(text="❌ Платеж отменен. Вернитесь в Telegram бот.", content_type="text/plain; charset=utf-8")
+
+
 # ─── Запуск ────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -4593,10 +4673,26 @@ async def main():
     print("🤖 Бот запущен и готов к работе!")
     print("💬 Напиши /start в Telegram")
     print(f"📨 Канал по умолчанию: {DEFAULT_RESULTS_CHANNEL}")
+
+    # Setup aiohttp web app for Stripe webhooks
+    web_app = web.Application()
+    web_app["bot"] = bot
+    web_app.router.add_post("/stripe-webhook", stripe_webhook_handler)
+    web_app.router.add_get("/stripe-success", stripe_success_handler)
+    web_app.router.add_get("/stripe-cancel", stripe_cancel_handler)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 Webhook server running on port {port}")
+
     scheduler_task = asyncio.create_task(scheduler_loop())
     try:
         await dp.start_polling(bot)
     finally:
+        await runner.cleanup()
         if current_monitor_task and not current_monitor_task.done():
             if monitor_stop_event:
                 monitor_stop_event.set()

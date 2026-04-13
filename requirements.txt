@@ -4,3 +4,4 @@ telethon
 aiofiles
 pydantic==2.5.3
 qrcode[pil]
+stripe>=5.0.0
