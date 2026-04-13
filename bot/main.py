@@ -85,6 +85,8 @@ BROADCAST_TZ = os.getenv("BROADCAST_TZ", "Europe/Madrid")
 BROADCAST_TIMES = ["08:12", "11:33", "17:40", "22:30"]
 BROADCAST_TIME_OPTIONS = ["07:00", "08:12", "09:00", "11:33", "12:00", "15:00", "17:40", "18:00", "21:00", "22:30"]
 BROADCAST_TEST_VERIFY_SECONDS = int(os.getenv("BROADCAST_TEST_VERIFY_SECONDS", "60") or "60")
+TEST_COOLDOWN_SECONDS = int(os.getenv("TEST_COOLDOWN_SECONDS", "30") or "30")
+TEST_MAX_PER_DAY = int(os.getenv("TEST_MAX_PER_DAY", "5") or "5")
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
     int(item.strip())
@@ -93,6 +95,7 @@ OWNER_IDS = {
 }
 OWNER_2FA_PASSWORD = (os.getenv("OWNER_2FA_PASSWORD") or "").strip()
 SESSION_PATH = Path(os.getenv("TG_SESSION_PATH", Path(__file__).parent.parent / "parser" / "tutor_bot_scan.session")).resolve()
+logger = logging.getLogger(__name__)
 
 # Для пула постов: куда бот копирует присланные сообщения, чтобы Telethon мог их переотправлять.
 # Можно задать username канала (например, @connect_services). Если не задано, используем активный send-as канал.
@@ -3043,6 +3046,34 @@ async def broadcast_test_v2(query: CallbackQuery):
         await query.answer(reason, show_alert=True)
         return
 
+    owner_bypass = bool(OWNER_IDS) and (user_id in OWNER_IDS)
+    can_run_test, deny_reason = bm.can_run_test(
+        cooldown_seconds=TEST_COOLDOWN_SECONDS,
+        max_tests_per_day=TEST_MAX_PER_DAY,
+        bypass_limits=owner_bypass,
+    )
+    if not can_run_test:
+        test_log = bm.load().get("test_log", {})
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        daily_count = 0
+        if isinstance(test_log, dict):
+            daily_counts = test_log.get("daily_counts", {})
+            if isinstance(daily_counts, dict):
+                try:
+                    daily_count = int(daily_counts.get(today, 0))
+                except Exception:
+                    daily_count = 0
+        logger.warning(
+            "bc_test denied user_id=%s reason=%s daily_count=%s cooldown_seconds=%s max_tests_per_day=%s",
+            user_id,
+            deny_reason,
+            daily_count,
+            TEST_COOLDOWN_SECONDS,
+            TEST_MAX_PER_DAY,
+        )
+        await query.answer(f"❌ {deny_reason}", show_alert=True)
+        return
+
     test_groups = get_active_selected_groups(state, groups_all)
 
     # Test broadcast is always free: no balance check, no deduction.
@@ -3059,6 +3090,7 @@ async def broadcast_test_v2(query: CallbackQuery):
     await query.answer()
 
     started_at = datetime.now(timezone.utc).isoformat()
+    bm.record_test_run(bypass_limits=owner_bypass)
     async with broadcast_lock:
         result = await execute_broadcast(
             user_id,

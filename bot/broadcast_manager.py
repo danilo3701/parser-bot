@@ -45,6 +45,10 @@ class BroadcastManager:
                     "last_sent": None,
                 }
             },
+            "test_log": {
+                "last_test_at": None,
+                "daily_counts": {},
+            },
         }
 
     def load(self) -> dict:
@@ -71,6 +75,7 @@ class BroadcastManager:
         state.setdefault("last_runs", {})
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
         state.setdefault("notifications", self._default_state()["notifications"])
+        state.setdefault("test_log", self._default_state()["test_log"])
 
         notifications = state.get("notifications")
         if not isinstance(notifications, dict):
@@ -83,6 +88,23 @@ class BroadcastManager:
             balance_low.setdefault("enabled", True)
             balance_low.setdefault("threshold", 30)
             balance_low.setdefault("last_sent", None)
+        test_log = state.get("test_log")
+        if not isinstance(test_log, dict):
+            test_log = self._default_state()["test_log"]
+            state["test_log"] = test_log
+        test_log.setdefault("last_test_at", None)
+        daily_counts = test_log.get("daily_counts")
+        if not isinstance(daily_counts, dict):
+            test_log["daily_counts"] = {}
+        else:
+            # Keep only numeric values to avoid crashes on malformed state.
+            normalized_counts = {}
+            for day_key, value in daily_counts.items():
+                try:
+                    normalized_counts[str(day_key)] = int(value)
+                except Exception:
+                    continue
+            test_log["daily_counts"] = normalized_counts
 
         # Back-compat migration: if old source post is set and posts pool is empty, seed it.
         campaign = state.get("campaign", {})
@@ -482,5 +504,74 @@ class BroadcastManager:
     def mark_balance_notif_sent(self) -> dict:
         state = self.load()
         state.setdefault("notifications", {}).setdefault("balance_low", {})["last_sent"] = datetime.now(timezone.utc).isoformat()
+        self.save(state)
+        return state
+
+    # ─── Test abuse protection ────────────────────────────────────────────────
+
+    def can_run_test(
+        self,
+        cooldown_seconds: int = 30,
+        max_tests_per_day: int = 5,
+        bypass_limits: bool = False,
+    ) -> tuple[bool, str]:
+        if bypass_limits:
+            return True, ""
+
+        state = self.load()
+        test_log = state.get("test_log", {}) if isinstance(state.get("test_log", {}), dict) else {}
+        now = datetime.now(timezone.utc)
+
+        # Cooldown check.
+        last_test_at = test_log.get("last_test_at")
+        if isinstance(last_test_at, str) and last_test_at:
+            try:
+                last_dt = datetime.fromisoformat(last_test_at)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                elapsed = (now - last_dt).total_seconds()
+                if elapsed < cooldown_seconds:
+                    wait_seconds = max(1, int(cooldown_seconds - elapsed))
+                    return False, f"Подождите {wait_seconds} сек перед следующим тестом"
+            except Exception:
+                # Malformed timestamp should not block the user.
+                pass
+
+        # Daily limit check (UTC date).
+        today = now.strftime("%Y-%m-%d")
+        daily_counts = test_log.get("daily_counts", {}) if isinstance(test_log.get("daily_counts", {}), dict) else {}
+        try:
+            daily_tests = int(daily_counts.get(today, 0))
+        except Exception:
+            daily_tests = 0
+        if daily_tests >= max_tests_per_day:
+            return False, f"Вы уже запустили {daily_tests} тестов сегодня (лимит: {max_tests_per_day})"
+
+        return True, ""
+
+    def record_test_run(self, bypass_limits: bool = False) -> dict:
+        if bypass_limits:
+            return self.load()
+
+        state = self.load()
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+
+        test_log = state.setdefault("test_log", {})
+        if not isinstance(test_log, dict):
+            test_log = {}
+            state["test_log"] = test_log
+        daily_counts = test_log.setdefault("daily_counts", {})
+        if not isinstance(daily_counts, dict):
+            daily_counts = {}
+            test_log["daily_counts"] = daily_counts
+
+        test_log["last_test_at"] = now.isoformat()
+        try:
+            current = int(daily_counts.get(today, 0))
+        except Exception:
+            current = 0
+        daily_counts[today] = current + 1
+
         self.save(state)
         return state
