@@ -11,12 +11,55 @@ class BalanceManager:
 
     def _default_state(self) -> dict:
         """Default balance state structure."""
+        now = datetime.now(timezone.utc).isoformat()
         return {
             "posts": 30,  # Default free tier: 30 posts
-            "history": [],
+            "created_at": now,
+            "total_purchased": 0,
             "total_spent": 0,
             "last_purchase": None,
+            "history": [
+                {
+                    "type": "initial_free",
+                    "amount": 30,
+                    "timestamp": now,
+                }
+            ],
         }
+
+    def _ensure_initial_history(self, state: dict) -> bool:
+        """
+        Ensure initial free-tier history exists for a brand-new user state.
+
+        Returns True if the state was modified.
+        """
+        history = state.get("history")
+        if not isinstance(history, list):
+            state["history"] = []
+            history = state["history"]
+
+        if history:
+            return False
+
+        posts = int(state.get("posts") or 0)
+        total_purchased = int(state.get("total_purchased") or 0)
+        total_spent = int(state.get("total_spent") or 0)
+        last_purchase = state.get("last_purchase")
+
+        # Backfill only when the state looks like a never-used free tier.
+        if posts == 30 and total_purchased == 0 and total_spent == 0 and not last_purchase:
+            created_at = state.get("created_at") or datetime.now(timezone.utc).isoformat()
+            state["created_at"] = created_at
+            state["history"].append(
+                {
+                    "type": "initial_free",
+                    "amount": 30,
+                    "timestamp": created_at,
+                }
+            )
+            return True
+
+        return False
 
     def load(self) -> dict:
         """Load balance state from JSON file."""
@@ -40,6 +83,8 @@ class BalanceManager:
 
         # Ensure all required fields exist
         state.setdefault("posts", 30)
+        state.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        state.setdefault("total_purchased", 0)
         state.setdefault("history", [])
         state.setdefault("total_spent", 0)
         state.setdefault("last_purchase", None)
@@ -47,6 +92,10 @@ class BalanceManager:
         # Ensure history is a list
         if not isinstance(state.get("history"), list):
             state["history"] = []
+
+        modified = self._ensure_initial_history(state)
+        if modified:
+            self.save(state)
 
         return state
 
@@ -127,6 +176,7 @@ class BalanceManager:
 
         state = self.load()
         state["posts"] += amount
+        state["total_purchased"] = state.get("total_purchased", 0) + amount
         state["last_purchase"] = datetime.now(timezone.utc).isoformat()
 
         # Record in history

@@ -77,6 +77,8 @@ async def send_broadcast_campaign_with_client(
     delay_seconds: float = 5.0,
     jitter_seconds: float = 1.0,
     as_copy: bool = True,
+    is_test: bool = False,
+    test_marker: str = "🧪",
 ) -> dict:
     """
     Sends campaign using an already connected/authorized Telethon client.
@@ -136,7 +138,18 @@ async def send_broadcast_campaign_with_client(
         sent = False
         sent_message_id = None
         try:
-            if as_copy:
+            if is_test:
+                kwargs = {"link_preview": False}
+                if send_as_entity is not None:
+                    kwargs["send_as"] = send_as_entity
+                sent_msg = await client.send_message(
+                    group_entity,
+                    f"{test_marker} Тестовое сообщение. Проверка доступа.",
+                    **kwargs,
+                )
+                sent = True
+                sent_message_id = getattr(sent_msg, "id", None)
+            elif as_copy:
                 kwargs = {"as_copy": True}
                 if send_as_entity is not None:
                     kwargs["send_as"] = send_as_entity
@@ -170,17 +183,41 @@ async def send_broadcast_campaign_with_client(
         except telethon.errors.FloodWaitError as exc:
             await asyncio.sleep(exc.seconds + 1)
             try:
-                forwarded = await client.forward_messages(
-                    entity=group_entity,
-                    messages=[source_message_id],
-                    from_peer=source_entity,
-                    as_copy=True,
-                )
-                if isinstance(forwarded, list) and forwarded:
-                    sent_message_id = getattr(forwarded[0], "id", None)
+                if is_test:
+                    kwargs = {"link_preview": False}
+                    if send_as_entity is not None:
+                        kwargs["send_as"] = send_as_entity
+                    sent_msg = await client.send_message(
+                        group_entity,
+                        f"{test_marker} Тестовое сообщение. Проверка доступа.",
+                        **kwargs,
+                    )
+                    sent = True
+                    sent_message_id = getattr(sent_msg, "id", None)
                 else:
-                    sent_message_id = getattr(forwarded, "id", None)
-                sent = True
+                    kwargs = {"as_copy": True}
+                    if send_as_entity is not None:
+                        kwargs["send_as"] = send_as_entity
+                    try:
+                        forwarded = await client.forward_messages(
+                            entity=group_entity,
+                            messages=[source_message_id],
+                            from_peer=source_entity,
+                            **kwargs,
+                        )
+                    except TypeError:
+                        # Older Telethon builds may not support send_as/as_copy in forward_messages
+                        forwarded = await client.forward_messages(
+                            entity=group_entity,
+                            messages=[source_message_id],
+                            from_peer=source_entity,
+                            as_copy=True,
+                        )
+                    if isinstance(forwarded, list) and forwarded:
+                        sent_message_id = getattr(forwarded[0], "id", None)
+                    else:
+                        sent_message_id = getattr(forwarded, "id", None)
+                    sent = True
             except Exception as retry_exc:
                 reason = _normalize_reason(retry_exc)
                 if _is_hard_permission_reason(reason):
@@ -217,4 +254,54 @@ async def send_broadcast_campaign_with_client(
     return result
 
 
+async def verify_and_delete_test_messages(
+    *,
+    client,
+    test_message_ids: dict[str, int],
+    wait_seconds: int = 60,
+) -> dict[str, dict[str, bool | str]]:
+    """
+    Wait, verify that test messages are still present, then try to delete them.
 
+    Returns: {group: {"found": bool, "deleted": bool, ...optional error fields...}}
+    """
+    if wait_seconds and wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+    delete_forbidden_exc = getattr(telethon.errors, "MessageDeleteForbiddenError", None)
+
+    results: dict[str, dict[str, bool | str]] = {}
+    for group, msg_id in (test_message_ids or {}).items():
+        found = False
+        deleted = False
+        delete_error = ""
+        verify_error = ""
+        try:
+            entity = await client.get_entity(_as_entity_ref(group))
+            message = await client.get_messages(entity, ids=int(msg_id))
+            if isinstance(message, list):
+                message = message[0] if message else None
+            if message:
+                found = True
+                try:
+                    await client.delete_messages(entity, [int(msg_id)])
+                    deleted = True
+                except Exception as exc:
+                    if delete_forbidden_exc is not None and isinstance(exc, delete_forbidden_exc):
+                        deleted = False
+                    else:
+                        deleted = False
+                        delete_error = type(exc).__name__
+        except Exception:
+            found = False
+            deleted = False
+            verify_error = "resolve_or_fetch_failed"
+
+        row: dict[str, bool | str] = {"found": bool(found), "deleted": bool(deleted)}
+        if delete_error:
+            row["delete_error"] = delete_error
+        if verify_error:
+            row["verify_error"] = verify_error
+        results[str(group)] = row
+
+    return results

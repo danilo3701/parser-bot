@@ -38,6 +38,13 @@ class BroadcastManager:
             # New schedule model: weekly day -> {enabled, time}
             "weekly_schedule": {wd: {"enabled": False, "time": None} for wd in WEEKDAYS},
             "last_runs": {},
+            "notifications": {
+                "balance_low": {
+                    "enabled": True,
+                    "threshold": 30,
+                    "last_sent": None,
+                }
+            },
         }
 
     def load(self) -> dict:
@@ -63,6 +70,19 @@ class BroadcastManager:
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+        state.setdefault("notifications", self._default_state()["notifications"])
+
+        notifications = state.get("notifications")
+        if not isinstance(notifications, dict):
+            notifications = self._default_state()["notifications"]
+            state["notifications"] = notifications
+        balance_low = notifications.get("balance_low")
+        if not isinstance(balance_low, dict):
+            notifications["balance_low"] = self._default_state()["notifications"]["balance_low"]
+        else:
+            balance_low.setdefault("enabled", True)
+            balance_low.setdefault("threshold", 30)
+            balance_low.setdefault("last_sent", None)
 
         # Back-compat migration: if old source post is set and posts pool is empty, seed it.
         campaign = state.get("campaign", {})
@@ -409,5 +429,58 @@ class BroadcastManager:
         state = self.load()
         state["campaign"]["send_mode"] = mode
         self.reset_test_flag_in_state(state)
+        self.save(state)
+        return state
+
+    # ─── Notifications ──────────────────────────────────────────────────────────
+
+    def init_notifications(self) -> dict:
+        state = self.load()
+        notifications = state.setdefault("notifications", {})
+        balance_low = notifications.setdefault("balance_low", {})
+        balance_low.setdefault("enabled", True)
+        balance_low.setdefault("threshold", 30)
+        balance_low.setdefault("last_sent", None)
+        self.save(state)
+        return state
+
+    def get_balance_notif_enabled(self) -> bool:
+        state = self.load()
+        return bool(state.get("notifications", {}).get("balance_low", {}).get("enabled", True))
+
+    def set_balance_notif_enabled(self, enabled: bool) -> dict:
+        state = self.load()
+        state.setdefault("notifications", {}).setdefault("balance_low", {})["enabled"] = bool(enabled)
+        self.save(state)
+        return state
+
+    def get_balance_notif_threshold(self) -> int:
+        state = self.load()
+        try:
+            threshold = int(state.get("notifications", {}).get("balance_low", {}).get("threshold", 30))
+        except Exception:
+            threshold = 30
+        return max(10, min(500, threshold))
+
+    def set_balance_notif_threshold(self, threshold: int) -> dict:
+        threshold = int(threshold)
+        if threshold < 10 or threshold > 500:
+            raise ValueError("Threshold must be between 10 and 500")
+        state = self.load()
+        state.setdefault("notifications", {}).setdefault("balance_low", {})["threshold"] = threshold
+        self.save(state)
+        return state
+
+    def was_balance_notif_sent_today(self) -> bool:
+        state = self.load()
+        last = state.get("notifications", {}).get("balance_low", {}).get("last_sent")
+        if not last:
+            return False
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return str(last)[:10] == today
+
+    def mark_balance_notif_sent(self) -> dict:
+        state = self.load()
+        state.setdefault("notifications", {}).setdefault("balance_low", {})["last_sent"] = datetime.now(timezone.utc).isoformat()
         self.save(state)
         return state

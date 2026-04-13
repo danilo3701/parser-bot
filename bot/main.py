@@ -50,7 +50,7 @@ from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
 from balance_manager import BalanceManager, scoped_balance_manager
-from broadcast_sender import send_broadcast_campaign_with_client
+from broadcast_sender import send_broadcast_campaign_with_client, verify_and_delete_test_messages
 from stripe_handler import create_checkout_session, process_webhook, STRIPE_PRICES
 from mtproto_accounts import (
     PendingLogin,
@@ -279,6 +279,9 @@ def settings_keyboard():
             InlineKeyboardButton(text="📊 Группы", callback_data="groups"),
         ],
         [
+            InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings_notifications"),
+        ],
+        [
             InlineKeyboardButton(text="🚫 Стоп-слова", callback_data="anti_keywords"),
         ],
         [
@@ -291,6 +294,51 @@ def back_button():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_main")],
     ])
+
+
+def settings_notifications_text(enabled: bool, threshold: int) -> str:
+    status_icon = "☑️" if enabled else "☐"
+    return (
+        "🔔 <b>УВЕДОМЛЕНИЯ</b>\n\n"
+        f"{status_icon} <b>Баланс заканчивается</b>\n"
+        f"Порог: <b>{threshold}</b> постов\n\n"
+        "✅ Аналитика рассылки (обязательное)\n"
+        "✅ Платеж успешен (обязательное)\n"
+        "✅ Платеж отклонен (обязательное)"
+    )
+
+
+def settings_notifications_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    toggle_label = "Отключить баланс" if enabled else "Включить баланс"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Изменить порог", callback_data="notif_threshold_menu")],
+        [InlineKeyboardButton(text=toggle_label, callback_data="notif_balance_toggle")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
+    ])
+
+
+def notifications_threshold_text(current_threshold: int) -> str:
+    return (
+        "⚠️ <b>ПОРОГ УВЕДОМЛЕНИЯ О БАЛАНСЕ</b>\n\n"
+        f"Текущий порог: <b>{current_threshold}</b> постов\n\n"
+        "Уведомить когда остается ≤ X постов:"
+    )
+
+
+def notifications_threshold_keyboard() -> InlineKeyboardMarkup:
+    values = [10, 20, 30, 50, 100]
+    rows = []
+    rows.append([
+        InlineKeyboardButton(text=str(values[0]), callback_data=f"notif_set_threshold_{values[0]}"),
+        InlineKeyboardButton(text=str(values[1]), callback_data=f"notif_set_threshold_{values[1]}"),
+        InlineKeyboardButton(text=str(values[2]), callback_data=f"notif_set_threshold_{values[2]}"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text=str(values[3]), callback_data=f"notif_set_threshold_{values[3]}"),
+        InlineKeyboardButton(text=str(values[4]), callback_data=f"notif_set_threshold_{values[4]}"),
+    ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings_notifications")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def format_channel_label(channel_id: int | None) -> str:
@@ -714,10 +762,38 @@ def broadcast_copy_target_keyboard(source_weekday: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def broadcast_balance_text(balance: int) -> str:
+def _format_iso_date_short(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.date().isoformat()
+    except Exception:
+        return str(value)[:10]
+
+
+def _format_iso_dt_short(value: str | None) -> str:
+    if not value:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(value)
+
+
+def broadcast_balance_text(state: dict) -> str:
     """Format balance display with tariff options."""
+    balance = int(state.get("posts") or 0)
+    total_purchased = int(state.get("total_purchased") or 0)
+    total_spent = int(state.get("total_spent") or 0)
+    created_at = _format_iso_date_short(state.get("created_at"))
     return (
-        f"💰 <b>Баланс постов: {balance}</b>\n\n"
+        "💰 <b>МОЙ БАЛАНС</b>\n\n"
+        f"🟢 Доступно: <b>{balance}</b> постов\n"
+        f"🛍 Всего куплено: <b>{total_purchased}</b>\n"
+        f"📤 Всего потрачено: <b>{total_spent}</b>\n"
+        f"📅 Аккаунт создан: <b>{created_at}</b>\n\n"
         "Выберите пакет и пополните баланс:\n\n"
         "<b>📦 Small:</b> 100 постов / €3.99 (€0.0399/пост)\n"
         "<b>⭐ Medium:</b> 300 постов / €7.99 (€0.0266/пост, -33% 📉) — <b>Популярный!</b>\n"
@@ -734,9 +810,62 @@ def broadcast_balance_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📦 €3.99 (100)", callback_data="bc_buy_small"),
             InlineKeyboardButton(text="💎 €33.99 (1500)", callback_data="bc_buy_large"),
         ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        [
+            InlineKeyboardButton(text="📜 История", callback_data="bc_balance_history"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def broadcast_balance_history_text(state: dict, history: list[dict]) -> str:
+    balance = int(state.get("posts") or 0)
+    if not history:
+        return (
+            "📜 <b>История баланса</b>\n\n"
+            f"Текущий баланс: <b>{balance}</b> постов\n\n"
+            "История пока пустая."
+        )
+
+    lines = [
+        "📜 <b>История баланса</b>",
+        "",
+        f"Текущий баланс: <b>{balance}</b> постов",
+        "",
+    ]
+
+    for idx, item in enumerate(history, 1):
+        kind = str(item.get("type") or "unknown")
+        amount = item.get("amount")
+        ts = _format_iso_dt_short(item.get("timestamp"))
+        summary = (item.get("summary") or "").strip()
+
+        if kind == "purchase":
+            label = "🛍 Покупка"
+            sign = "+"
+        elif kind == "spent":
+            label = "📤 Рассылка"
+            sign = "-"
+        elif kind == "initial_free":
+            label = "🎁 Старт"
+            sign = "+"
+        else:
+            label = f"ℹ️ {kind}"
+            sign = ""
+
+        amount_str = f"{sign}{amount}" if amount is not None else "—"
+        line = f"{idx}. {label}: <b>{amount_str}</b> — {ts}"
+        if summary and kind == "spent":
+            line += f"\n   {summary}"
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def broadcast_balance_history_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_balance")],
+    ])
 
 
 def broadcast_test_result_text(test_result: dict, working_groups: list, failed_groups: dict) -> str:
@@ -872,7 +1001,14 @@ def get_active_selected_groups(state: dict, groups: list[str]) -> list[str]:
     return get_active_selected_groups_from(state, groups)
 
 
-async def execute_broadcast(user_id: int, groups: list[str], *, advance_rotation: bool) -> dict:
+async def execute_broadcast(
+    user_id: int,
+    groups: list[str],
+    *,
+    advance_rotation: bool,
+    is_test: bool = False,
+    test_marker: str = "🧪",
+) -> dict:
     mgr = scoped_broadcast_manager(user_id)
     state = mgr.load()
     campaign = state.get("campaign", {})
@@ -896,9 +1032,11 @@ async def execute_broadcast(user_id: int, groups: list[str], *, advance_rotation
             source_channel=source_channel,
             source_message_id=source_message_id,
             send_as_channel=send_as,
-            delay_seconds=5.0,
-            jitter_seconds=1.0,
+            delay_seconds=1.5 if is_test else 5.0,
+            jitter_seconds=0.5 if is_test else 1.0,
             as_copy=True,
+            is_test=is_test,
+            test_marker=test_marker,
         )
     finally:
         try:
@@ -952,6 +1090,7 @@ async def scheduler_loop():
 
             for user_id in sorted(user_ids):
                 bm = scoped_broadcast_manager(user_id)
+                balance_mgr = scoped_balance_manager(user_id)
                 groups_all = scoped_load_broadcast_groups(user_id)
                 state = bm.ensure_groups_known(groups_all)
 
@@ -986,14 +1125,67 @@ async def scheduler_loop():
                     continue
 
                 groups = get_active_selected_groups(state, groups_all)
+                if not balance_mgr.check_sufficient(len(groups)):
+                    reason = "Недостаточно постов на балансе."
+                    bm.mark_slot_run(date_str, slot, "skipped", reason)
+                    await notify_user(user_id, "📣 Авторассылка пропущена: недостаточно постов на балансе.")
+                    continue
+
                 async with broadcast_lock:
+                    # Re-check under lock to avoid races with parallel manual runs.
+                    if not balance_mgr.check_sufficient(len(groups)):
+                        reason = "Недостаточно постов на балансе."
+                        bm.mark_slot_run(date_str, slot, "skipped", reason)
+                        await notify_user(user_id, "📣 Авторассылка пропущена: недостаточно постов на балансе.")
+                        continue
                     result = await execute_broadcast(user_id, groups, advance_rotation=True)
+                    sent_count = int(result.get("sent_count", 0) or 0)
+                    if sent_count > 0:
+                        balance_mgr.spend_posts(
+                            amount=sent_count,
+                            groups_count=len(groups),
+                            sent_count=sent_count,
+                            summary=f"Авторассылка: {sent_count} групп",
+                        )
                 for group, err in result.get("blocked_groups", {}).items():
                     bm.set_group_blocked(group, err)
 
                 status = "ok" if result.get("ok") else "failed"
                 bm.mark_slot_run(date_str, slot, status, result.get("summary", ""))
-                await notify_user(user_id, f"📣 Авторассылка ({WEEKDAY_NAMES.get(weekday, weekday)} {slot}): {result.get('summary', '')}")
+                new_balance = balance_mgr.get_balance()
+                failed_count = max(0, len(groups) - sent_count)
+                analytics_text = (
+                    "📊 <b>АВТОРАССЫЛКА ЗАВЕРШЕНА</b>\n"
+                    f"🕐 {WEEKDAY_NAMES.get(weekday, weekday)} {date_str} {slot}\n\n"
+                    f"Группы: {len(groups)}\n"
+                    f"├─ ✅ Отправлено: {sent_count}\n"
+                    f"└─ ❌ Не отправлено: {failed_count}\n\n"
+                    f"💰 Потрачено: {sent_count} постов\n"
+                    f"📉 Баланс: {new_balance} постов"
+                )
+                if failed_count > 0:
+                    analytics_text += "\n\n⚠️ Есть неудачные группы — запустите тест."
+                await notify_user(user_id, analytics_text)
+
+                if bm.get_balance_notif_enabled():
+                    threshold = bm.get_balance_notif_threshold()
+                    if new_balance <= threshold and not bm.was_balance_notif_sent_today():
+                        broadcasts_left = new_balance // max(1, len(groups))
+                        low_balance_text = (
+                            "⚠️ <b>БАЛАНС ЗАКАНЧИВАЕТСЯ</b>\n\n"
+                            f"Осталось: <b>{new_balance}</b> постов\n\n"
+                            "Вы можете опубликовать еще:\n"
+                            f"• {broadcasts_left} рассылок по {max(1, len(groups))} групп"
+                        )
+                        await bot.send_message(
+                            int(user_id),
+                            low_balance_text,
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="💳 Купить тариф", callback_data="bc_balance")]
+                            ]),
+                        )
+                        bm.mark_balance_notif_sent()
 
             await asyncio.sleep(20)
         except Exception:
@@ -1007,14 +1199,12 @@ async def cmd_start(message: Message, state: FSMContext):
     await state.set_state(MainMenu.viewing)
     user_id = message.from_user.id
 
-    # Initialize balance on first start
-    balance_mgr = scoped_balance_manager(user_id)
-    current_balance = balance_mgr.get_balance()
-    if current_balance == 0:
-        # First time user: give 30 free posts
-        balance_mgr.reset_to_free_tier()
+    # Ensure balance state exists/initialized (free tier is granted only once)
+    scoped_balance_manager(user_id).load()
 
-    bm_state = scoped_broadcast_manager(user_id).load()
+    bm = scoped_broadcast_manager(user_id)
+    bm.init_notifications()
+    bm_state = bm.load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     cat_state = load()
     active_dir = get_active_direction(cat_state)
@@ -2855,30 +3045,28 @@ async def broadcast_test_v2(query: CallbackQuery):
 
     test_groups = get_active_selected_groups(state, groups_all)
 
-    # Check balance before test
+    # Test broadcast is always free: no balance check, no deduction.
     balance_mgr = scoped_balance_manager(user_id)
-    if not balance_mgr.check_sufficient(1):
-        await query.message.edit_text(
-            "❌ <b>Недостаточно постов!</b>\n\n"
-            f"Требуется: 1 пост для теста\n"
-            f"В наличии: {balance_mgr.get_balance()} постов\n\n"
-            "Выберите пакет и пополните баланс:",
-            parse_mode="HTML",
-            reply_markup=broadcast_balance_keyboard(),
-        )
-        await query.answer()
-        return
+    balance_before_test = balance_mgr.get_balance()
 
     await query.message.edit_text(
-        "🧪 <b>Тест-рассылка</b>\n\n"
-        f"Групп: <code>{len(test_groups)}</code>\n"
-        "⏳ Проверяю 60 сек...",
+        "🧪 <b>ТЕСТИРОВАНИЕ ГРУПП</b>\n\n"
+        "🆓 Тест бесплатный — посты не списываются.\n"
+        f"Отправляю тестовые сообщения в <b>{len(test_groups)}</b> групп...\n"
+        "Не закрывайте чат!",
         parse_mode="HTML",
     )
+    await query.answer()
 
     started_at = datetime.now(timezone.utc).isoformat()
     async with broadcast_lock:
-        result = await execute_broadcast(user_id, test_groups, advance_rotation=False)
+        result = await execute_broadcast(
+            user_id,
+            test_groups,
+            advance_rotation=False,
+            is_test=True,
+            test_marker="🧪",
+        )
 
     sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
     send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
@@ -2920,23 +3108,63 @@ async def broadcast_test_v2(query: CallbackQuery):
             reason = send_errors.get(group, "unknown")
             failed_groups[group] = reason
 
-    # Spend posts (balance deduction) for successful broadcasts
-    balance_mgr = scoped_balance_manager(user_id)
-    if result.get("sent_count", 0) > 0:
-        balance_mgr.spend_posts(
-            amount=result.get("sent_count", 0),
-            groups_count=len(test_groups),
-            sent_count=result.get("sent_count", 0),
-            summary=f"Тест-рассылка: {result.get('sent_count', 0)} групп",
-        )
-
     # Show test result with new format
     test_result_text = broadcast_test_result_text(result, working_groups, failed_groups)
-    new_balance = balance_mgr.get_balance()
+    balance_after_test = balance_mgr.get_balance()
+
+    # Wait 60 seconds with progress updates, then verify/delete test messages.
+    total_seconds = 60
+    step_seconds = 10
+    test_message_ids = sent_message_ids
+    cleanup_summary = ""
+    if test_message_ids:
+        for elapsed in range(0, total_seconds + step_seconds, step_seconds):
+            remaining = max(0, total_seconds - elapsed)
+            filled = min(10, int((elapsed / total_seconds) * 10))
+            bar = "█" * filled + "░" * (10 - filled)
+            try:
+                await query.message.edit_text(
+                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ СООБЩЕНИЙ</b>\n\n"
+                    f"⏳ Осталось: <b>{remaining}</b> сек\n"
+                    f"<code>{bar}</code>\n\n"
+                    "Не закрывайте чат!",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            if remaining > 0:
+                await asyncio.sleep(step_seconds)
+
+        ok, _, client, _ = await _readiness_check_connected_account(user_id)
+        cleanup = {}
+        if ok and client:
+            try:
+                cleanup = await verify_and_delete_test_messages(
+                    client=client,
+                    test_message_ids=test_message_ids,
+                    wait_seconds=0,
+                )
+            except Exception:
+                cleanup = {}
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+            found_count = sum(1 for v in cleanup.values() if v.get("found"))
+            deleted_count = sum(1 for v in cleanup.values() if v.get("deleted"))
+            cleanup_summary = f"🧹 Тестовые сообщения: найдено {found_count}, удалено {deleted_count}.\n"
+        else:
+            cleanup_summary = "🧹 Не удалось подключиться для удаления тестовых сообщений.\n"
+    else:
+        cleanup_summary = "🧹 Тестовые сообщения не отправлены (удалять нечего).\n"
+
     full_text = (
         test_result_text
-        + f"\n\n💰 <b>Баланс:</b> {new_balance} постов\n"
-        + f"⚠️ <b>Потрачено:</b> {result.get('sent_count', 0)} постов"
+        + "\n\n🆓 <b>Тест бесплатный:</b> потрачено 0 постов\n"
+        + f"💰 <b>Баланс:</b> {balance_after_test} постов (было {balance_before_test})"
+        + f"\n{cleanup_summary}"
     )
 
     updated = bm.load()
@@ -2946,7 +3174,7 @@ async def broadcast_test_v2(query: CallbackQuery):
         reply_markup=broadcast_test_result_keyboard(),
         disable_web_page_preview=True,
     )
-    await query.answer()
+    # query.answer() already called at start of the long-running operation
 
 
 @dp.callback_query(F.data == "bc_mode_toggle")
@@ -3030,10 +3258,10 @@ async def broadcast_mass(query: CallbackQuery):
         f"  Групп к отправке: <b>{len(groups)}</b>\n"
         f"  Расписание: включено\n\n"
         f"💰 Баланс постов:\n"
-        f"  Будет потрачено: {len(groups)} постов\n"
+        f"  Требуется для старта: {len(groups)} постов\n"
         f"  Сейчас: {current_balance} постов\n"
-        f"  После рассылки: {new_balance} постов\n\n"
-        f"⚠️ Посты списываются только за успешные публикации.\n"
+        f"  После рассылки (макс. вычет): ~{new_balance} постов\n\n"
+        f"⚠️ Точная сумма списания: только успешные публикации.\n"
         f"Нажмите \"Подтвердить\" для начала рассылки."
     )
 
@@ -3060,46 +3288,87 @@ async def broadcast_confirm_mass(query: CallbackQuery):
 
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
+    balance_mgr = scoped_balance_manager(user_id)
+    balance_before = balance_mgr.get_balance()
     groups_all = scoped_load_broadcast_groups(user_id)
-    state = bm.load()
+    state = bm.ensure_groups_known(groups_all)
     groups = get_active_selected_groups(state, groups_all)
 
+    ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
+    if not ready:
+        await query.answer(reason, show_alert=True)
+        return
+    if not groups:
+        await query.answer("Нет активных групп.", show_alert=True)
+        return
+
     await query.message.edit_text(
-        f"📣 <b>Массовая рассылка</b>\n\n"
-        f"Групп к отправке: <b>{len(groups)}</b>\n"
-        f"⏳ Выполняю...",
+        "📢 <b>РАССЫЛКА В ПРОЦЕССЕ</b>\n\n"
+        f"Всего групп: <b>{len(groups)}</b>\n"
+        "⏳ Отправляю сообщения...\n"
+        "Не закрывайте чат!",
         parse_mode="HTML",
     )
 
     async with broadcast_lock:
+        # Re-check inside the lock to protect from double-click races.
+        if not balance_mgr.check_sufficient(len(groups)):
+            await query.message.edit_text(
+                "❌ <b>Баланс изменился</b>\n\n"
+                f"Требуется: {len(groups)} постов\n"
+                f"Доступно: {balance_mgr.get_balance()} постов\n\n"
+                "Пополните баланс и попробуйте снова.",
+                parse_mode="HTML",
+                reply_markup=broadcast_balance_keyboard(),
+            )
+            await query.answer()
+            return
         result = await execute_broadcast(user_id, groups, advance_rotation=True)
+        blocked_groups = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+        for group, err in blocked_groups.items():
+            bm.set_group_blocked(group, err)
 
-    for group, err in result.get("blocked_groups", {}).items():
-        bm.set_group_blocked(group, err)
-
-    # Spend posts for successful broadcasts
-    sent_count = result.get("sent_count", 0)
-    balance_mgr = scoped_balance_manager(user_id)
-    if sent_count > 0:
-        balance_mgr.spend_posts(
-            amount=sent_count,
-            groups_count=len(groups),
-            sent_count=sent_count,
-            summary=f"Массовая рассылка: {sent_count} групп",
-        )
+        # Spend inside lock so next waiter sees updated balance.
+        sent_count = int(result.get("sent_count", 0) or 0)
+        spend_ok = True
+        if sent_count > 0:
+            spend_ok = balance_mgr.spend_posts(
+                amount=sent_count,
+                groups_count=len(groups),
+                sent_count=sent_count,
+                summary=f"Массовая рассылка: {sent_count} групп",
+            )
 
     # Get updated balance
-    new_balance = balance_mgr.get_balance()
+    balance_after = balance_mgr.get_balance()
+    failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+    blocked_count = len(blocked_groups)
+    failed_count = len(failed_groups)
 
-    # Format result with balance information
     result_text = (
-        f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"📊 <b>Результат:</b>\n"
-        f"  Групп: {len(groups)} | Отправлено: {sent_count} | Не удалось: {len(groups) - sent_count}\n\n"
-        f"💰 <b>Баланс:</b>\n"
-        f"  Потрачено: {sent_count} постов\n"
-        f"  Осталось: {new_balance} постов"
+        "✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
+        "📊 <b>СТАТИСТИКА:</b>\n"
+        f"├─ Всего групп: {len(groups)}\n"
+        f"├─ ✅ Успешно: {sent_count}\n"
+        f"├─ ⚠️ Забаны: {blocked_count}\n"
+        f"└─ ❌ Другие ошибки: {failed_count}\n\n"
+        "💳 <b>ЗАТРАТЫ:</b>\n"
+        f"├─ Потрачено: {sent_count} постов (за успешные)\n"
+        f"├─ Баланс было: {balance_before} постов\n"
+        f"└─ Баланс сейчас: {balance_after} постов\n\n"
+        "✅ Платите только за успешные!"
     )
+
+    if not spend_ok and sent_count > 0:
+        result_text += "\n\n⚠️ Не удалось списать посты автоматически. Обратитесь в поддержку."
+
+    if blocked_count > 0:
+        shown = list(blocked_groups.keys())[:5]
+        result_text += f"\n\n🚫 <b>ЗАБАНЫ</b> ({blocked_count}):\n"
+        for group in shown:
+            result_text += f"• <code>{group}</code>\n"
+        if blocked_count > len(shown):
+            result_text += "• ...\n"
 
     state = bm.load()
     await query.message.edit_text(
@@ -3117,12 +3386,27 @@ async def broadcast_balance(query: CallbackQuery):
     """Show balance and tariff purchase menu."""
     user_id = query.from_user.id
     bm = scoped_balance_manager(user_id)
-    balance = bm.get_balance()
+    state = bm.load()
 
     await query.message.edit_text(
-        broadcast_balance_text(balance),
+        broadcast_balance_text(state),
         parse_mode="HTML",
         reply_markup=broadcast_balance_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_balance_history")
+async def broadcast_balance_history(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_balance_manager(user_id)
+    state = bm.load()
+    history = bm.get_history(limit=10)
+
+    await query.message.edit_text(
+        broadcast_balance_history_text(state, history),
+        parse_mode="HTML",
+        reply_markup=broadcast_balance_history_keyboard(),
     )
     await query.answer()
 
@@ -3654,6 +3938,73 @@ async def settings_callback(query: CallbackQuery):
         reply_markup=settings_keyboard()
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == "settings_notifications")
+async def settings_notifications_callback(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    enabled = bm.get_balance_notif_enabled()
+    threshold = bm.get_balance_notif_threshold()
+
+    await query.message.edit_text(
+        settings_notifications_text(enabled, threshold),
+        parse_mode="HTML",
+        reply_markup=settings_notifications_keyboard(enabled),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "notif_threshold_menu")
+async def notif_threshold_menu_callback(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    current_threshold = bm.get_balance_notif_threshold()
+
+    await query.message.edit_text(
+        notifications_threshold_text(current_threshold),
+        parse_mode="HTML",
+        reply_markup=notifications_threshold_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("notif_set_threshold_"))
+async def notif_set_threshold_callback(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    raw_value = (query.data or "").split("_")[-1]
+    try:
+        threshold = int(raw_value)
+        bm.set_balance_notif_threshold(threshold)
+    except Exception:
+        await query.answer("Неверное значение порога.", show_alert=True)
+        return
+
+    await query.answer(f"Порог обновлен: {threshold}")
+    current_threshold = bm.get_balance_notif_threshold()
+    await query.message.edit_text(
+        notifications_threshold_text(current_threshold),
+        parse_mode="HTML",
+        reply_markup=notifications_threshold_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "notif_balance_toggle")
+async def notif_balance_toggle_callback(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    current = bm.get_balance_notif_enabled()
+    bm.set_balance_notif_enabled(not current)
+    enabled = bm.get_balance_notif_enabled()
+    threshold = bm.get_balance_notif_threshold()
+
+    await query.message.edit_text(
+        settings_notifications_text(enabled, threshold),
+        parse_mode="HTML",
+        reply_markup=settings_notifications_keyboard(enabled),
+    )
+    await query.answer("Настройка уведомления о балансе обновлена.")
 
 
 @dp.callback_query(F.data == "anti_keywords")
