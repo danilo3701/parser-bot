@@ -88,6 +88,7 @@ BROADCAST_TIME_OPTIONS = ["07:00", "08:12", "09:00", "11:33", "12:00", "15:00", 
 BROADCAST_TEST_VERIFY_SECONDS = int(os.getenv("BROADCAST_TEST_VERIFY_SECONDS", "60") or "60")
 TEST_COOLDOWN_SECONDS = int(os.getenv("TEST_COOLDOWN_SECONDS", "30") or "30")
 TEST_MAX_PER_DAY = int(os.getenv("TEST_MAX_PER_DAY", "5") or "5")
+TEST_FRESH_TTL_SECONDS = int(os.getenv("TEST_FRESH_TTL_SECONDS", "86400") or "86400")
 READINESS_TTL_SECONDS = int(os.getenv("READINESS_TTL_SECONDS", "1800") or "1800")
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
@@ -284,9 +285,6 @@ def settings_keyboard():
             InlineKeyboardButton(text="📊 Группы", callback_data="groups"),
         ],
         [
-            InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings_notifications"),
-        ],
-        [
             InlineKeyboardButton(text="🚫 Стоп-слова", callback_data="anti_keywords"),
         ],
         [
@@ -318,7 +316,7 @@ def settings_notifications_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚠️ Изменить порог", callback_data="notif_threshold_menu")],
         [InlineKeyboardButton(text=toggle_label, callback_data="notif_balance_toggle")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="settings")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_settings")],
     ])
 
 
@@ -344,6 +342,63 @@ def notifications_threshold_keyboard() -> InlineKeyboardMarkup:
     ])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings_notifications")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def broadcast_settings_text() -> str:
+    return (
+        "⚙️ <b>Настройки рассылки</b>\n\n"
+        "Здесь находятся настройки, которые относятся только к разделу «Рассылка».\n"
+        "Новые параметры будут добавляться сюда."
+    )
+
+
+def broadcast_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings_notifications")],
+        [InlineKeyboardButton(text="🧩 Скоро: другие настройки", callback_data="noop")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+    ])
+
+
+def broadcast_test_intro_text() -> str:
+    return (
+        "🧪 <b>Перед тестом рассылки</b>\n\n"
+        "Тест проверяет, в каких группах сообщение публикуется без проблем.\n"
+        "Это снижает риск жалоб, ограничений и блокировки аккаунта (вплоть до 24 часов).\n\n"
+        "Что делает тест:\n"
+        "• отправляет тестовые сообщения в выбранные группы;\n"
+        "• ждёт 60 секунд и проверяет результат;\n"
+        "• автоматически отключает нерабочие группы;\n"
+        "• показывает отчёт: сколько прошло и сколько отключено.\n\n"
+        "После успешного теста можно безопаснее запускать массовую рассылку."
+    )
+
+
+def broadcast_test_intro_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
+        [InlineKeyboardButton(text="ℹ️ Подробнее", callback_data="bc_test_info")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+    ])
+
+
+def broadcast_test_info_text() -> str:
+    return (
+        "ℹ️ <b>Зачем тест обязателен</b>\n\n"
+        "Без теста массовая рассылка может попадать в группы, где посты удаляются или запрещены.\n"
+        "Из-за этого растёт риск жалоб и ограничений Telegram.\n\n"
+        "Рекомендуемый порядок всегда один:\n"
+        "1) Тест\n"
+        "2) Автофильтр нерабочих групп\n"
+        "3) Массовая рассылка"
+    )
+
+
+def broadcast_test_info_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_test")],
+    ])
 
 
 def format_channel_label(channel_id: int | None) -> str:
@@ -504,6 +559,29 @@ def is_readiness_fresh(state: dict, ttl_seconds: int = READINESS_TTL_SECONDS) ->
     return True, "ok"
 
 
+def is_test_fresh(state: dict, ttl_seconds: int = TEST_FRESH_TTL_SECONDS) -> tuple[bool, str]:
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    if not bool(campaign.get("test_passed", False)):
+        return False, "not_passed"
+
+    last_test_at = campaign.get("last_test_at")
+    if not isinstance(last_test_at, str) or not last_test_at:
+        return False, "missing_last_test_at"
+
+    try:
+        tested_dt = datetime.fromisoformat(last_test_at)
+        if tested_dt.tzinfo is None:
+            tested_dt = tested_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, "invalid_last_test_at"
+
+    now = datetime.now(timezone.utc)
+    if now - tested_dt > timedelta(seconds=max(60, ttl_seconds)):
+        return False, "stale"
+
+    return True, "ok"
+
+
 def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
     """
     Owner uses global broadcast_state.json; regular users have isolated state under bot/user_data/<user_id>/.
@@ -551,7 +629,24 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
     selected_groups = campaign.get("selected_groups", [])
     groups_state = state.get("broadcast_groups_state", {})
     blocked_count = sum(1 for item in groups_state.values() if item.get("status") == "blocked")
-    test_status = "✅ пройден" if campaign.get("test_passed") else "❌ не пройден"
+    test_fresh, test_reason = is_test_fresh(state)
+    if test_fresh:
+        test_status = "✅ пройден (свежий)"
+    elif campaign.get("test_passed"):
+        test_status = "⚠️ устарел — запустите тест заново"
+    else:
+        test_status = "❌ не пройден"
+    last_test_label = ""
+    raw_last_test_at = campaign.get("last_test_at")
+    if isinstance(raw_last_test_at, str) and raw_last_test_at:
+        try:
+            last_dt = datetime.fromisoformat(raw_last_test_at)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            last_test_label = f" (посл. тест: {last_dt.astimezone(timezone.utc).strftime('%d.%m %H:%M')} UTC)"
+        except Exception:
+            if test_reason in {"invalid_last_test_at", "missing_last_test_at"}:
+                last_test_label = " (время теста не определено)"
     schedule_status = "включено" if schedule.get("enabled", True) else "выключено"
     tz = schedule.get("tz", BROADCAST_TZ)
 
@@ -634,7 +729,7 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
         f"Постов в пуле: <b>{len(posts)}</b>{next_post_label}\n"
         f"Выбрано групп: <b>{len(selected_groups)}</b>\n"
         f"Недоступных групп: <b>{blocked_count}</b>\n"
-        f"Тест: <b>{test_status}</b>\n\n"
+        f"Тест: <b>{test_status}</b>{last_test_label}\n\n"
         f"Расписание: <b>{schedule_status}</b>\n"
         f"TZ: <b>{tz}</b>\n"
         f"Неделя: <b>{weekly_label}</b>"
@@ -671,6 +766,7 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
         InlineKeyboardButton(text="✅ Массовая", callback_data="bc_mass"),
     ])
     rows.append([InlineKeyboardButton(text="🧭 Готовность", callback_data="bc_ready")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="bc_settings")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
     rows.append([InlineKeyboardButton(
         text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
@@ -942,12 +1038,27 @@ def broadcast_balance_history_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def broadcast_test_result_text(test_result: dict, working_groups: list, failed_groups: dict) -> str:
+def broadcast_test_result_text(
+    total_groups: int,
+    working_groups: list,
+    failed_groups: dict,
+    auto_disabled_count: int,
+) -> str:
     """Format test broadcast result."""
     working_count = len(working_groups)
     failed_count = len(failed_groups)
 
-    text = "🧪 <b>Результат тестовой рассылки</b>\n\n"
+    reason_counts: dict[str, int] = {}
+    for reason in failed_groups.values():
+        key = str(reason or "unknown").strip() or "unknown"
+        reason_counts[key] = reason_counts.get(key, 0) + 1
+
+    text = (
+        "🧪 <b>Результат тестовой рассылки</b>\n\n"
+        f"Проверено: <b>{total_groups}</b>\n"
+        f"Пройдено: <b>{working_count}</b>\n"
+        f"Отключено автоматически: <b>{auto_disabled_count}</b>\n"
+    )
 
     if working_count > 0:
         text += f"✅ <b>Группы, где работает ({working_count}):</b>\n"
@@ -964,14 +1075,18 @@ def broadcast_test_result_text(test_result: dict, working_groups: list, failed_g
             text += f"  {reason_emoji} @{group} ({reason})\n"
         if failed_count > 10:
             text += f"  • ... и ещё {failed_count - 10}\n"
+        top_reasons = sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+        if top_reasons:
+            text += "\nПричины (топ):\n"
+            for reason, count in top_reasons:
+                text += f"  • {reason}: {count}\n"
 
     return text
 
 
 def broadcast_test_result_keyboard() -> InlineKeyboardMarkup:
-    """Buttons after test: disable failed, add more groups, proceed to mass broadcast."""
+    """Buttons after test: add groups or proceed to mass broadcast."""
     buttons = [
-        [InlineKeyboardButton(text="🚫 Отключить нерабочие", callback_data="bc_test_disable_failed")],
         [InlineKeyboardButton(text="➕ Добавить группы", callback_data="bc_groups")],
         [InlineKeyboardButton(text="📢 Массовая рассылка", callback_data="bc_mass")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
@@ -1407,6 +1522,16 @@ async def broadcast_menu(query: CallbackQuery):
         broadcast_summary_text(state, user_id=user_id, groups=groups),
         parse_mode="HTML",
         reply_markup=broadcast_main_keyboard(state, user_id=user_id),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_settings")
+async def broadcast_settings_menu(query: CallbackQuery):
+    await query.message.edit_text(
+        broadcast_settings_text(),
+        parse_mode="HTML",
+        reply_markup=broadcast_settings_keyboard(),
     )
     await query.answer()
 
@@ -3119,6 +3244,26 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
 
 
 @dp.callback_query(F.data == "bc_test")
+async def broadcast_test_intro(query: CallbackQuery):
+    await query.message.edit_text(
+        broadcast_test_intro_text(),
+        parse_mode="HTML",
+        reply_markup=broadcast_test_intro_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_test_info")
+async def broadcast_test_info(query: CallbackQuery):
+    await query.message.edit_text(
+        broadcast_test_info_text(),
+        parse_mode="HTML",
+        reply_markup=broadcast_test_info_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_test_start")
 async def broadcast_test_v2(query: CallbackQuery):
     if broadcast_lock.locked():
         await query.answer("Рассылка уже выполняется.", show_alert=True)
@@ -3241,10 +3386,13 @@ async def broadcast_test_v2(query: CallbackQuery):
                 verified_at=None,
             )
         else:
+            reason_raw = str(send_errors.get(group) or blocked.get(group) or "other")
+            reason_lower = reason_raw.lower()
+            status = "deleted" if "delete" in reason_lower else "failed"
             bm.set_group_last_test(
                 group,
-                status="failed",
-                reason=str(send_errors.get(group) or "other"),
+                status=status,
+                reason=reason_raw,
                 message_id=None,
                 sent_at=started_at,
                 verified_at=None,
@@ -3257,18 +3405,26 @@ async def broadcast_test_v2(query: CallbackQuery):
 
     # Build lists of working and failed groups
     working_groups = list(sent_message_ids.keys()) if sent_message_ids else []
-    failed_groups = {}
+    failed_groups: dict[str, str] = {}
+    auto_disabled_groups: list[str] = []
     for group in test_groups:
         if group not in working_groups:
-            reason = send_errors.get(group, "unknown")
+            reason = str(send_errors.get(group) or blocked.get(group) or "unknown")
             failed_groups[group] = reason
+            bm.set_group_blocked(group, f"test_{reason}")
+            auto_disabled_groups.append(group)
 
     # Show test result with new format
-    test_result_text = broadcast_test_result_text(result, working_groups, failed_groups)
+    test_result_text = broadcast_test_result_text(
+        len(test_groups),
+        working_groups,
+        failed_groups,
+        len(auto_disabled_groups),
+    )
     balance_after_test = balance_mgr.get_balance()
 
     # Wait 60 seconds with progress updates, then verify/delete test messages.
-    total_seconds = 60
+    total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
     step_seconds = 10
     test_message_ids = sent_message_ids
     cleanup_summary = ""
@@ -3384,6 +3540,10 @@ async def broadcast_mass(query: CallbackQuery):
     if not steps["test"]:
         await query.answer("⚠️ Шаг 6: Сначала запустите тест (кнопка «🧪 Тест»).", show_alert=True)
         return
+    test_fresh, _ = is_test_fresh(state)
+    if not test_fresh:
+        await query.answer("⚠️ Тест устарел (старше 24 часов). Запустите «🧪 Тест» заново.", show_alert=True)
+        return
 
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
@@ -3456,6 +3616,10 @@ async def broadcast_confirm_mass(query: CallbackQuery):
     steps = get_setup_steps(user_id, state, groups_all)
     if not steps["account"] or not steps["posts"] or not steps["groups"] or not steps["schedule"] or not steps["readiness"] or not steps["test"]:
         await query.answer("Кампания не готова. Откройте раздел «📣 Рассылка» и завершите шаги настройки.", show_alert=True)
+        return
+    test_fresh, _ = is_test_fresh(state)
+    if not test_fresh:
+        await query.answer("⚠️ Тест устарел (старше 24 часов). Перед массовой рассылкой запустите тест повторно.", show_alert=True)
         return
 
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
