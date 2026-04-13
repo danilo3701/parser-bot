@@ -378,7 +378,7 @@ def broadcast_test_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
         [InlineKeyboardButton(text="ℹ️ Подробнее", callback_data="bc_test_info")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_launch_menu")],
     ])
 
 
@@ -397,7 +397,7 @@ def broadcast_test_info_text() -> str:
 def broadcast_test_info_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_test")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_launch_menu")],
     ])
 
 
@@ -582,6 +582,85 @@ def is_test_fresh(state: dict, ttl_seconds: int = TEST_FRESH_TTL_SECONDS) -> tup
     return True, "ok"
 
 
+def _readiness_reason_human(reason_code: str) -> str:
+    mapping = {
+        "not_passed": "Готовность еще не пройдена.",
+        "has_problems": "В готовности есть проблемные группы.",
+        "missing_checked_at": "Готовность не завершена.",
+        "invalid_checked_at": "Статус готовности поврежден, пройдите заново.",
+        "stale": "Готовность устарела, обновите шаг 1.",
+        "snapshot_missing": "Изменились условия кампании, обновите шаг 1.",
+        "snapshot_changed": "Вы изменили настройки кампании, пройдите шаг 1 заново.",
+        "not_connected": "Аккаунт не подключен.",
+        "no_groups_selected": "Не выбраны группы рассылки.",
+        "group_issues": "Есть группы с ограничениями на отправку.",
+    }
+    return mapping.get(reason_code, "Требуется обновить готовность.")
+
+
+def _launch_block_reason(state: dict, steps: dict) -> str:
+    if not steps.get("account"):
+        return "Сначала подключите аккаунт."
+    if not steps.get("posts"):
+        return "Добавьте хотя бы один пост в пул."
+    if not steps.get("groups"):
+        return "Добавьте и выберите группы рассылки."
+    if not steps.get("schedule"):
+        return "Настройте расписание (минимум один день)."
+    if not steps.get("readiness"):
+        _, reason = is_readiness_fresh(state)
+        if reason == "not_passed":
+            campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+            reason = str(campaign.get("readiness_last_reason") or "not_passed")
+        return _readiness_reason_human(reason)
+    if not steps.get("test"):
+        return "Сначала выполните шаг 2: Тест."
+    return "Все шаги выполнены. Можно запускать рассылку."
+
+
+def broadcast_launch_text(state: dict, *, user_id: int, notice: str | None = None) -> str:
+    groups = scoped_load_broadcast_groups(user_id)
+    steps = get_setup_steps(user_id, state, groups)
+    readiness_done = bool(steps.get("readiness"))
+    test_done = bool(steps.get("test"))
+    step2_open = all(bool(steps.get(key)) for key in ("account", "posts", "groups", "schedule", "readiness"))
+    step3_open = test_done
+
+    s1 = "✅" if readiness_done else "⬜"
+    s2 = "✅" if test_done else ("⬜" if step2_open else "🔒")
+    s3 = "🟢" if step3_open else "🔒"
+
+    lines = [
+        "🚀 <b>ЗАПУСК РАССЫЛКИ</b>",
+        "",
+        f"1) Готовность: {s1}",
+        f"2) Тест: {s2}",
+        f"3) Запуск: {s3}",
+        "",
+        f"Статус: {_launch_block_reason(state, steps)}",
+    ]
+    if notice:
+        lines.extend(["", f"ℹ️ {notice}"])
+    return "\n".join(lines)
+
+
+def broadcast_launch_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarkup:
+    groups = scoped_load_broadcast_groups(user_id)
+    steps = get_setup_steps(user_id, state, groups)
+    step2_open = all(bool(steps.get(key)) for key in ("account", "posts", "groups", "schedule", "readiness"))
+    step3_open = bool(steps.get("test"))
+
+    step2_label = "2️⃣ Тест" if step2_open else "2️⃣ Тест (🔒)"
+    step3_label = "3️⃣ Запустить рассылку" if step3_open else "3️⃣ Запустить рассылку (🔒)"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Готовность", callback_data="bc_launch_step_ready")],
+        [InlineKeyboardButton(text=step2_label, callback_data="bc_launch_step_test")],
+        [InlineKeyboardButton(text=step3_label, callback_data="bc_launch_step_mass")],
+        [InlineKeyboardButton(text="◀️ Назад к рассылке", callback_data="broadcast")],
+    ])
+
+
 def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
     """
     Owner uses global broadcast_state.json; regular users have isolated state under bot/user_data/<user_id>/.
@@ -707,9 +786,9 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
             elif current_step == "schedule":
                 current_text = "👉 Текущий шаг: Настройте расписание — укажите время для дня"
             elif current_step == "readiness":
-                current_text = "👉 Текущий шаг: Нажмите «🧭 Готовность» и устраните проблемы"
+                current_text = "👉 Текущий шаг: Откройте «🚀 Запустить рассылку» и пройдите шаг 1"
             elif current_step == "test":
-                current_text = "👉 Текущий шаг: Запустите тест (кнопка «🧪 Тест»)"
+                current_text = "👉 Текущий шаг: Откройте «🚀 Запустить рассылку» и пройдите шаг 2"
 
             step_progress = (
                 "📋 <b>Настройка рассылки:</b>\n"
@@ -761,11 +840,7 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
 
     rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
     rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
-    rows.append([
-        InlineKeyboardButton(text="🧪 Тест", callback_data="bc_test"),
-        InlineKeyboardButton(text="✅ Массовая", callback_data="bc_mass"),
-    ])
-    rows.append([InlineKeyboardButton(text="🧭 Готовность", callback_data="bc_ready")])
+    rows.append([InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="bc_launch_menu")])
     rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="bc_settings")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
     rows.append([InlineKeyboardButton(
@@ -1088,7 +1163,7 @@ def broadcast_test_result_keyboard() -> InlineKeyboardMarkup:
     """Buttons after test: add groups or proceed to mass broadcast."""
     buttons = [
         [InlineKeyboardButton(text="➕ Добавить группы", callback_data="bc_groups")],
-        [InlineKeyboardButton(text="📢 Массовая рассылка", callback_data="bc_mass")],
+        [InlineKeyboardButton(text="🚀 Открыть запуск рассылки", callback_data="bc_launch_menu")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1524,6 +1599,160 @@ async def broadcast_menu(query: CallbackQuery):
         reply_markup=broadcast_main_keyboard(state, user_id=user_id),
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == "bc_launch_menu")
+async def broadcast_launch_menu(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
+    await query.message.edit_text(
+        broadcast_launch_text(state, user_id=user_id),
+        parse_mode="HTML",
+        reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_launch_step_ready")
+async def broadcast_launch_step_ready(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected_groups = campaign.get("selected_groups", []) if isinstance(campaign.get("selected_groups", []), list) else []
+    send_mode = campaign.get("send_mode", "user")
+    send_as_channel = (campaign.get("send_as_channel") or "").strip()
+    snapshot = _readiness_snapshot_from_state(state)
+
+    if not selected_groups:
+        state = bm.load()
+        campaign_state = state.setdefault("campaign", {})
+        campaign_state["readiness_passed"] = False
+        campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+        campaign_state["readiness_problem_count"] = 1
+        campaign_state["readiness_mode_snapshot"] = snapshot
+        campaign_state["readiness_last_reason"] = "no_groups_selected"
+        bm.save(state)
+        await query.message.edit_text(
+            broadcast_launch_text(state, user_id=user_id, notice=_readiness_reason_human("no_groups_selected")),
+            parse_mode="HTML",
+            reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+        )
+        await query.answer("Шаг 1 недоступен")
+        return
+
+    ok, _, client, _ = await _readiness_check_connected_account(user_id)
+    if not ok or not client:
+        state = bm.load()
+        campaign_state = state.setdefault("campaign", {})
+        campaign_state["readiness_passed"] = False
+        campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+        campaign_state["readiness_problem_count"] = 1
+        campaign_state["readiness_mode_snapshot"] = snapshot
+        campaign_state["readiness_last_reason"] = "not_connected"
+        bm.save(state)
+        await query.message.edit_text(
+            broadcast_launch_text(state, user_id=user_id, notice=_readiness_reason_human("not_connected")),
+            parse_mode="HTML",
+            reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+        )
+        await query.answer("Шаг 1: аккаунт не подключен")
+        return
+
+    problems: list[tuple[str, str]] = []
+    send_as_status = "ok"
+    if send_mode == "channel":
+        if not send_as_channel:
+            send_as_status = "send_as_missing"
+        else:
+            try:
+                ent = await client.get_entity(send_as_channel)
+                ok_send_as, reason = await _telethon_can_send_to_entity(client, ent)
+                if not ok_send_as:
+                    send_as_status = "send_as_no_access" if reason in ("not_participant", "admin_required", "resolve_failed") else reason
+            except Exception:
+                send_as_status = "send_as_no_access"
+
+    for group in selected_groups:
+        try:
+            entity = await client.get_entity(group)
+        except Exception:
+            problems.append((group, "resolve_failed"))
+            continue
+        ok_group, reason = await _telethon_can_send_to_entity(client, entity)
+        if not ok_group:
+            problems.append((group, reason))
+
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+    total_problems = len(problems) + (1 if send_as_status != "ok" else 0)
+    state = bm.load()
+    campaign_state = state.setdefault("campaign", {})
+    campaign_state["readiness_passed"] = total_problems == 0
+    campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+    campaign_state["readiness_problem_count"] = total_problems
+    campaign_state["readiness_mode_snapshot"] = snapshot
+    campaign_state["readiness_last_reason"] = "" if total_problems == 0 else (send_as_status if send_as_status != "ok" else "group_issues")
+    bm.save(state)
+
+    notice = "Готовность пройдена. Можно запускать шаг 2." if total_problems == 0 else _readiness_reason_human(campaign_state["readiness_last_reason"])
+    await query.message.edit_text(
+        broadcast_launch_text(state, user_id=user_id, notice=notice),
+        parse_mode="HTML",
+        reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+    )
+    await query.answer("Шаг 1 выполнен")
+
+
+@dp.callback_query(F.data == "bc_launch_step_test")
+async def broadcast_launch_step_test(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
+    steps = get_setup_steps(user_id, state, groups)
+
+    if not all(bool(steps.get(key)) for key in ("account", "posts", "groups", "schedule", "readiness")):
+        await query.message.edit_text(
+            broadcast_launch_text(state, user_id=user_id, notice=_launch_block_reason(state, steps)),
+            parse_mode="HTML",
+            reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+        )
+        await query.answer("Шаг 2 пока недоступен")
+        return
+
+    await query.message.edit_text(
+        broadcast_test_intro_text(),
+        parse_mode="HTML",
+        reply_markup=broadcast_test_intro_keyboard(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_launch_step_mass")
+async def broadcast_launch_step_mass(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups)
+    steps = get_setup_steps(user_id, state, groups)
+
+    if not bool(steps.get("test")):
+        await query.message.edit_text(
+            broadcast_launch_text(state, user_id=user_id, notice=_launch_block_reason(state, steps)),
+            parse_mode="HTML",
+            reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
+        )
+        await query.answer("Шаг 3 пока недоступен")
+        return
+
+    await broadcast_mass(query)
 
 
 @dp.callback_query(F.data == "bc_settings")
