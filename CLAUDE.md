@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 🎯 Context Files by Feature (READ FIRST!)
 
-**When user mentions broadcast/rассылка/mail/posting:**
+**When user mentions broadcast/рассылка/mail/posting:**
 → **READ:** `CLAUDE_BROADCAST.md` immediately
 - Contains: full menu structure, all callbacks (bc_*, bcp_*, bcg_*), flows, pricing
 - Gives: exact line numbers, handler patterns, visuals
