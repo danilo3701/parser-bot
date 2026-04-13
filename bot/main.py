@@ -13,7 +13,7 @@ import contextlib
 import io
 import logging
 from pathlib import Path
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -88,6 +88,7 @@ BROADCAST_TIME_OPTIONS = ["07:00", "08:12", "09:00", "11:33", "12:00", "15:00", 
 BROADCAST_TEST_VERIFY_SECONDS = int(os.getenv("BROADCAST_TEST_VERIFY_SECONDS", "60") or "60")
 TEST_COOLDOWN_SECONDS = int(os.getenv("TEST_COOLDOWN_SECONDS", "30") or "30")
 TEST_MAX_PER_DAY = int(os.getenv("TEST_MAX_PER_DAY", "5") or "5")
+READINESS_TTL_SECONDS = int(os.getenv("READINESS_TTL_SECONDS", "1800") or "1800")
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
     int(item.strip())
@@ -421,8 +422,9 @@ async def ensure_owner_callback(query: CallbackQuery) -> bool:
 def get_setup_steps(user_id: int, state: dict, groups: list[str]) -> dict:
     """
     Returns a dict of booleans for each setup step required before mass broadcast.
-    Steps must be completed in order: account → posts → groups → schedule → test.
+    Steps must be completed in order: account → posts → groups → schedule → readiness → test.
     """
+    readiness_ok, _ = is_readiness_fresh(state)
     return {
         "account": get_account(user_id) is not None,
         "posts": len(state.get("campaign", {}).get("posts", [])) > 0,
@@ -432,8 +434,74 @@ def get_setup_steps(user_id: int, state: dict, groups: list[str]) -> dict:
             for v in state.get("weekly_schedule", {}).values()
             if isinstance(v, dict)
         ),
+        "readiness": readiness_ok,
         "test": state.get("campaign", {}).get("test_passed", False),
     }
+
+
+def _readiness_snapshot_from_state(state: dict) -> dict:
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected_groups = campaign.get("selected_groups", [])
+    return {
+        "send_mode": campaign.get("send_mode", "user"),
+        "send_as_channel": campaign.get("send_as_channel", ""),
+        "selected_groups_count": len(selected_groups) if isinstance(selected_groups, list) else 0,
+    }
+
+
+def _invalidate_readiness_in_state(state: dict, reason: str = "config_changed") -> dict:
+    campaign = state.setdefault("campaign", {})
+    campaign["readiness_passed"] = False
+    campaign["readiness_last_reason"] = reason
+    return state
+
+
+def invalidate_readiness_if_needed(bm: BroadcastManager, reason: str = "config_changed") -> dict:
+    state = bm.load()
+    _invalidate_readiness_in_state(state, reason=reason)
+    bm.save(state)
+    return state
+
+
+def is_readiness_fresh(state: dict, ttl_seconds: int = READINESS_TTL_SECONDS) -> tuple[bool, str]:
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+
+    if not bool(campaign.get("readiness_passed", False)):
+        return False, "not_passed"
+
+    try:
+        problem_count = int(campaign.get("readiness_problem_count", 0))
+    except Exception:
+        problem_count = 0
+    if problem_count > 0:
+        return False, "has_problems"
+
+    checked_at = campaign.get("readiness_checked_at")
+    if not checked_at:
+        return False, "missing_checked_at"
+    try:
+        checked_dt = datetime.fromisoformat(str(checked_at))
+        if checked_dt.tzinfo is None:
+            checked_dt = checked_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False, "invalid_checked_at"
+
+    now = datetime.now(timezone.utc)
+    if now - checked_dt > timedelta(seconds=max(60, ttl_seconds)):
+        return False, "stale"
+
+    current_snapshot = _readiness_snapshot_from_state(state)
+    saved_snapshot = campaign.get("readiness_mode_snapshot", {})
+    if not isinstance(saved_snapshot, dict):
+        return False, "snapshot_missing"
+    if current_snapshot != {
+        "send_mode": saved_snapshot.get("send_mode", "user"),
+        "send_as_channel": saved_snapshot.get("send_as_channel", ""),
+        "selected_groups_count": int(saved_snapshot.get("selected_groups_count", -1)) if str(saved_snapshot.get("selected_groups_count", "")).lstrip("-").isdigit() else -1,
+    }:
+        return False, "snapshot_changed"
+
+    return True, "ok"
 
 
 def scoped_broadcast_manager(user_id: int) -> BroadcastManager:
@@ -525,6 +593,7 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
                 "Добавить пост",
                 "Добавить группы рассылки",
                 "Настроить расписание (≥1 день)",
+                "Проверить готовность",
                 "Пройти тест",
             ]
             for i, (key, completed) in enumerate(steps.items(), 1):
@@ -542,6 +611,8 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
                 current_text = "👉 Текущий шаг: Добавьте и выберите группы рассылки"
             elif current_step == "schedule":
                 current_text = "👉 Текущий шаг: Настройте расписание — укажите время для дня"
+            elif current_step == "readiness":
+                current_text = "👉 Текущий шаг: Нажмите «🧭 Готовность» и устраните проблемы"
             elif current_step == "test":
                 current_text = "👉 Текущий шаг: Запустите тест (кнопка «🧪 Тест»)"
 
@@ -1426,13 +1497,30 @@ async def broadcast_readiness(query: CallbackQuery):
     selected_groups = campaign.get("selected_groups", []) if isinstance(campaign.get("selected_groups", []), list) else []
     send_mode = campaign.get("send_mode", "user")
     send_as_channel = (campaign.get("send_as_channel") or "").strip()
+    snapshot = _readiness_snapshot_from_state(state)
 
     if not selected_groups:
+        state = bm.load()
+        campaign_state = state.setdefault("campaign", {})
+        campaign_state["readiness_passed"] = False
+        campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+        campaign_state["readiness_problem_count"] = 1
+        campaign_state["readiness_mode_snapshot"] = snapshot
+        campaign_state["readiness_last_reason"] = "no_groups_selected"
+        bm.save(state)
         await query.answer("Сначала выберите группы рассылки.", show_alert=True)
         return
 
     ok, _, client, who = await _readiness_check_connected_account(user_id)
     if not ok or not client:
+        state = bm.load()
+        campaign_state = state.setdefault("campaign", {})
+        campaign_state["readiness_passed"] = False
+        campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+        campaign_state["readiness_problem_count"] = 1
+        campaign_state["readiness_mode_snapshot"] = snapshot
+        campaign_state["readiness_last_reason"] = "not_connected"
+        bm.save(state)
         await query.message.edit_text(
             "🧭 <b>Готовность</b>\n\n"
             "❌ Аккаунт для рассылки не подключен.\n\n"
@@ -1483,6 +1571,16 @@ async def broadcast_readiness(query: CallbackQuery):
 
     await client.disconnect()
 
+    total_problems = len(problems) + (1 if send_as_status != "ok" else 0)
+    state = bm.load()
+    campaign_state = state.setdefault("campaign", {})
+    campaign_state["readiness_passed"] = total_problems == 0
+    campaign_state["readiness_checked_at"] = datetime.now(timezone.utc).isoformat()
+    campaign_state["readiness_problem_count"] = total_problems
+    campaign_state["readiness_mode_snapshot"] = snapshot
+    campaign_state["readiness_last_reason"] = "" if total_problems == 0 else (send_as_status if send_as_status != "ok" else "group_issues")
+    bm.save(state)
+
     # Render summary
     lines = [
         "🧭 <b>Готовность</b>\n",
@@ -1490,7 +1588,7 @@ async def broadcast_readiness(query: CallbackQuery):
         f"Режим: <b>{'от канала' if send_mode == 'channel' else 'от пользователя'}</b>",
         f"Групп выбрано: <b>{len(selected_groups)}</b>",
         f"OK: <b>{len(oks)}</b>",
-        f"Проблемы: <b>{len(problems) + (1 if send_as_status != 'ok' else 0)}</b>",
+        f"Проблемы: <b>{total_problems}</b>",
     ]
     if send_as_note:
         lines.append(send_as_note)
@@ -2193,6 +2291,7 @@ async def _finalize_account_login(message: Message, state: FSMContext, *, user_i
         first_name=getattr(me, "first_name", None) if me else None,
         session_string=session_string,
     )
+    invalidate_readiness_if_needed(scoped_broadcast_manager(user_id), reason="account_reconnected")
 
     await _cleanup_pending_login(user_id)
     await state.set_state(MainMenu.viewing)
@@ -2252,6 +2351,7 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
             first_name=getattr(me, "first_name", None) if me else None,
             session_string=session_string,
         )
+        invalidate_readiness_if_needed(scoped_broadcast_manager(user_id), reason="account_reconnected")
 
         pending_logins.pop(user_id, None)
         try:
@@ -2299,6 +2399,7 @@ async def _qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None
                     first_name=getattr(me, "first_name", None) if me else None,
                     session_string=session_string,
                 )
+                invalidate_readiness_if_needed(scoped_broadcast_manager(user_id), reason="account_reconnected")
 
                 pending_logins.pop(user_id, None)
                 try:
@@ -2467,6 +2568,7 @@ async def broadcast_add_channel_input(message: Message, state: FSMContext):
     bm.add_send_as_channel(value)
     if not current:
         bm.set_send_as_channel(value)
+    invalidate_readiness_if_needed(bm, reason="send_as_changed")
     await state.set_state(MainMenu.viewing)
     state_data = bm.load()
     await message.answer(
@@ -2485,6 +2587,7 @@ async def broadcast_set_channel(query: CallbackQuery):
         await query.answer("Канал не найден.", show_alert=True)
         return
     state = bm.set_send_as_channel(channel)
+    state = invalidate_readiness_if_needed(bm, reason="send_as_changed")
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\nАктивный канал обновлён.",
         parse_mode="HTML",
@@ -2503,6 +2606,7 @@ async def broadcast_delete_selected_channel(query: CallbackQuery):
         await query.answer("Сначала выберите канал.", show_alert=True)
         return
     state = bm.remove_send_as_channel(selected)
+    state = invalidate_readiness_if_needed(bm, reason="send_as_changed")
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\nВыбранный канал удалён.",
         parse_mode="HTML",
@@ -2792,6 +2896,7 @@ async def broadcast_group_delete(query: CallbackQuery):
     bm = scoped_broadcast_manager(user_id)
     if delete_user_broadcast_group(user_id, group):
         bm.unselect_groups([group])
+        invalidate_readiness_if_needed(bm, reason="groups_changed")
         await query.answer("Удалено")
     else:
         await query.answer("Не найдено", show_alert=True)
@@ -2821,9 +2926,11 @@ async def broadcast_group_toggle(query: CallbackQuery):
     }.get(last_status, "")
     if group_meta.get("status") == "blocked":
         state = bm.set_group_active(group)
+        state = invalidate_readiness_if_needed(bm, reason="groups_changed")
         await query.answer("Группа разблокирована")
     else:
         state = bm.toggle_group_selected(group)
+        state = invalidate_readiness_if_needed(bm, reason="groups_changed")
         if last_status and last_status != "ok":
             hint = f"{status_icon} последний тест: {last_status}"
             if last_reason:
@@ -3040,6 +3147,22 @@ async def broadcast_test_v2(query: CallbackQuery):
     if not steps["schedule"]:
         await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
         return
+    if not steps["readiness"]:
+        readiness_ok, readiness_reason = is_readiness_fresh(state)
+        reason_map = {
+            "not_passed": "сначала пройдите «🧭 Готовность»",
+            "has_problems": "в «🧭 Готовность» есть проблемные группы — устраните их",
+            "missing_checked_at": "проверка готовности не завершена, нажмите «🧭 Готовность»",
+            "invalid_checked_at": "статус готовности поврежден, запустите «🧭 Готовность» заново",
+            "stale": "проверка устарела, обновите «🧭 Готовность»",
+            "snapshot_missing": "изменились условия кампании, обновите «🧭 Готовность»",
+            "snapshot_changed": "вы изменили настройки кампании, снова пройдите «🧭 Готовность»",
+        }
+        if readiness_ok:
+            await query.answer("⚠️ Сначала пройдите «🧭 Готовность».", show_alert=True)
+        else:
+            await query.answer(f"⚠️ Перед тестом {reason_map.get(readiness_reason, 'пройдите «🧭 Готовность»')}.", show_alert=True)
+        return
 
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
     if not ready:
@@ -3218,6 +3341,7 @@ async def broadcast_mode_toggle(query: CallbackQuery):
     current = state_data.get("campaign", {}).get("send_mode", "user")
     new_mode = "channel" if current == "user" else "user"
     state_data = bm.set_send_mode(new_mode)
+    state_data = invalidate_readiness_if_needed(bm, reason="send_mode_changed")
     await query.message.edit_text(
         broadcast_summary_text(state_data, user_id=user_id, groups=groups),
         parse_mode="HTML",
@@ -3236,7 +3360,7 @@ async def broadcast_mass(query: CallbackQuery):
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
 
-    # Step enforcement: check all 5 setup steps
+    # Step enforcement: check all 6 setup steps
     steps = get_setup_steps(user_id, state, groups_all)
     if not steps["account"]:
         await query.answer("⚠️ Шаг 1: Сначала подключите аккаунт (кнопка «🔑 Подключить аккаунт»)", show_alert=True)
@@ -3254,8 +3378,11 @@ async def broadcast_mass(query: CallbackQuery):
     if not steps["schedule"]:
         await query.answer("⚠️ Шаг 4: Настройте расписание — укажите время хотя бы для одного дня (кнопка «📅 Расписание»)", show_alert=True)
         return
+    if not steps["readiness"]:
+        await query.answer("⚠️ Шаг 5: Сначала пройдите «🧭 Готовность».", show_alert=True)
+        return
     if not steps["test"]:
-        await query.answer("⚠️ Шаг 5: Сначала запустите тест (кнопка «🧪 Тест»). Тест определяет, в какие группы можно отправлять.", show_alert=True)
+        await query.answer("⚠️ Шаг 6: Сначала запустите тест (кнопка «🧪 Тест»).", show_alert=True)
         return
 
     ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
@@ -3327,7 +3454,7 @@ async def broadcast_confirm_mass(query: CallbackQuery):
     groups = get_active_selected_groups(state, groups_all)
 
     steps = get_setup_steps(user_id, state, groups_all)
-    if not steps["account"] or not steps["posts"] or not steps["groups"] or not steps["schedule"] or not steps["test"]:
+    if not steps["account"] or not steps["posts"] or not steps["groups"] or not steps["schedule"] or not steps["readiness"] or not steps["test"]:
         await query.answer("Кампания не готова. Откройте раздел «📣 Рассылка» и завершите шаги настройки.", show_alert=True)
         return
 

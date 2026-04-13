@@ -32,6 +32,11 @@ class BroadcastManager:
                 "posts": [],
                 "rotation_index": 0,
                 "selected_groups": [],
+                "readiness_passed": False,
+                "readiness_checked_at": None,
+                "readiness_problem_count": 0,
+                "readiness_mode_snapshot": {},
+                "readiness_last_reason": "",
                 "test_passed": False,
                 "last_test_at": None,
             },
@@ -126,6 +131,11 @@ class BroadcastManager:
                     "kind": "legacy",
                     "preview": f"{campaign['source_channel']} #{mid}",
                 })
+        campaign.setdefault("readiness_passed", False)
+        campaign.setdefault("readiness_checked_at", None)
+        campaign.setdefault("readiness_problem_count", 0)
+        campaign.setdefault("readiness_mode_snapshot", {})
+        campaign.setdefault("readiness_last_reason", "")
         return state
 
     def save(self, state: dict) -> None:
