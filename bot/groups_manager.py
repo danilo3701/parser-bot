@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
-GROUPS_FILE = Path(__file__).parent / "groups.json"
+from storage_paths import state_file
+
+GROUPS_FILE = state_file("groups.json")
 
 
 def load_groups() -> list:

@@ -67,6 +67,25 @@ python telegram_keyword_monitor.py
 
 ## Railway / Hosting (ENV variables)
 
+## Railway: Persistent Storage (важно)
+
+Railway при redeploy обычно поднимает новый контейнер, и локальные файлы внутри контейнера могут не сохраняться.
+Если состояние бота хранится в JSON-файлах (посты рассылки, настройки, группы, категории, стоп-слова, user_data), то без Persistent Volume оно будет сбрасываться при redeploy.
+
+В этом репозитории volume уже описан в `railway.toml`:
+- mountPath: `/data`
+- name: `bot-data`
+
+Код бота автоматически использует `/data` для хранения состояния, если директория существует (или если задан `DATA_DIR`/`BOT_DATA_DIR`/`RAILWAY_VOLUME_MOUNT_PATH`).
+
+Рекомендуемые ENV в Railway:
+```
+TG_SESSION_PATH=/data/tutor_bot_scan.session
+# опционально, если хотите явно задать директории:
+DATA_DIR=/data
+USER_DATA_DIR=/data/user_data
+```
+
 Если бот развёрнут на Railway (или другом хостинге), значения из `bot/.env` **не подхватываются автоматически** — их нужно добавить в переменные окружения проекта.
 
 Минимальный набор для работы бота + рассылки (Telethon):

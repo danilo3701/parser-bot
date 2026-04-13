@@ -52,6 +52,7 @@ from broadcast_manager import BroadcastManager
 from balance_manager import BalanceManager, scoped_balance_manager
 from broadcast_sender import send_broadcast_campaign_with_client, verify_and_delete_test_messages
 from stripe_handler import create_checkout_session, process_webhook, STRIPE_PRICES
+from storage_paths import state_file, user_data_dir
 from mtproto_accounts import (
     PendingLogin,
     code_ttl_seconds,
@@ -176,7 +177,7 @@ def _bot_chat_id(ref: str | int) -> int | str:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 broadcast_manager = BroadcastManager(
-    Path(__file__).parent / "broadcast_state.json",
+    state_file("broadcast_state.json"),
     default_tz=BROADCAST_TZ,
     default_times=BROADCAST_TIMES,
 )
@@ -452,11 +453,10 @@ def scoped_balance_manager(user_id: int) -> BalanceManager:
     """
     Owner uses global balance_state.json; regular users have isolated state under bot/user_data/<user_id>/.
     """
-    path_bot_dir = Path(__file__).parent
     if is_owner(user_id):
-        path = path_bot_dir / "balance_state.json"
+        path = state_file("balance_state.json")
     else:
-        path = path_bot_dir / "user_data" / str(user_id) / "balance_state.json"
+        path = user_data_dir() / str(user_id) / "balance_state.json"
     return BalanceManager(path)
 
 
@@ -5061,6 +5061,12 @@ async def main():
     print("🤖 Бот запущен и готов к работе!")
     print("💬 Напиши /start в Telegram")
     print(f"📨 Канал по умолчанию: {DEFAULT_RESULTS_CHANNEL}")
+    try:
+        print(f"State file: {state_file('broadcast_state.json')}")
+        print(f"User data dir: {user_data_dir()}")
+        print(f"Session path: {SESSION_PATH}")
+    except Exception:
+        pass
 
     # Setup aiohttp web app for Stripe webhooks
     web_app = web.Application()

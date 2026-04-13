@@ -1,7 +1,9 @@
 import json
 from pathlib import Path
 
-ANTI_KEYWORDS_FILE = Path(__file__).parent / "anti_keywords.json"
+from storage_paths import state_file
+
+ANTI_KEYWORDS_FILE = state_file("anti_keywords.json")
 
 
 def load_anti_keywords() -> list:

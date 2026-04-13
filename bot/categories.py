@@ -7,7 +7,9 @@ import json
 import os
 from pathlib import Path
 
-CATEGORIES_FILE = Path(__file__).parent / "categories.json"
+from storage_paths import state_file
+
+CATEGORIES_FILE = state_file("categories.json")
 PARSER_KEYWORDS_FILE = Path(__file__).parent.parent / "parser_keywords.json"
 
 

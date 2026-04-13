@@ -2,6 +2,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from storage_paths import state_file, user_data_dir
+
 
 class BalanceManager:
     """Manages post balance for users in broadcast campaigns."""
@@ -216,15 +218,16 @@ def scoped_balance_manager(user_id: int, path_bot_dir: Path = None, owner_ids: s
         owner_ids: Set of owner user IDs (defaults to empty set)
     """
     if path_bot_dir is None:
-        path_bot_dir = Path(__file__).parent
+        # Keep legacy signature but default to persisted state location when available.
+        path_bot_dir = state_file(".").parent
     if owner_ids is None:
         owner_ids = set()
 
     if user_id in owner_ids or not owner_ids:
         # Owner uses global balance
-        path = path_bot_dir / "balance_state.json"
+        path = state_file("balance_state.json")
     else:
         # User gets isolated balance
-        path = path_bot_dir / "user_data" / str(user_id) / "balance_state.json"
+        path = user_data_dir() / str(user_id) / "balance_state.json"
 
     return BalanceManager(path)

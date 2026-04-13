@@ -3,12 +3,13 @@ import os
 import re
 from pathlib import Path
 
+from storage_paths import user_data_dir
 
 def _user_data_dir() -> Path:
     raw = (os.getenv("USER_DATA_DIR") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return (Path(__file__).parent / "user_data").resolve()
+    return user_data_dir()
 
 
 def user_dir(user_id: int) -> Path:
@@ -123,4 +124,3 @@ def delete_user_broadcast_group(user_id: int, ref: str) -> bool:
     groups = [g for g in groups if g != ref]
     save_user_broadcast_groups(user_id, groups)
     return True
-
