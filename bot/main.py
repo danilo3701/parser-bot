@@ -763,6 +763,8 @@ def _readiness_reason_human(reason_code: str) -> str:
         "not_connected": "Аккаунт не подключен.",
         "no_groups_selected": "Не выбраны группы рассылки.",
         "group_issues": "Есть группы с ограничениями на отправку.",
+        "send_as_missing": "В режиме «от канала» не выбран send-as канал.",
+        "send_as_no_access": "Нет доступа к выбранному send-as каналу.",
         "send_as_rights_missing": "Для send-as канала не хватает прав (отправка/редактирование/удаление).",
     }
     return mapping.get(reason_code, "Требуется обновить готовность.")
@@ -2182,7 +2184,10 @@ async def broadcast_launch_step_ready(query: CallbackQuery):
         parse_mode="HTML",
         reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
     )
-    await query.answer("Шаг 1 выполнен")
+    if total_problems == 0:
+        await query.answer("Шаг 1 выполнен")
+    else:
+        await query.answer("Шаг 1: найдены проблемы")
 
 
 @dp.callback_query(F.data == "bc_launch_step_test")
