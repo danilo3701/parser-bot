@@ -1425,10 +1425,12 @@ def broadcast_test_result_text(
 
     reason_counts: dict[str, int] = {}
     normalized_reasons: dict[str, str] = {}
+    raw_reasons: dict[str, str] = {}
     for group, raw_reason in failed_groups.items():
         key = _normalize_test_error_reason(raw_reason)
         reason_counts[key] = reason_counts.get(key, 0) + 1
         normalized_reasons[group] = key
+        raw_reasons[group] = str(raw_reason or "")
 
     text = (
         "🧪 <b>РЕЗУЛЬТАТ ТЕСТА</b>\n"
@@ -1451,7 +1453,11 @@ def broadcast_test_result_text(
             emoji = _test_reason_emoji(normalized)
             reason_label = _test_reason_human(normalized)
             group_label = _format_test_group_label(group)
-            text += f"{emoji} {group_label} — {reason_label} (<code>{normalized}</code>)\n"
+            extra = ""
+            raw_reason = (raw_reasons.get(group, "") or "").strip()
+            if normalized == "other" and raw_reason and raw_reason not in {"other", "unknown"}:
+                extra = f", <code>{raw_reason}</code>"
+            text += f"{emoji} {group_label} — {reason_label} (<code>{normalized}</code>{extra})\n"
         if failed_count > max_groups_to_show:
             text += f"… и ещё {failed_count - max_groups_to_show}\n"
 
@@ -4450,6 +4456,7 @@ async def _run_broadcast_test_for_groups(
     sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
     sent_senders = result.get("sent_senders", {}) if isinstance(result.get("sent_senders", {}), dict) else {}
     send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
+    failed_excs = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
     blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
 
     for group, err in blocked.items():
@@ -4466,7 +4473,14 @@ async def _run_broadcast_test_for_groups(
                 verified_at=None,
             )
         else:
-            reason_raw = str(send_errors.get(group) or blocked.get(group) or "other")
+            normalized = str(send_errors.get(group) or "").strip().lower()
+            reason_raw = str(
+                (
+                    failed_excs.get(group)
+                    if normalized in {"", "other"} and failed_excs.get(group)
+                    else (send_errors.get(group) or blocked.get(group) or failed_excs.get(group) or "other")
+                )
+            )
             reason_lower = reason_raw.lower()
             status = "deleted" if "delete" in reason_lower else "failed"
             bm.set_group_last_test(
@@ -4488,7 +4502,11 @@ async def _run_broadcast_test_for_groups(
     failed_groups: dict[str, str] = {}
     for group in test_groups:
         if group not in working_groups:
-            reason = str(send_errors.get(group) or blocked.get(group) or "unknown")
+            normalized = str(send_errors.get(group) or "").strip().lower()
+            if normalized in {"", "other"} and failed_excs.get(group):
+                reason = str(failed_excs.get(group) or "unknown")
+            else:
+                reason = str(send_errors.get(group) or blocked.get(group) or failed_excs.get(group) or "unknown")
             failed_groups[group] = reason
 
     balance_after_test = balance_mgr.get_balance()
