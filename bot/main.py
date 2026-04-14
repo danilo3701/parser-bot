@@ -2239,20 +2239,6 @@ async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
 
     assets = Path(__file__).parent / "assets"
 
-    await query.message.answer(
-        "🪪 <b>Подключение по API</b>\n\n"
-        "1. Откройте <b>my.telegram.org</b> в браузере. Введите номер телефона и нажмите <b>Next</b>. Вам придёт код в Telegram — введите его на сайте.\n\n"
-        "2. Вам придёт сообщение от <b>Telegram</b> с кодом. Введите его на сайте my.telegram.org, чтобы войти.\n\n"
-        "3. После входа нажмите <b>API development tools</b>. Вы увидите <b>App api_id</b> (число) и <b>App api_hash</b> (длинная строка).\n\n"
-        "Отправьте оба значения вместе:\n\n"
-        "<b>Вариант 1 (через запятую):</b>\n"
-        "<code>30705626, 0123456789abcdef0123456789abcdef</code>\n\n"
-        "<b>Вариант 2 (на двух строках):</b>\n"
-        "<code>30705626\n0123456789abcdef0123456789abcdef</code>",
-        parse_mode="HTML",
-        reply_markup=account_cancel_keyboard(),
-    )
-
     media_group = [
         InputMediaPhoto(
             media=FSInputFile(assets / "Captura de pantalla 2026-04-12 221400.png"),
@@ -2271,6 +2257,20 @@ async def account_connect_api_prompt(query: CallbackQuery, state: FSMContext):
         ),
     ]
     await query.message.answer_media_group(media_group)
+
+    await query.message.answer(
+        "🪪 <b>Подключение по API</b>\n\n"
+        "1. Откройте <b>my.telegram.org</b> в браузере. Введите номер телефона и нажмите <b>Next</b>. Вам придёт код в Telegram — введите его на сайте.\n\n"
+        "2. Вам придёт сообщение от <b>Telegram</b> с кодом. Введите его на сайте my.telegram.org, чтобы войти.\n\n"
+        "3. После входа нажмите <b>API development tools</b>. Вы увидите <b>App api_id</b> (число) и <b>App api_hash</b> (длинная строка).\n\n"
+        "Отправьте оба значения вместе:\n\n"
+        "<b>Вариант 1 (через запятую):</b>\n"
+        "<code>30705626, 0123456789abcdef0123456789abcdef</code>\n\n"
+        "<b>Вариант 2 (на двух строках):</b>\n"
+        "<code>30705626\n0123456789abcdef0123456789abcdef</code>",
+        parse_mode="HTML",
+        reply_markup=account_cancel_keyboard(),
+    )
 
     await state.set_state(MainMenu.connecting_account_api)
 
