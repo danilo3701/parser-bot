@@ -1505,7 +1505,11 @@ def broadcast_groups_keyboard(
 
     buttons = []
     if allow_manage:
-        buttons.append([InlineKeyboardButton(text="➕ Добавить чат/группу", callback_data="bcg_add")])
+        buttons.append([
+            InlineKeyboardButton(text="➕ Добавить по @", callback_data="bcg_add_at"),
+            InlineKeyboardButton(text="➕ Добавить по ссылке", callback_data="bcg_add_link"),
+        ])
+        buttons.append([InlineKeyboardButton(text="➕ Добавить (любой формат)", callback_data="bcg_add")])
     for group in page_groups:
         group_meta = groups_state.get(group, {})
         blocked = group_meta.get("status") == "blocked"
@@ -3921,7 +3925,7 @@ async def broadcast_groups(query: CallbackQuery):
         "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
         "Нажмите на группу, чтобы переключить.",
         parse_mode="HTML",
-        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=not is_owner(user_id)),
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=True),
     )
     await query.answer()
 
@@ -3938,7 +3942,7 @@ async def broadcast_groups_page(query: CallbackQuery):
         "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
         "Нажмите на группу, чтобы переключить.",
         parse_mode="HTML",
-        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=page, allow_manage=not is_owner(user_id)),
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=page, allow_manage=True),
     )
     await query.answer()
 
@@ -3946,9 +3950,6 @@ async def broadcast_groups_page(query: CallbackQuery):
 @dp.callback_query(F.data == "bcg_add")
 async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
     user_id = query.from_user.id
-    if is_owner(user_id):
-        await query.answer("Для админа список групп фиксированный.", show_alert=True)
-        return
     await state.set_state(MainMenu.adding_broadcast_group)
     await query.message.edit_text(
         "➕ <b>Добавить чат/группу</b>\n\n"
@@ -3963,6 +3964,50 @@ async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
         "<i>Примечание: рассылка возможна только если подключённый аккаунт состоит в этом чате.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Примеры @", callback_data="bcg_add_at"),
+                InlineKeyboardButton(text="Примеры ссылок", callback_data="bcg_add_link"),
+            ],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+        ]),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bcg_add_at")
+async def broadcast_groups_add_prompt_at(query: CallbackQuery, state: FSMContext):
+    await state.set_state(MainMenu.adding_broadcast_group)
+    await query.message.edit_text(
+        "➕ <b>Добавить чат по @username</b>\n\n"
+        "<b>Отправьте одним сообщением любой из вариантов:</b>\n"
+        "• <code>@spain_chatss</code>\n"
+        "• <code>spain_chatss</code>\n\n"
+        "⚠️ <b>По одной группе за раз.</b>\n\n"
+        "<i>Примечание: рассылка возможна только если подключённый аккаунт состоит в этом чате.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Примеры ссылок", callback_data="bcg_add_link")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+        ]),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bcg_add_link")
+async def broadcast_groups_add_prompt_link(query: CallbackQuery, state: FSMContext):
+    await state.set_state(MainMenu.adding_broadcast_group)
+    await query.message.edit_text(
+        "➕ <b>Добавить чат по ссылке</b>\n\n"
+        "<b>Отправьте одним сообщением ссылку в формате t.me:</b>\n"
+        "• <code>https://t.me/spain_chatss</code>\n"
+        "• <code>t.me/spain_chatss</code>\n\n"
+        "⚠️ <b>По одной группе за раз.</b>\n\n"
+        "<i>Примечание: рассылка возможна только если подключённый аккаунт состоит в этом чате.</i>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Примеры @", callback_data="bcg_add_at")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
         ]),
         disable_web_page_preview=True,
@@ -3973,10 +4018,6 @@ async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
 @dp.message(MainMenu.adding_broadcast_group)
 async def broadcast_groups_add_input(message: Message, state: FSMContext):
     user_id = message.from_user.id
-    if is_owner(user_id):
-        await state.set_state(MainMenu.viewing)
-        await message.answer("⛔️ Доступ только для пользователей.", reply_markup=back_button())
-        return
 
     # Валидация: не более одной группы за раз
     if message.text:
@@ -4128,7 +4169,7 @@ async def broadcast_group_toggle(query: CallbackQuery):
         else:
             await query.answer()
     await query.message.edit_reply_markup(
-        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=not is_owner(user_id))
+        reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=True)
     )
 
 
