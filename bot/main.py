@@ -1296,48 +1296,115 @@ def broadcast_balance_history_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def _normalize_test_error_reason(reason_raw: str | None) -> str:
+    reason = str(reason_raw or "").strip().lower()
+    if not reason:
+        return "other"
+    if reason in {"blocked", "restricted", "admin_required", "timeout", "other"}:
+        return reason
+    if reason in {"not_participant", "resolve_failed", "channelprivateerror"}:
+        return "blocked"
+    if reason in {"chatwriteforbiddenerror", "chatrestrictederror"}:
+        return "restricted"
+    if reason in {"chatadminrequirederror", "userbannedinchannelerror"}:
+        return "admin_required"
+    if reason in {"flood_wait", "floodwaiterror", "timeout", "timeouterror"}:
+        return "timeout"
+    if "timeout" in reason:
+        return "timeout"
+    if "restricted" in reason or "writeforbidden" in reason:
+        return "restricted"
+    if "admin" in reason or "banned" in reason:
+        return "admin_required"
+    if "private" in reason or "resolve" in reason or "not_participant" in reason:
+        return "blocked"
+    return "other"
+
+
+def _test_reason_human(normalized_reason: str) -> str:
+    return {
+        "blocked": "бот заблокирован / чат недоступен",
+        "restricted": "ограничение на отправку",
+        "admin_required": "нужны права администратора",
+        "timeout": "таймаут отправки",
+        "other": "другая ошибка",
+    }.get(normalized_reason, "другая ошибка")
+
+
+def _test_reason_emoji(normalized_reason: str) -> str:
+    return {
+        "blocked": "🚫",
+        "restricted": "⚠️",
+        "admin_required": "🛡",
+        "timeout": "⏱",
+        "other": "⚠️",
+    }.get(normalized_reason, "⚠️")
+
+
+def _format_test_group_label(group: str) -> str:
+    ref = str(group or "").strip()
+    if not ref:
+        return "<code>unknown</code>"
+    if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
+        return f"<code>{ref}</code>"
+    slug = ref.lstrip("@")
+    return f"@{slug}"
+
+
 def broadcast_test_result_text(
-    total_groups: int,
-    working_groups: list,
-    failed_groups: dict,
-    auto_disabled_count: int,
+    *,
+    selected_total: int,
+    tested_total: int,
+    success_count: int,
+    failed_groups: dict[str, str],
+    preblocked_count: int,
+    duration_seconds: int,
+    max_groups_to_show: int = 10,
 ) -> str:
-    """Format test broadcast result."""
-    working_count = len(working_groups)
+    """Format compact test broadcast result with negative-first details."""
     failed_count = len(failed_groups)
+    safe_tested_total = max(0, int(tested_total))
+    safe_success_count = max(0, int(success_count))
+    success_pct = int(round((safe_success_count / safe_tested_total) * 100)) if safe_tested_total > 0 else 0
+    bar_filled = min(10, max(0, int(round((success_pct / 100) * 10))))
+    progress_bar = "█" * bar_filled + "░" * (10 - bar_filled)
 
     reason_counts: dict[str, int] = {}
-    for reason in failed_groups.values():
-        key = str(reason or "unknown").strip() or "unknown"
+    normalized_reasons: dict[str, str] = {}
+    for group, raw_reason in failed_groups.items():
+        key = _normalize_test_error_reason(raw_reason)
         reason_counts[key] = reason_counts.get(key, 0) + 1
+        normalized_reasons[group] = key
 
     text = (
-        "🧪 <b>Результат тестовой рассылки</b>\n\n"
-        f"Проверено: <b>{total_groups}</b>\n"
-        f"Пройдено: <b>{working_count}</b>\n"
-        f"Отключено автоматически: <b>{auto_disabled_count}</b>\n"
+        "🧪 <b>РЕЗУЛЬТАТ ТЕСТА</b>\n"
+        f"Статус: ✅ Завершено за <b>{max(1, int(duration_seconds))}</b> сек\n\n"
+        "<b>Группы:</b>\n"
+        f"Выбрано: <b>{max(0, int(selected_total))}</b> | "
+        f"Тестировалось: <b>{safe_tested_total}</b> | "
+        f"Успешно: <b>{safe_success_count}</b>\n"
+        f"Проблемы: <b>{failed_count}</b> | "
+        f"Пропущено до теста: <b>{max(0, int(preblocked_count))}</b> (заблокированы)\n"
+        f"<code>{progress_bar}</code> {success_pct}% успешно (из тестировавшихся)\n"
     )
 
-    if working_count > 0:
-        text += f"✅ <b>Группы, где работает ({working_count}):</b>\n"
-        # Show up to 10 groups
-        for group in working_groups[:10]:
-            text += f"  • @{group}\n"
-        if working_count > 10:
-            text += f"  • ... и ещё {working_count - 10}\n"
+    text += f"\n❌ <b>Проблемные группы ({failed_count}):</b>\n"
+    if failed_count == 0:
+        text += "— нет —\n"
+    else:
+        for group, _ in list(failed_groups.items())[:max_groups_to_show]:
+            normalized = normalized_reasons.get(group, "other")
+            emoji = _test_reason_emoji(normalized)
+            reason_label = _test_reason_human(normalized)
+            group_label = _format_test_group_label(group)
+            text += f"{emoji} {group_label} — {reason_label} (<code>{normalized}</code>)\n"
+        if failed_count > max_groups_to_show:
+            text += f"… и ещё {failed_count - max_groups_to_show}\n"
 
-    if failed_count > 0:
-        text += f"\n❌ <b>Группы, где не работает ({failed_count}):</b>\n"
-        for group, reason in list(failed_groups.items())[:10]:
-            reason_emoji = "🚫" if reason == "blocked" else "⚠️"
-            text += f"  {reason_emoji} @{group} ({reason})\n"
-        if failed_count > 10:
-            text += f"  • ... и ещё {failed_count - 10}\n"
-        top_reasons = sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)[:5]
+        top_reasons = sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)
         if top_reasons:
-            text += "\nПричины (топ):\n"
-            for reason, count in top_reasons:
-                text += f"  • {reason}: {count}\n"
+            top_text = " | ".join(f"{reason}:{count}" for reason, count in top_reasons[:5])
+            text += f"\nПричины: <code>{top_text}</code>\n"
 
     return text
 
@@ -1345,6 +1412,8 @@ def broadcast_test_result_text(
 def broadcast_test_result_keyboard() -> InlineKeyboardMarkup:
     """Buttons after test: add groups or proceed to mass broadcast."""
     buttons = [
+        [InlineKeyboardButton(text="🔁 Повторить тест проблемных", callback_data="bc_test_retry_failed")],
+        [InlineKeyboardButton(text="🧹 Отключить заблокированные", callback_data="bc_test_disable_failed")],
         [InlineKeyboardButton(text="➕ Добавить группы", callback_data="bc_groups")],
         [InlineKeyboardButton(text="🚀 Открыть запуск рассылки", callback_data="bc_launch_menu")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
@@ -3939,6 +4008,191 @@ async def broadcast_test_info(query: CallbackQuery):
     await query.answer()
 
 
+async def _run_broadcast_test_for_groups(
+    query: CallbackQuery,
+    *,
+    user_id: int,
+    bm: BroadcastManager,
+    test_groups: list[str],
+    selected_total: int,
+    preblocked_count: int,
+    title: str = "ТЕСТИРОВАНИЕ ГРУПП",
+) -> None:
+    tested_total = len(test_groups)
+
+    # Test broadcast is always free: no balance check, no deduction.
+    balance_mgr = scoped_balance_manager(user_id)
+    balance_before_test = balance_mgr.get_balance()
+    started_perf = asyncio.get_running_loop().time()
+
+    await query.message.edit_text(
+        f"🧪 <b>{title}</b>\n\n"
+        "🆓 Тест бесплатный — посты не списываются.\n"
+        f"Выбрано: <b>{selected_total}</b> | К тесту: <b>{tested_total}</b>\n"
+        f"Отправляю тестовые сообщения в <b>{tested_total}</b> групп...\n"
+        "Не закрывайте чат!",
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    async with broadcast_lock:
+        result = await execute_broadcast(
+            user_id,
+            test_groups,
+            advance_rotation=False,
+            is_test=True,
+            test_marker="🧪",
+        )
+
+    sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
+    send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
+    blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+
+    for group, err in blocked.items():
+        bm.set_group_blocked(group, err)
+
+    for group in test_groups:
+        if group in sent_message_ids:
+            bm.set_group_last_test(
+                group,
+                status="ok",
+                reason="ok",
+                message_id=int(sent_message_ids.get(group) or 0) if sent_message_ids.get(group) else None,
+                sent_at=started_at,
+                verified_at=None,
+            )
+        else:
+            reason_raw = str(send_errors.get(group) or blocked.get(group) or "other")
+            reason_lower = reason_raw.lower()
+            status = "deleted" if "delete" in reason_lower else "failed"
+            bm.set_group_last_test(
+                group,
+                status=status,
+                reason=reason_raw,
+                message_id=None,
+                sent_at=started_at,
+                verified_at=None,
+            )
+
+    if result.get("sent_count", 0) > 0:
+        bm.mark_test_passed()
+    else:
+        bm.reset_test_flag()
+
+    # Build lists of working and failed groups (negative-first).
+    working_groups = list(sent_message_ids.keys()) if sent_message_ids else []
+    failed_groups: dict[str, str] = {}
+    for group in test_groups:
+        if group not in working_groups:
+            reason = str(send_errors.get(group) or blocked.get(group) or "unknown")
+            failed_groups[group] = reason
+
+    balance_after_test = balance_mgr.get_balance()
+
+    # Build group links section (before the wait loop, so it's static)
+    MAX_LINK_GROUPS = 15
+    groups_link_lines = []
+    for g in test_groups[:MAX_LINK_GROUPS]:
+        ref = str(g).strip()
+        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
+        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
+            groups_link_lines.append(f"• <code>{ref}</code>")
+        else:
+            slug = ref.lstrip("@")
+            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
+    extra = len(test_groups) - MAX_LINK_GROUPS
+    if extra > 0:
+        groups_link_lines.append(f"…и ещё {extra}")
+    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
+
+    # Wait N seconds with progress updates, then verify/delete test messages.
+    total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
+    step_seconds = 10
+    test_message_ids = sent_message_ids
+    cleanup_summary = ""
+    if test_message_ids:
+        for elapsed in range(0, total_seconds + step_seconds, step_seconds):
+            remaining = max(0, total_seconds - elapsed)
+            filled = min(10, int((elapsed / total_seconds) * 10))
+            bar = "█" * filled + "░" * (10 - filled)
+            try:
+                message_text = (
+                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ СООБЩЕНИЙ</b>\n\n"
+                    f"⏳ Осталось: <b>{remaining}</b> сек\n"
+                    f"<code>{bar}</code>\n\n"
+                )
+                if groups_links_text:
+                    message_text += f"<b>Группы теста:</b>\n{groups_links_text}\n\n"
+                message_text += "Не закрывайте чат!"
+
+                await query.message.edit_text(
+                    message_text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+            if remaining > 0:
+                await asyncio.sleep(step_seconds)
+
+        ok, _, client, _ = await _readiness_check_connected_account(user_id)
+        cleanup = {}
+        if ok and client:
+            try:
+                cleanup = await verify_and_delete_test_messages(
+                    client=client,
+                    test_message_ids=test_message_ids,
+                    wait_seconds=0,
+                )
+            except Exception:
+                cleanup = {}
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+
+            found_count = sum(1 for v in cleanup.values() if v.get("found"))
+            deleted_count = sum(1 for v in cleanup.values() if v.get("deleted"))
+            cleanup_summary = (
+                f"🧹 <b>Удаление тест-постов:</b> найдено {found_count}, удалено {deleted_count} "
+                f"(таймаут {total_seconds} сек)."
+            )
+        else:
+            cleanup_summary = (
+                f"🧹 <b>Удаление тест-постов:</b> не удалось подключиться "
+                f"(таймаут {total_seconds} сек)."
+            )
+    else:
+        cleanup_summary = f"🧹 <b>Удаление тест-постов:</b> тестовые сообщения не отправлены (таймаут {total_seconds} сек)."
+
+    duration_seconds = max(1, int(round(asyncio.get_running_loop().time() - started_perf)))
+    test_result_text = broadcast_test_result_text(
+        selected_total=selected_total,
+        tested_total=tested_total,
+        success_count=len(working_groups),
+        failed_groups=failed_groups,
+        preblocked_count=preblocked_count,
+        duration_seconds=duration_seconds,
+        max_groups_to_show=10,
+    )
+
+    full_text = (
+        test_result_text
+        + "\n\n🆓 <b>Тест бесплатный:</b> потрачено 0 постов\n"
+        + f"💰 <b>Баланс:</b> {balance_after_test} постов (было {balance_before_test})"
+        + f"\n{cleanup_summary}"
+    )
+
+    await query.message.edit_text(
+        full_text,
+        parse_mode="HTML",
+        reply_markup=broadcast_test_result_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
 @dp.callback_query(F.data == "bc_test_start")
 async def broadcast_test_v2(query: CallbackQuery):
     if broadcast_lock.locked():
@@ -4018,173 +4272,84 @@ async def broadcast_test_v2(query: CallbackQuery):
         await query.answer(f"❌ {deny_reason}", show_alert=True)
         return
 
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected = set(campaign.get("selected_groups", []))
+    selected_groups = [group for group in groups_all if group in selected]
+    selected_total = len(selected_groups)
     test_groups = get_active_selected_groups(state, groups_all)
+    tested_total = len(test_groups)
+    preblocked_count = max(0, selected_total - tested_total)
 
-    # Test broadcast is always free: no balance check, no deduction.
-    balance_mgr = scoped_balance_manager(user_id)
-    balance_before_test = balance_mgr.get_balance()
-
-    await query.message.edit_text(
-        "🧪 <b>ТЕСТИРОВАНИЕ ГРУПП</b>\n\n"
-        "🆓 Тест бесплатный — посты не списываются.\n"
-        f"Отправляю тестовые сообщения в <b>{len(test_groups)}</b> групп...\n"
-        "Не закрывайте чат!",
-        parse_mode="HTML",
-    )
-    await query.answer()
-
-    started_at = datetime.now(timezone.utc).isoformat()
     bm.record_test_run(bypass_limits=owner_bypass)
-    async with broadcast_lock:
-        result = await execute_broadcast(
-            user_id,
-            test_groups,
-            advance_rotation=False,
-            is_test=True,
-            test_marker="🧪",
-        )
-
-    sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
-    send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
-    blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
-
-    for group, err in blocked.items():
-        bm.set_group_blocked(group, err)
-
-    for group in test_groups:
-        if group in sent_message_ids:
-            bm.set_group_last_test(
-                group,
-                status="ok",
-                reason="ok",
-                message_id=int(sent_message_ids.get(group) or 0) if sent_message_ids.get(group) else None,
-                sent_at=started_at,
-                verified_at=None,
-            )
-        else:
-            reason_raw = str(send_errors.get(group) or blocked.get(group) or "other")
-            reason_lower = reason_raw.lower()
-            status = "deleted" if "delete" in reason_lower else "failed"
-            bm.set_group_last_test(
-                group,
-                status=status,
-                reason=reason_raw,
-                message_id=None,
-                sent_at=started_at,
-                verified_at=None,
-            )
-
-    if result.get("sent_count", 0) > 0:
-        bm.mark_test_passed()
-    else:
-        bm.reset_test_flag()
-
-    # Build lists of working and failed groups
-    working_groups = list(sent_message_ids.keys()) if sent_message_ids else []
-    failed_groups: dict[str, str] = {}
-    auto_disabled_groups: list[str] = []
-    for group in test_groups:
-        if group not in working_groups:
-            reason = str(send_errors.get(group) or blocked.get(group) or "unknown")
-            failed_groups[group] = reason
-            bm.set_group_blocked(group, f"test_{reason}")
-            auto_disabled_groups.append(group)
-
-    # Show test result with new format
-    test_result_text = broadcast_test_result_text(
-        len(test_groups),
-        working_groups,
-        failed_groups,
-        len(auto_disabled_groups),
-    )
-    balance_after_test = balance_mgr.get_balance()
-
-    # Build group links section (before the wait loop, so it's static)
-    MAX_LINK_GROUPS = 15
-    groups_link_lines = []
-    for g in test_groups[:MAX_LINK_GROUPS]:
-        ref = str(g).strip()
-        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
-        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
-            groups_link_lines.append(f"• <code>{ref}</code>")
-        else:
-            slug = ref.lstrip("@")
-            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
-    extra = len(test_groups) - MAX_LINK_GROUPS
-    if extra > 0:
-        groups_link_lines.append(f"…и ещё {extra}")
-    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
-
-    # Wait 60 seconds with progress updates, then verify/delete test messages.
-    total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
-    step_seconds = 10
-    test_message_ids = sent_message_ids
-    cleanup_summary = ""
-    if test_message_ids:
-        for elapsed in range(0, total_seconds + step_seconds, step_seconds):
-            remaining = max(0, total_seconds - elapsed)
-            filled = min(10, int((elapsed / total_seconds) * 10))
-            bar = "█" * filled + "░" * (10 - filled)
-            try:
-                message_text = (
-                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ СООБЩЕНИЙ</b>\n\n"
-                    f"⏳ Осталось: <b>{remaining}</b> сек\n"
-                    f"<code>{bar}</code>\n\n"
-                )
-                if groups_links_text:
-                    message_text += f"<b>Группы теста:</b>\n{groups_links_text}\n\n"
-                message_text += "Не закрывайте чат!"
-
-                await query.message.edit_text(
-                    message_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-            if remaining > 0:
-                await asyncio.sleep(step_seconds)
-
-        ok, _, client, _ = await _readiness_check_connected_account(user_id)
-        cleanup = {}
-        if ok and client:
-            try:
-                cleanup = await verify_and_delete_test_messages(
-                    client=client,
-                    test_message_ids=test_message_ids,
-                    wait_seconds=0,
-                )
-            except Exception:
-                cleanup = {}
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
-            found_count = sum(1 for v in cleanup.values() if v.get("found"))
-            deleted_count = sum(1 for v in cleanup.values() if v.get("deleted"))
-            cleanup_summary = f"🧹 Тестовые сообщения: найдено {found_count}, удалено {deleted_count}.\n"
-        else:
-            cleanup_summary = "🧹 Не удалось подключиться для удаления тестовых сообщений.\n"
-    else:
-        cleanup_summary = "🧹 Тестовые сообщения не отправлены (удалять нечего).\n"
-
-    full_text = (
-        test_result_text
-        + "\n\n🆓 <b>Тест бесплатный:</b> потрачено 0 постов\n"
-        + f"💰 <b>Баланс:</b> {balance_after_test} постов (было {balance_before_test})"
-        + f"\n{cleanup_summary}"
+    await _run_broadcast_test_for_groups(
+        query,
+        user_id=user_id,
+        bm=bm,
+        test_groups=test_groups,
+        selected_total=selected_total,
+        preblocked_count=preblocked_count,
+        title="ТЕСТИРОВАНИЕ ГРУПП",
     )
 
-    updated = bm.load()
-    await query.message.edit_text(
-        full_text,
-        parse_mode="HTML",
-        reply_markup=broadcast_test_result_keyboard(),
-        disable_web_page_preview=True,
+
+@dp.callback_query(F.data == "bc_test_retry_failed")
+async def broadcast_test_retry_failed(query: CallbackQuery):
+    if broadcast_lock.locked():
+        await query.answer("Рассылка уже выполняется.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    groups_all = scoped_load_broadcast_groups(user_id)
+    state = bm.ensure_groups_known(groups_all)
+
+    steps = get_setup_steps(user_id, state, groups_all)
+    if not steps["account"] or not steps["posts"] or not steps["groups"] or not steps["schedule"]:
+        await query.answer("⚠️ Сначала завершите базовую настройку перед повторным тестом.", show_alert=True)
+        return
+    if not steps["readiness"]:
+        await query.answer("⚠️ Сначала пройдите «🧭 Готовность».", show_alert=True)
+        return
+
+    owner_bypass = bool(OWNER_IDS) and (user_id in OWNER_IDS)
+    can_run_test, deny_reason = bm.can_run_test(
+        cooldown_seconds=TEST_COOLDOWN_SECONDS,
+        max_tests_per_day=TEST_MAX_PER_DAY,
+        bypass_limits=owner_bypass,
     )
-    # query.answer() already called at start of the long-running operation
+    if not can_run_test:
+        await query.answer(f"❌ {deny_reason}", show_alert=True)
+        return
+
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected = set(campaign.get("selected_groups", []))
+    groups_state = state.get("broadcast_groups_state", {}) if isinstance(state.get("broadcast_groups_state", {}), dict) else {}
+
+    retry_groups: list[str] = []
+    for group in groups_all:
+        if group not in selected:
+            continue
+        meta = groups_state.get(group, {}) if isinstance(groups_state.get(group, {}), dict) else {}
+        if meta.get("status") == "blocked":
+            continue
+        last_status = str(meta.get("last_test_status") or "").strip().lower()
+        if last_status in {"failed", "deleted", "unknown"}:
+            retry_groups.append(group)
+
+    if not retry_groups:
+        await query.answer("ℹ️ Нет активных проблемных групп для повторного теста.", show_alert=True)
+        return
+
+    bm.record_test_run(bypass_limits=owner_bypass)
+    await _run_broadcast_test_for_groups(
+        query,
+        user_id=user_id,
+        bm=bm,
+        test_groups=retry_groups,
+        selected_total=len(retry_groups),
+        preblocked_count=0,
+        title="ПОВТОРНЫЙ ТЕСТ ПРОБЛЕМНЫХ ГРУПП",
+    )
 
 
 @dp.callback_query(F.data == "bc_mode_toggle")
@@ -4485,19 +4650,34 @@ async def _handle_purchase(query: CallbackQuery, tier: str):
 
 @dp.callback_query(F.data == "bc_test_disable_failed")
 async def broadcast_test_disable_failed(query: CallbackQuery):
-    """Disable failed groups after test."""
+    """Disable groups that had non-OK test result."""
     user_id = query.from_user.id
     bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
 
-    # Disable all groups with failed test status
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected = set(campaign.get("selected_groups", []))
+
+    # Disable selected groups with problematic test status/reason.
     groups_state = state.get("broadcast_groups_state", {})
     disabled_count = 0
     for group, meta in groups_state.items():
-        test_status = meta.get("last_test_status")
-        if test_status == "failed" or test_status == "deleted":
-            bm.set_group_blocked(group, f"test_{test_status}")
+        if group not in selected:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        test_status = str(meta.get("last_test_status") or "").strip().lower()
+        raw_reason = str(meta.get("last_test_reason") or "").strip()
+        test_reason = _normalize_test_error_reason(raw_reason)
+        is_problem_status = bool(test_status) and test_status != "ok"
+        is_problem_reason = bool(raw_reason) and test_reason in {"blocked", "restricted", "admin_required", "timeout", "other"}
+        if not (is_problem_status or is_problem_reason):
+            continue
+
+        was_blocked = str(meta.get("status") or "").strip().lower() == "blocked"
+        bm.set_group_blocked(group, f"test_{test_reason}")
+        if not was_blocked:
             disabled_count += 1
 
     state = bm.load()
