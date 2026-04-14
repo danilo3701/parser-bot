@@ -4698,7 +4698,7 @@ async def broadcast_test_v2(query: CallbackQuery):
         await query.answer(reason, show_alert=True)
         return
 
-    owner_bypass = bool(OWNER_IDS) and (user_id in OWNER_IDS)
+    owner_bypass = is_owner(user_id)
     can_run_test, deny_reason = bm.can_run_test(
         cooldown_seconds=TEST_COOLDOWN_SECONDS,
         max_tests_per_day=TEST_MAX_PER_DAY,
@@ -4765,7 +4765,7 @@ async def broadcast_test_retry_failed(query: CallbackQuery):
         await query.answer("⚠️ Сначала пройдите «🧭 Готовность».", show_alert=True)
         return
 
-    owner_bypass = bool(OWNER_IDS) and (user_id in OWNER_IDS)
+    owner_bypass = is_owner(user_id)
     can_run_test, deny_reason = bm.can_run_test(
         cooldown_seconds=TEST_COOLDOWN_SECONDS,
         max_tests_per_day=TEST_MAX_PER_DAY,
