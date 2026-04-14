@@ -45,6 +45,13 @@ class BroadcastManager:
             # New schedule model: weekly day -> {enabled, time}
             "weekly_schedule": {wd: {"enabled": False, "time": None} for wd in WEEKDAYS},
             "last_runs": {},
+            # Runtime state for production resilience (Phase 8).
+            # active_run is used to prevent parallel runs per user and to detect "stuck" runs after restarts.
+            "runtime": {
+                "active_run": None,  # dict | None
+                "consecutive_failed_runs": 0,
+                "last_run": None,  # dict | None
+            },
             "notifications": {
                 "balance_low": {
                     "enabled": True,
@@ -82,6 +89,7 @@ class BroadcastManager:
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
+        state.setdefault("runtime", self._default_state()["runtime"])
         state.setdefault("notifications", self._default_state()["notifications"])
         state.setdefault("test_log", self._default_state()["test_log"])
 
@@ -167,6 +175,18 @@ class BroadcastManager:
         campaign.setdefault("selected_groups", [])
         campaign.setdefault("test_passed", False)
         campaign.setdefault("last_test_at", None)
+
+        runtime = state.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = self._default_state()["runtime"]
+            state["runtime"] = runtime
+        runtime.setdefault("active_run", None)
+        runtime.setdefault("consecutive_failed_runs", 0)
+        runtime.setdefault("last_run", None)
+        try:
+            runtime["consecutive_failed_runs"] = max(0, int(runtime.get("consecutive_failed_runs", 0)))
+        except Exception:
+            runtime["consecutive_failed_runs"] = 0
         return state
 
     def save(self, state: dict) -> None:
@@ -648,3 +668,165 @@ class BroadcastManager:
             schedule["started_at"] = datetime.now(timezone.utc).isoformat()
             self.save(state)
         return state
+
+    # ─── Runtime: lock/circuit-breaker/heartbeat (Phase 8) ─────────────────────
+
+    def get_active_run(self) -> dict | None:
+        state = self.load()
+        runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+        active = runtime.get("active_run")
+        return active if isinstance(active, dict) else None
+
+    def clear_stale_active_run(self, *, timeout_seconds: int = 180) -> bool:
+        """
+        If an active run exists but its heartbeat is too old, clear it.
+
+        Returns True if a stale run was cleared.
+        """
+        state = self.load()
+        runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+        active = runtime.get("active_run")
+        if not isinstance(active, dict):
+            return False
+
+        def _mark_stuck():
+            runtime["last_run"] = {
+                "kind": str(active.get("kind") or "unknown"),
+                "ok": False,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "summary": "Запуск был прерван или завис (heartbeat timeout).",
+                "groups_total": int(active.get("groups_total", 0) or 0),
+                "sent_count": 0,
+                "blocked_count": 0,
+                "failed_count": 0,
+                "spent_posts": 0,
+                "post_index": int(active.get("post_index", 0) or 0),
+                "post_total": int(active.get("post_total", 0) or 0),
+                "next_post_index": None,
+                "sent_message_ids": {},
+            }
+
+        last_hb = active.get("last_heartbeat")
+        if not isinstance(last_hb, str) or not last_hb:
+            # No heartbeat info -> treat as stale.
+            _mark_stuck()
+            runtime["active_run"] = None
+            self.save(state)
+            return True
+
+        try:
+            hb_dt = datetime.fromisoformat(last_hb)
+            if hb_dt.tzinfo is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            _mark_stuck()
+            runtime["active_run"] = None
+            self.save(state)
+            return True
+
+        age = (datetime.now(timezone.utc) - hb_dt).total_seconds()
+        if age <= float(timeout_seconds):
+            return False
+
+        _mark_stuck()
+        runtime["active_run"] = None
+        self.save(state)
+        return True
+
+    def begin_run(
+        self,
+        *,
+        kind: str,
+        groups_total: int,
+        post_index: int,
+        post_total: int,
+        slot: str | None = None,
+    ) -> dict:
+        state = self.load()
+        runtime = state.setdefault("runtime", self._default_state()["runtime"])
+        now = datetime.now(timezone.utc).isoformat()
+        runtime["active_run"] = {
+            "kind": str(kind or "manual"),
+            "slot": (slot or "").strip() or None,
+            "started_at": now,
+            "last_heartbeat": now,
+            "groups_total": int(groups_total),
+            "post_index": int(post_index),
+            "post_total": int(post_total),
+        }
+        self.save(state)
+        return state
+
+    def touch_heartbeat(self) -> dict:
+        state = self.load()
+        runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+        active = runtime.get("active_run")
+        if not isinstance(active, dict):
+            return state
+        active["last_heartbeat"] = datetime.now(timezone.utc).isoformat()
+        self.save(state)
+        return state
+
+    def end_run(
+        self,
+        *,
+        kind: str,
+        ok: bool,
+        summary: str,
+        groups_total: int,
+        sent_count: int,
+        blocked_count: int,
+        failed_count: int,
+        spent_posts: int,
+        post_index: int,
+        post_total: int,
+        next_post_index: int | None,
+        sent_message_ids: dict | None = None,
+    ) -> dict:
+        state = self.load()
+        runtime = state.setdefault("runtime", self._default_state()["runtime"])
+        runtime["active_run"] = None
+        runtime["last_run"] = {
+            "kind": str(kind or "manual"),
+            "ok": bool(ok),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary": str(summary or ""),
+            "groups_total": int(groups_total),
+            "sent_count": int(sent_count),
+            "blocked_count": int(blocked_count),
+            "failed_count": int(failed_count),
+            "spent_posts": int(spent_posts),
+            "post_index": int(post_index),
+            "post_total": int(post_total),
+            "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
+            "sent_message_ids": dict(sent_message_ids or {}),
+        }
+        self.save(state)
+        return state
+
+    def get_consecutive_failed_runs(self) -> int:
+        state = self.load()
+        runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+        try:
+            return max(0, int(runtime.get("consecutive_failed_runs", 0)))
+        except Exception:
+            return 0
+
+    def reset_consecutive_failed_runs(self) -> dict:
+        state = self.load()
+        runtime = state.setdefault("runtime", self._default_state()["runtime"])
+        runtime["consecutive_failed_runs"] = 0
+        self.save(state)
+        return state
+
+    def inc_consecutive_failed_runs(self) -> int:
+        state = self.load()
+        runtime = state.setdefault("runtime", self._default_state()["runtime"])
+        try:
+            current = int(runtime.get("consecutive_failed_runs", 0))
+        except Exception:
+            current = 0
+        current = max(0, current) + 1
+        runtime["consecutive_failed_runs"] = current
+        self.save(state)
+        return current

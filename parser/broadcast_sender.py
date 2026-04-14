@@ -3,6 +3,7 @@ import os
 import random
 import re
 from pathlib import Path
+from collections.abc import Awaitable, Callable
 
 import telethon.errors
 from dotenv import load_dotenv
@@ -119,6 +120,7 @@ async def send_broadcast_campaign_with_client(
     as_copy: bool = True,
     is_test: bool = False,
     test_marker: str = "🧪",
+    progress_callback: Callable[[dict], Awaitable[None]] | None = None,
 ) -> dict:
     """
     Sends campaign using an already connected/authorized Telethon client.
@@ -167,6 +169,8 @@ async def send_broadcast_campaign_with_client(
         result["summary"] = f"Ошибка подготовки рассылки: {type(exc).__name__}"
         return result
 
+    total_groups = len(groups)
+
     for idx, group in enumerate(groups):
         try:
             group_entity = await client.get_entity(_as_entity_ref(group))
@@ -174,6 +178,21 @@ async def send_broadcast_campaign_with_client(
             result["failed_groups"][group] = f"resolve_failed: {type(exc).__name__}"
             result["send_errors"][group] = "resolve_failed"
             result["skipped_count"] += 1
+            if progress_callback is not None:
+                try:
+                    await progress_callback({
+                        "processed": idx + 1,
+                        "total": total_groups,
+                        "group": group,
+                        "sent": False,
+                        "message_id": None,
+                        "sent_count": int(result.get("sent_count", 0) or 0),
+                        "skipped_count": int(result.get("skipped_count", 0) or 0),
+                        "blocked_count": len(result.get("blocked_groups", {}) or {}),
+                        "failed_count": len(result.get("failed_groups", {}) or {}),
+                    })
+                except Exception:
+                    pass
             continue
 
         sent = False
@@ -285,6 +304,22 @@ async def send_broadcast_campaign_with_client(
         else:
             result["skipped_count"] += 1
             result["send_errors"].setdefault(group, "other")
+
+        if progress_callback is not None:
+            try:
+                await progress_callback({
+                    "processed": idx + 1,
+                    "total": total_groups,
+                    "group": group,
+                    "sent": bool(sent),
+                    "message_id": sent_message_id if isinstance(sent_message_id, int) else None,
+                    "sent_count": int(result.get("sent_count", 0) or 0),
+                    "skipped_count": int(result.get("skipped_count", 0) or 0),
+                    "blocked_count": len(result.get("blocked_groups", {}) or {}),
+                    "failed_count": len(result.get("failed_groups", {}) or {}),
+                })
+            except Exception:
+                pass
 
         if idx < len(groups) - 1:
             await asyncio.sleep(delay_seconds + random.uniform(0, jitter_seconds))

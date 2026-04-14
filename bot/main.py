@@ -326,7 +326,26 @@ broadcast_manager = BroadcastManager(
     default_tz=BROADCAST_TZ,
     default_times=BROADCAST_TIMES,
 )
-broadcast_lock = asyncio.Lock()
+_broadcast_locks: dict[int, asyncio.Lock] = {}
+
+
+def _broadcast_lock_for(user_id: int) -> asyncio.Lock:
+    """
+    Per-user broadcast lock (Phase 8): prevents parallel mass/auto runs for the same user.
+
+    Note: this is in-memory only; persistent "active_run" is tracked in BroadcastManager.runtime.
+    """
+    uid = int(user_id)
+    lock = _broadcast_locks.get(uid)
+    if lock is None:
+        lock = asyncio.Lock()
+        _broadcast_locks[uid] = lock
+    return lock
+
+
+SCHEDULER_TICK_SECONDS = 20
+HEARTBEAT_TIMEOUT_SECONDS = 180
+MAX_CONSECUTIVE_FAILED_RUNS = 5
 scheduler_task: asyncio.Task | None = None
 current_scan_task: asyncio.Task | None = None
 current_monitor_task: asyncio.Task | None = None
@@ -1551,6 +1570,67 @@ def get_active_selected_groups(state: dict, groups: list[str]) -> list[str]:
     return get_active_selected_groups_from(state, groups)
 
 
+def _rotation_info(state: dict) -> tuple[int, int, int]:
+    """
+    Returns (current_post_number_1based, total_posts, next_post_number_1based).
+    If there are no posts, returns (0, 0, 0).
+    """
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
+    total = len(posts)
+    if total <= 0:
+        return 0, 0, 0
+    try:
+        idx = int(campaign.get("rotation_index") or 0)
+    except Exception:
+        idx = 0
+    idx = max(0, min(idx, total - 1))
+    current_n = idx + 1
+    next_n = ((idx + 1) % total) + 1
+    return current_n, total, next_n
+
+
+def _format_eta_range_seconds(min_seconds: int, max_seconds: int) -> str:
+    min_seconds = max(0, int(min_seconds))
+    max_seconds = max(min_seconds, int(max_seconds))
+    if max_seconds < 60:
+        if min_seconds == max_seconds:
+            return f"~{max_seconds} сек"
+        return f"~{min_seconds}–{max_seconds} сек"
+    min_min = int(math.ceil(min_seconds / 60))
+    max_min = int(math.ceil(max_seconds / 60))
+    if min_min == max_min:
+        return f"~{max_min} мин"
+    return f"~{min_min}–{max_min} мин"
+
+
+def _public_group_link(group_ref: str, message_id: int | None) -> str | None:
+    """
+    Build t.me link for public chats with username-like refs.
+    group_ref is stored without '@' (see normalize_group_ref).
+    """
+    if not isinstance(message_id, int) or message_id <= 0:
+        return None
+    s = str(group_ref or "").strip()
+    if not s or re.fullmatch(r"-?\d{5,}", s):
+        return None
+    s = s[1:] if s.startswith("@") else s
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", s):
+        return None
+    return f"https://t.me/{s}/{int(message_id)}"
+
+
+def _get_active_run_if_any(bm: BroadcastManager) -> dict | None:
+    try:
+        bm.clear_stale_active_run(timeout_seconds=HEARTBEAT_TIMEOUT_SECONDS)
+    except Exception:
+        pass
+    try:
+        return bm.get_active_run()
+    except Exception:
+        return None
+
+
 async def execute_broadcast(
     user_id: int,
     groups: list[str],
@@ -1558,6 +1638,7 @@ async def execute_broadcast(
     advance_rotation: bool,
     is_test: bool = False,
     test_marker: str = "🧪",
+    progress_callback=None,
 ) -> dict:
     mgr = scoped_broadcast_manager(user_id)
     state = mgr.load()
@@ -1583,10 +1664,11 @@ async def execute_broadcast(
             source_message_id=source_message_id,
             send_as_channel=send_as,
             delay_seconds=1.5 if is_test else 5.0,
-            jitter_seconds=0.5 if is_test else 1.0,
+            jitter_seconds=0.5 if is_test else 5.0,
             as_copy=True,
             is_test=is_test,
             test_marker=test_marker,
+            progress_callback=progress_callback,
         )
     finally:
         try:
@@ -1669,13 +1751,28 @@ async def scheduler_loop():
                 if not (meta.get("enabled") and slot):
                     continue
 
-                # Run only at the exact minute; if missed (downtime), skip for the day.
-                if now_local.strftime("%H:%M") != slot:
+                # Run only within the slot minute; if missed (downtime/busy), mark and skip for the day.
+                try:
+                    hh, mm = [int(x) for x in str(slot).split(":", 1)]
+                    slot_dt = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                except Exception:
                     continue
 
                 if bm.was_slot_run(date_str, slot):
                     continue
-                if broadcast_lock.locked():
+
+                user_lock = _broadcast_lock_for(user_id)
+
+                if now_local < slot_dt:
+                    continue
+                if now_local >= slot_dt + timedelta(minutes=1):
+                    bm.mark_slot_run(date_str, slot, "missed", "Слот пропущен (бот был офлайн или был занят).")
+                    continue
+
+                # Inside the slot minute: if user already runs something, just let it be marked as missed later.
+                if user_lock.locked():
+                    continue
+                if _get_active_run_if_any(bm) is not None:
                     continue
 
                 ready, reason = is_campaign_ready(state, user_id=user_id, groups=groups_all)
@@ -1691,14 +1788,50 @@ async def scheduler_loop():
                     await notify_user(user_id, "📣 Авторассылка пропущена: недостаточно постов на балансе.")
                     continue
 
-                async with broadcast_lock:
+                async with user_lock:
                     # Re-check under lock to avoid races with parallel manual runs.
+                    if bm.was_slot_run(date_str, slot):
+                        continue
                     if not balance_mgr.check_sufficient(len(groups)):
                         reason = "Недостаточно постов на балансе."
                         bm.mark_slot_run(date_str, slot, "skipped", reason)
                         await notify_user(user_id, "📣 Авторассылка пропущена: недостаточно постов на балансе.")
                         continue
-                    result = await execute_broadcast(user_id, groups, advance_rotation=True)
+
+                    cur_n, total_posts, next_n = _rotation_info(state)
+                    bm.begin_run(
+                        kind="auto",
+                        groups_total=len(groups),
+                        post_index=cur_n,
+                        post_total=total_posts,
+                        slot=f"{date_str} {slot}",
+                    )
+                    last_hb_ts = 0.0
+                    loop = asyncio.get_running_loop()
+
+                    async def _auto_progress_cb(_: dict):
+                        nonlocal last_hb_ts
+                        now_ts = loop.time()
+                        if now_ts - last_hb_ts >= 15.0:
+                            last_hb_ts = now_ts
+                            try:
+                                bm.touch_heartbeat()
+                            except Exception:
+                                pass
+
+                    try:
+                        result = await execute_broadcast(
+                            user_id,
+                            groups,
+                            advance_rotation=True,
+                            progress_callback=_auto_progress_cb,
+                        )
+                    finally:
+                        try:
+                            bm.touch_heartbeat()
+                        except Exception:
+                            pass
+
                     sent_count = int(result.get("sent_count", 0) or 0)
                     if sent_count > 0:
                         balance_mgr.spend_posts(
@@ -1710,8 +1843,45 @@ async def scheduler_loop():
                 for group, err in result.get("blocked_groups", {}).items():
                     bm.set_group_blocked(group, err)
 
-                status = "ok" if result.get("ok") else "failed"
+                ok_run = bool(result.get("ok"))
+                status = "ok" if ok_run else "failed"
                 bm.mark_slot_run(date_str, slot, status, result.get("summary", ""))
+
+                blocked_groups = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+                failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+                after_state = bm.load()
+                next_post_for_user, total_posts_after, _ = _rotation_info(after_state)
+                bm.end_run(
+                    kind="auto",
+                    ok=ok_run,
+                    summary=str(result.get("summary", "")),
+                    groups_total=len(groups),
+                    sent_count=sent_count,
+                    blocked_count=len(blocked_groups),
+                    failed_count=len(failed_groups),
+                    spent_posts=sent_count,
+                    post_index=cur_n,
+                    post_total=total_posts,
+                    next_post_index=next_post_for_user if next_post_for_user else None,
+                    sent_message_ids=result.get("sent_message_ids", {}),
+                )
+
+                if ok_run:
+                    bm.reset_consecutive_failed_runs()
+                else:
+                    failed_streak = bm.inc_consecutive_failed_runs()
+                    if failed_streak >= MAX_CONSECUTIVE_FAILED_RUNS:
+                        bm.set_schedule_enabled(False)
+                        await notify_user(
+                            user_id,
+                            "⏸ <b>АВТОРАССЫЛКА НА ПАУЗЕ</b>\n\n"
+                            "Зафиксировано 5 неудачных запусков подряд.\n"
+                            "Я поставил авторассылку на паузу, чтобы не рисковать блокировками.\n\n"
+                            "Что делать:\n"
+                            "1) Запустите «🧭 Готовность» и «🧪 Тест»\n"
+                            "2) Убедитесь, что посты не удаляются/есть права\n"
+                            "3) Включите расписание снова в «📅 Расписание»",
+                        )
                 new_balance = balance_mgr.get_balance()
                 failed_count = max(0, len(groups) - sent_count)
                 analytics_text = (
@@ -1747,9 +1917,9 @@ async def scheduler_loop():
                         )
                         bm.mark_balance_notif_sent()
 
-            await asyncio.sleep(20)
+            await asyncio.sleep(SCHEDULER_TICK_SECONDS)
         except Exception:
-            await asyncio.sleep(20)
+            await asyncio.sleep(SCHEDULER_TICK_SECONDS)
 
 
 # ─── Основные хендлеры ────────────────────────────────────────────────────────
@@ -4161,7 +4331,8 @@ async def _run_broadcast_test_for_groups(
     await query.answer()
 
     started_at = datetime.now(timezone.utc).isoformat()
-    async with broadcast_lock:
+    user_lock = _broadcast_lock_for(user_id)
+    async with user_lock:
         result = await execute_broadcast(
             user_id,
             test_groups,
@@ -4359,12 +4530,12 @@ async def _run_broadcast_test_for_groups(
 
 @dp.callback_query(F.data == "bc_test_start")
 async def broadcast_test_v2(query: CallbackQuery):
-    if broadcast_lock.locked():
+    user_id = query.from_user.id
+    user_lock = _broadcast_lock_for(user_id)
+    bm = scoped_broadcast_manager(user_id)
+    if user_lock.locked() or _get_active_run_if_any(bm) is not None:
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
 
@@ -4458,12 +4629,12 @@ async def broadcast_test_v2(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_test_retry_failed")
 async def broadcast_test_retry_failed(query: CallbackQuery):
-    if broadcast_lock.locked():
+    user_id = query.from_user.id
+    user_lock = _broadcast_lock_for(user_id)
+    bm = scoped_broadcast_manager(user_id)
+    if user_lock.locked() or _get_active_run_if_any(bm) is not None:
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
 
@@ -4536,11 +4707,12 @@ async def broadcast_mode_toggle(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_mass")
 async def broadcast_mass(query: CallbackQuery):
-    if broadcast_lock.locked():
+    user_id = query.from_user.id
+    user_lock = _broadcast_lock_for(user_id)
+    bm = scoped_broadcast_manager(user_id)
+    if user_lock.locked() or _get_active_run_if_any(bm) is not None:
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
     groups_all = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups_all)
 
@@ -4596,26 +4768,28 @@ async def broadcast_mass(query: CallbackQuery):
         await query.answer()
         return
 
-    # Show confirmation with balance calculation
+    # Show confirmation screen (Phase 8).
+    current_post_n, total_posts, next_post_n = _rotation_info(state)
     current_balance = balance_mgr.get_balance()
-    new_balance = current_balance - len(groups)
+    eta = _format_eta_range_seconds(len(groups) * 5, len(groups) * 10)
+
     confirmation_text = (
-        f"📣 <b>Подтверждение рассылки</b>\n\n"
-        f"📊 Параметры:\n"
-        f"  Групп к отправке: <b>{len(groups)}</b>\n"
-        f"  Расписание: включено\n\n"
-        f"💰 Баланс постов:\n"
-        f"  Требуется для старта: {len(groups)} постов\n"
-        f"  Сейчас: {current_balance} постов\n"
-        f"  После рассылки (макс. вычет): ~{new_balance} постов\n\n"
-        f"⚠️ Точная сумма списания: только успешные публикации.\n"
-        f"Нажмите \"Подтвердить\" для начала рассылки."
+        "📣 <b>Запуск массовой рассылки</b>\n\n"
+        f"Текущий пост: <b>#{current_post_n} из {total_posts}</b>\n"
+        f"Групп в этом запуске: <b>{len(groups)}</b>\n"
+        f"Следующий пост после запуска: <b>#{next_post_n}</b>\n"
+        f"Оценка длительности: <b>{eta}</b>\n\n"
+        "⚠️ <b>Важно</b>\n"
+        "Посты отправляются по очереди, не мгновенно.\n"
+        "Интервал 5–10 сек между группами для снижения риска блокировок Telegram.\n\n"
+        f"💰 Баланс: <b>{current_balance}</b> постов\n"
+        "Списание: только за успешные публикации.\n\n"
+        "Запустить рассылку?"
     )
 
-    # Create confirmation keyboard with proceed and cancel buttons
     confirm_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="bc_confirm_mass")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="broadcast")],
+        [InlineKeyboardButton(text="✅ Запустить", callback_data="bc_confirm_mass")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ])
 
     await query.message.edit_text(
@@ -4629,12 +4803,12 @@ async def broadcast_mass(query: CallbackQuery):
 @dp.callback_query(F.data == "bc_confirm_mass")
 async def broadcast_confirm_mass(query: CallbackQuery):
     """Execute mass broadcast after confirmation."""
-    if broadcast_lock.locked():
+    user_id = query.from_user.id
+    user_lock = _broadcast_lock_for(user_id)
+    bm = scoped_broadcast_manager(user_id)
+    if user_lock.locked() or _get_active_run_if_any(bm) is not None:
         await query.answer("Рассылка уже выполняется.", show_alert=True)
         return
-
-    user_id = query.from_user.id
-    bm = scoped_broadcast_manager(user_id)
     balance_mgr = scoped_balance_manager(user_id)
     balance_before = balance_mgr.get_balance()
     groups_all = scoped_load_broadcast_groups(user_id)
@@ -4658,15 +4832,23 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         await query.answer("Нет активных групп.", show_alert=True)
         return
 
+    current_post_n, total_posts, _ = _rotation_info(state)
+
     await query.message.edit_text(
         "📢 <b>РАССЫЛКА В ПРОЦЕССЕ</b>\n\n"
-        f"Всего групп: <b>{len(groups)}</b>\n"
-        "⏳ Отправляю сообщения...\n"
-        "Не закрывайте чат!",
+        f"Текущий пост: <b>#{current_post_n} из {total_posts}</b>\n"
+        f"Всего групп: <b>{len(groups)}</b>\n\n"
+        "⚠️ Посты отправляются по очереди, не мгновенно.\n"
+        "Интервал 5–10 сек между группами для снижения риска блокировок Telegram.\n\n"
+        "Обработано: <b>0</b>\n"
+        "✅ Успешно: <b>0</b>\n"
+        "❌ Ошибки: <b>0</b>\n"
+        f"Примерно осталось: <b>{_format_eta_range_seconds(len(groups) * 5, len(groups) * 10)}</b>\n\n"
+        "Не закрывайте чат.",
         parse_mode="HTML",
     )
 
-    async with broadcast_lock:
+    async with user_lock:
         # Re-check inside the lock to protect from double-click races.
         if not balance_mgr.check_sufficient(len(groups)):
             await query.message.edit_text(
@@ -4679,7 +4861,73 @@ async def broadcast_confirm_mass(query: CallbackQuery):
             )
             await query.answer()
             return
-        result = await execute_broadcast(user_id, groups, advance_rotation=True)
+
+        # Mark run as active in persistent state (survives restarts).
+        current_post_n, total_posts, _ = _rotation_info(state)
+        bm.begin_run(
+            kind="manual",
+            groups_total=len(groups),
+            post_index=current_post_n,
+            post_total=total_posts,
+        )
+
+        loop = asyncio.get_running_loop()
+        last_edit_ts = 0.0
+        last_hb_ts = 0.0
+
+        async def _progress_cb(info: dict):
+            nonlocal last_edit_ts, last_hb_ts
+            now_ts = loop.time()
+
+            # Heartbeat (persistent) to detect "stuck" runs after restarts.
+            if now_ts - last_hb_ts >= 15.0:
+                last_hb_ts = now_ts
+                try:
+                    bm.touch_heartbeat()
+                except Exception:
+                    pass
+
+            processed = int(info.get("processed", 0) or 0)
+            total = int(info.get("total", len(groups)) or len(groups))
+            sent = int(info.get("sent_count", 0) or 0)
+            errors = int(info.get("skipped_count", 0) or 0)
+
+            remaining = max(0, total - processed)
+            eta_text = _format_eta_range_seconds(remaining * 5, remaining * 10)
+
+            if processed < total and (now_ts - last_edit_ts) < 4.0:
+                return
+            last_edit_ts = now_ts
+
+            text = (
+                "📢 <b>РАССЫЛКА В ПРОЦЕССЕ</b>\n\n"
+                f"Текущий пост: <b>#{current_post_n} из {total_posts}</b>\n"
+                f"Всего групп: <b>{total}</b>\n\n"
+                "⚠️ Посты отправляются по очереди, не мгновенно.\n"
+                "Интервал 5–10 сек между группами для снижения риска блокировок Telegram.\n\n"
+                f"Обработано: <b>{processed} из {total}</b>\n"
+                f"✅ Успешно: <b>{sent}</b>\n"
+                f"❌ Ошибки: <b>{errors}</b>\n"
+                f"Примерно осталось: <b>{eta_text}</b>\n\n"
+                "Не закрывайте чат."
+            )
+            try:
+                await query.message.edit_text(text, parse_mode="HTML")
+            except Exception:
+                pass
+
+        try:
+            result = await execute_broadcast(
+                user_id,
+                groups,
+                advance_rotation=True,
+                progress_callback=_progress_cb,
+            )
+        finally:
+            try:
+                bm.touch_heartbeat()
+            except Exception:
+                pass
         blocked_groups = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
         for group, err in blocked_groups.items():
             bm.set_group_blocked(group, err)
@@ -4697,6 +4945,25 @@ async def broadcast_confirm_mass(query: CallbackQuery):
             # Set started_at on first successful launch (idempotent)
             bm.set_started_at()
 
+        # Persist last run details for "Publications" screen.
+        after_state = bm.load()
+        next_post_for_user, total_posts_after, _ = _rotation_info(after_state)
+        failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+        bm.end_run(
+            kind="manual",
+            ok=bool(result.get("ok")),
+            summary=str(result.get("summary", "")),
+            groups_total=len(groups),
+            sent_count=sent_count,
+            blocked_count=len(blocked_groups),
+            failed_count=len(failed_groups),
+            spent_posts=sent_count,
+            post_index=current_post_n,
+            post_total=total_posts,
+            next_post_index=next_post_for_user if next_post_for_user else None,
+            sent_message_ids=result.get("sent_message_ids", {}),
+        )
+
     # Get updated balance
     balance_after = balance_mgr.get_balance()
     failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
@@ -4705,16 +4972,13 @@ async def broadcast_confirm_mass(query: CallbackQuery):
 
     result_text = (
         "✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
-        "📊 <b>СТАТИСТИКА:</b>\n"
-        f"├─ Всего групп: {len(groups)}\n"
-        f"├─ ✅ Успешно: {sent_count}\n"
-        f"├─ ⚠️ Забаны: {blocked_count}\n"
-        f"└─ ❌ Другие ошибки: {failed_count}\n\n"
-        "💳 <b>ЗАТРАТЫ:</b>\n"
-        f"├─ Потрачено: {sent_count} постов (за успешные)\n"
-        f"├─ Баланс было: {balance_before} постов\n"
-        f"└─ Баланс сейчас: {balance_after} постов\n\n"
-        "✅ Платите только за успешные!"
+        f"Текущий пост: <b>#{current_post_n} из {total_posts}</b>\n"
+        f"Успешно: <b>{sent_count} из {len(groups)}</b>\n"
+        f"Ошибки: <b>{len(groups) - sent_count}</b>\n"
+        f"Списано: <b>{sent_count}</b> поста(ов)\n"
+        f"Следующий пост: <b>#{next_post_for_user} из {total_posts_after}</b>\n\n"
+        f"Баланс было: <b>{balance_before}</b>\n"
+        f"Баланс сейчас: <b>{balance_after}</b>"
     )
 
     if not spend_ok and sent_count > 0:
@@ -4728,11 +4992,100 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         if blocked_count > len(shown):
             result_text += "• ...\n"
 
-    state = bm.load()
     await query.message.edit_text(
         result_text,
         parse_mode="HTML",
-        reply_markup=broadcast_main_keyboard(state, user_id=user_id),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Посмотреть публикации", callback_data="bc_publications")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_publications")
+async def broadcast_publications(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
+    runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+    last_run = runtime.get("last_run", {}) if isinstance(runtime.get("last_run", {}), dict) else {}
+    sent_ids = last_run.get("sent_message_ids", {}) if isinstance(last_run.get("sent_message_ids", {}), dict) else {}
+
+    lines: list[str] = []
+    for i, (group, mid) in enumerate(list(sent_ids.items()), start=1):
+        try:
+            mid_int = int(mid)
+        except Exception:
+            mid_int = None
+        ref = format_group_ref(str(group))
+        link = _public_group_link(str(group), mid_int)
+        if link:
+            lines.append(f"{i}) {ref} -> {link}")
+        else:
+            lines.append(f"{i}) {ref} -> link недоступен (приватный чат)")
+
+    if not lines:
+        text = (
+            "📄 <b>Публикации</b>\n\n"
+            "Нет данных о публикациях для последнего запуска.\n"
+            "Запустите массовую рассылку, чтобы появились ссылки."
+        )
+    else:
+        text = "📄 <b>Публикации</b>\n\n" + "\n".join(lines)
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_last_run")],
+        ]),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_last_run")
+async def broadcast_last_run(query: CallbackQuery):
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
+    runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+    last_run = runtime.get("last_run", {}) if isinstance(runtime.get("last_run", {}), dict) else {}
+    if not last_run:
+        await query.message.edit_text(
+            broadcast_summary_text(state, user_id=user_id, groups=scoped_load_broadcast_groups(user_id)),
+            parse_mode="HTML",
+            reply_markup=broadcast_main_keyboard(state, user_id=user_id),
+        )
+        await query.answer()
+        return
+
+    ok = bool(last_run.get("ok"))
+    title = "✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>" if ok else "❌ <b>РАССЫЛКА НЕ УДАЛАСЬ</b>"
+    groups_total = int(last_run.get("groups_total", 0) or 0)
+    sent_count = int(last_run.get("sent_count", 0) or 0)
+    spent_posts = int(last_run.get("spent_posts", 0) or 0)
+    post_index = int(last_run.get("post_index", 0) or 0)
+    post_total = int(last_run.get("post_total", 0) or 0)
+    next_post_index = int(last_run.get("next_post_index", 0) or 0)
+
+    text = (
+        f"{title}\n\n"
+        f"Текущий пост: <b>#{post_index} из {post_total}</b>\n"
+        f"Успешно: <b>{sent_count} из {groups_total}</b>\n"
+        f"Ошибки: <b>{max(0, groups_total - sent_count)}</b>\n"
+        f"Списано: <b>{spent_posts}</b> поста(ов)\n"
+        f"Следующий пост: <b>#{next_post_index} из {post_total}</b>"
+    )
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Посмотреть публикации", callback_data="bc_publications")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        ]),
     )
     await query.answer()
 
