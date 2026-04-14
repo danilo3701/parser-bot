@@ -48,6 +48,46 @@ def _is_hard_permission_reason(reason: str) -> bool:
     return reason in {"not_participant", "restricted", "admin_required", "resolve_failed"}
 
 
+async def _message_sender_meta(message) -> dict[str, str | int]:
+    """
+    Extract lightweight sender metadata from a Telethon Message.
+    """
+    sender_kind = "unknown"
+    sender_id = getattr(message, "sender_id", None)
+    from_id = getattr(message, "from_id", None)
+    from_id_class = type(from_id).__name__ if from_id is not None else ""
+    if getattr(message, "post", False) or from_id_class == "PeerChannel":
+        sender_kind = "channel"
+    elif sender_id is not None:
+        sender_kind = "user"
+
+    meta: dict[str, str | int] = {"kind": sender_kind}
+    if isinstance(sender_id, int):
+        meta["id"] = sender_id
+
+    try:
+        sender = await message.get_sender()
+    except Exception:
+        sender = None
+
+    if sender is not None:
+        username = getattr(sender, "username", None)
+        title = getattr(sender, "title", None)
+        first_name = getattr(sender, "first_name", None)
+        last_name = getattr(sender, "last_name", None)
+        if username:
+            meta["username"] = f"@{username}"
+        if title:
+            meta["title"] = str(title)
+        full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+        if full_name:
+            meta["title"] = full_name
+        if isinstance(getattr(sender, "id", None), int):
+            meta["id"] = int(getattr(sender, "id"))
+
+    return meta
+
+
 def _as_entity_ref(value: str | int | None):
     """
     Best-effort conversion of a group/channel reference into something Telethon can resolve.
@@ -93,6 +133,7 @@ async def send_broadcast_campaign_with_client(
         "skipped_groups": {},
         "failed_groups": {},
         "sent_message_ids": {},
+        "sent_senders": {},
         "send_errors": {},
         "summary": "",
         "account": "connected",
@@ -149,6 +190,8 @@ async def send_broadcast_campaign_with_client(
                 )
                 sent = True
                 sent_message_id = getattr(sent_msg, "id", None)
+                if sent_msg is not None:
+                    result["sent_senders"][group] = await _message_sender_meta(sent_msg)
             elif as_copy:
                 kwargs = {"as_copy": True}
                 if send_as_entity is not None:
@@ -194,6 +237,8 @@ async def send_broadcast_campaign_with_client(
                     )
                     sent = True
                     sent_message_id = getattr(sent_msg, "id", None)
+                    if sent_msg is not None:
+                        result["sent_senders"][group] = await _message_sender_meta(sent_msg)
                 else:
                     kwargs = {"as_copy": True}
                     if send_as_entity is not None:

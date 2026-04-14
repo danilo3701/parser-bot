@@ -162,6 +162,11 @@ class BroadcastManager:
         campaign.setdefault("readiness_problem_count", 0)
         campaign.setdefault("readiness_mode_snapshot", {})
         campaign.setdefault("readiness_last_reason", "")
+        campaign.setdefault("send_mode", "user")
+        campaign.setdefault("send_as_channel", "")
+        campaign.setdefault("selected_groups", [])
+        campaign.setdefault("test_passed", False)
+        campaign.setdefault("last_test_at", None)
         return state
 
     def save(self, state: dict) -> None:

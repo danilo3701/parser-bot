@@ -511,10 +511,12 @@ def broadcast_test_intro_text() -> str:
     return (
         "🧪 <b>Перед тестом рассылки</b>\n\n"
         "Тест проверяет, в каких группах сообщение публикуется без проблем.\n"
+        "Отправка идёт от подключённого MTProto-аккаунта (не от Bot API-бота).\n"
         "Это снижает риск жалоб, ограничений и блокировки аккаунта (вплоть до 24 часов).\n\n"
         "Что делает тест:\n"
         "• отправляет тестовые сообщения в выбранные группы;\n"
         "• ждёт 60 секунд и проверяет результат;\n"
+        "• показывает ожидаемого и фактического отправителя;\n"
         "• автоматически отключает нерабочие группы;\n"
         "• показывает отчёт: сколько прошло и сколько отключено.\n\n"
         "После успешного теста можно безопаснее запускать массовую рассылку."
@@ -741,6 +743,7 @@ def _readiness_reason_human(reason_code: str) -> str:
         "not_connected": "Аккаунт не подключен.",
         "no_groups_selected": "Не выбраны группы рассылки.",
         "group_issues": "Есть группы с ограничениями на отправку.",
+        "send_as_rights_missing": "Для send-as канала не хватает прав (отправка/редактирование/удаление).",
     }
     return mapping.get(reason_code, "Требуется обновить готовность.")
 
@@ -784,6 +787,7 @@ def broadcast_launch_text(state: dict, *, user_id: int, notice: str | None = Non
         f"2) Тест: {s2}",
         f"3) Запуск: {s3}",
         "",
+        "Отправка идёт от подключённого MTProto-аккаунта.",
         f"Статус: {_launch_block_reason(state, steps)}",
     ]
     if notice:
@@ -884,11 +888,14 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
             active_days.append(f"{WEEKDAY_NAMES.get(wd, wd)} {meta.get('time')}")
     weekly_label = ", ".join(active_days) if active_days else "не настроено"
 
+    channels_total = len(state.get("send_as_channels", [])) if isinstance(state.get("send_as_channels", []), list) else 0
     if send_mode == "user":
         mode_label = "🧑 От пользователя"
+        mode_hint = "send-as каналы не применяются в этом режиме"
     else:
         channel = campaign.get("send_as_channel", "не выбран")
         mode_label = f"📢 От канала: {channel}"
+        mode_hint = f"всего send-as каналов: {channels_total} (используется один активный)"
 
     if user_id is not None and not is_owner(user_id):
         meta = get_account(user_id)
@@ -947,31 +954,32 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
     # 3-state status indicator: not launched / active / paused
     started_at = schedule.get("started_at")
     if not started_at:
-        status_indicator = "⚪️ Рассылка не запущена"
+        status_label = "не запущена"
     elif schedule.get("enabled", True):
-        status_indicator = "✅ Рассылка активна"
+        status_label = "активна"
     else:
-        status_indicator = "⏸ Рассылка приостановлена"
+        status_label = "приостановлена"
 
     return (
         step_progress +
-        f"{status_indicator}\n\n"
-        "📣 <b>Рассылка</b>\n\n"
+        "📣 <b>РАССЫЛКА</b>\n\n"
+        f"Статус: <b>{status_label}</b>\n"
         f"Аккаунт: <b>{account_label}</b>\n"
         f"Режим: <b>{mode_label}</b>\n"
-        f"Постов в пуле: <b>{len(posts)}</b>{next_post_label}\n"
-        f"Выбрано групп: <b>{len(selected_groups)}</b>\n"
-        f"Недоступных групп: <b>{blocked_count}</b>\n"
+        f"<i>{mode_hint}</i>\n"
+        f"Постов: <b>{len(posts)}</b>{next_post_label}\n"
+        f"Групп: <b>{len(selected_groups)}</b> (недоступно: {blocked_count})\n"
         f"Тест: <b>{test_status}</b>{last_test_label}\n\n"
         f"Расписание: <b>{schedule_status}</b>\n"
-        f"TZ: <b>{_tz_label(tz)}</b>\n"
-        f"Неделя: <b>{weekly_label}</b>"
+        f"TZ: {_tz_label(tz)}\n"
+        f"Старт: <b>{weekly_label}</b>"
     )
 
 
 def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarkup:
     campaign = state.get("campaign", {})
     send_mode = campaign.get("send_mode", "user")
+    active_send_as = (campaign.get("send_as_channel") or "").strip()
     posts = campaign.get("posts", []) if isinstance(campaign.get("posts", []), list) else []
     schedule_enabled = state.get("broadcast_schedule", {}).get("enabled", True)
 
@@ -981,39 +989,42 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
 
     rows = []
     # Add balance button at the top
-    rows.append([InlineKeyboardButton(text=f"💰 Баланс: {balance} постов", callback_data="bc_balance")])
+    rows.append([InlineKeyboardButton(text=f"Баланс: {balance} постов", callback_data="bc_balance")])
 
     # Add account connection button first (goes directly to warning pages)
-    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_methods")])
+    rows.append([InlineKeyboardButton(text="Подключить аккаунт", callback_data="acc_methods")])
 
-    mode_text = "🧑 Режим: от пользователя" if send_mode == "user" else "📢 Режим: от канала"
+    if send_mode == "user":
+        mode_text = "Режим: от пользователя"
+    else:
+        mode_text = f"Режим: от канала ({active_send_as or 'не выбран'})"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
     if send_mode == "channel":
-        rows.append([InlineKeyboardButton(text="📢 Каналы send-as", callback_data="bc_channels")])
+        rows.append([InlineKeyboardButton(text="Каналы send-as", callback_data="bc_channels")])
 
-    rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
-    rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
-    rows.append([InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="bc_launch_menu")])
-    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="bc_settings")])
-    rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
+    rows.append([InlineKeyboardButton(text=f"Посты ({len(posts)}/10)", callback_data="bc_posts")])
+    rows.append([InlineKeyboardButton(text="Группы рассылки", callback_data="bc_groups")])
+    rows.append([InlineKeyboardButton(text="Запустить рассылку", callback_data="bc_launch_menu")])
+    rows.append([InlineKeyboardButton(text="Настройки", callback_data="bc_settings")])
+    rows.append([InlineKeyboardButton(text="Расписание (неделя)", callback_data="bc_schedule")])
 
     # Only render pause/resume button if broadcast was ever launched
     started_at = state.get("broadcast_schedule", {}).get("started_at")
     if started_at:
         rows.append([InlineKeyboardButton(
-            text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
+            text="Приостановить рассылку" if schedule_enabled else "Возобновить рассылку",
             callback_data="main_bc_toggle",
         )])
 
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def broadcast_channels_keyboard(state: dict) -> InlineKeyboardMarkup:
     channels = state.get("send_as_channels", [])
     selected = state.get("campaign", {}).get("send_as_channel", "")
-    buttons = []
+    buttons = [[InlineKeyboardButton(text=f"Активный: {selected or 'не выбран'}", callback_data="noop")]]
     for channel in channels:
         mark = "✅" if channel == selected else "▫️"
         buttons.append([InlineKeyboardButton(text=f"{mark} {channel}", callback_data=f"bc_set_{channel}")])
@@ -1218,29 +1229,29 @@ def broadcast_balance_text(state: dict) -> str:
     created_at = _format_iso_date_short(state.get("created_at"))
     return (
         "💰 <b>МОЙ БАЛАНС</b>\n\n"
-        f"🟢 Доступно: <b>{balance}</b> постов\n"
-        f"🛍 Всего куплено: <b>{total_purchased}</b>\n"
-        f"📤 Всего потрачено: <b>{total_spent}</b>\n"
-        f"📅 Аккаунт создан: <b>{created_at}</b>\n\n"
-        "Выберите пакет и пополните баланс:\n\n"
-        "<b>📦 Small:</b> 100 постов / €3.99 (€0.0399/пост)\n"
-        "<b>⭐ Medium:</b> 300 постов / €7.99 (€0.0266/пост, -33% 📉) — <b>Популярный!</b>\n"
-        "<b>💎 Large:</b> 1500 постов / €33.99 (€0.0226/пост, -73% 📉)\n\n"
-        "Платите только за успешные публикации."
+        f"Доступно: <b>{balance} постов</b>\n"
+        f"Куплено: {total_purchased}\n"
+        f"Потрачено: {total_spent}\n"
+        f"Создан: {created_at}\n\n"
+        "<b>Пакеты пополнения</b>\n"
+        "100 постов — €3.99\n"
+        "300 постов — <b>€7.99</b> (выгоднее)\n"
+        "1500 постов — €33.99\n\n"
+        "Оплата только за успешные публикации."
     )
 
 
 def broadcast_balance_keyboard() -> InlineKeyboardMarkup:
     """Balance menu with tariff purchase buttons."""
     buttons = [
-        [InlineKeyboardButton(text="⭐ €7.99 (300 постов)", callback_data="bc_buy_medium")],
+        [InlineKeyboardButton(text="⭐ €7.99 · 300", callback_data="bc_buy_medium")],
         [
-            InlineKeyboardButton(text="📦 €3.99 (100)", callback_data="bc_buy_small"),
-            InlineKeyboardButton(text="💎 €33.99 (1500)", callback_data="bc_buy_large"),
+            InlineKeyboardButton(text="€3.99 · 100", callback_data="bc_buy_small"),
+            InlineKeyboardButton(text="€33.99 · 1500", callback_data="bc_buy_large"),
         ],
         [
-            InlineKeyboardButton(text="📜 История", callback_data="bc_balance_history"),
-            InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast"),
+            InlineKeyboardButton(text="История", callback_data="bc_balance_history"),
+            InlineKeyboardButton(text="Назад", callback_data="broadcast"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1349,6 +1360,27 @@ def _format_test_group_label(group: str) -> str:
         return f"<code>{ref}</code>"
     slug = ref.lstrip("@")
     return f"@{slug}"
+
+
+def _sender_kind_human(kind: str) -> str:
+    return {
+        "user": "пользователь",
+        "channel": "канал",
+        "unknown": "не определён",
+    }.get(kind, "не определён")
+
+
+def _sender_meta_short(meta: dict) -> str:
+    username = str(meta.get("username") or "").strip()
+    title = str(meta.get("title") or "").strip()
+    sender_id = meta.get("id")
+    if username:
+        return username
+    if title:
+        return title
+    if isinstance(sender_id, int):
+        return f"id:{sender_id}"
+    return "без подписи"
 
 
 def broadcast_test_result_text(
@@ -1564,6 +1596,8 @@ async def execute_broadcast(
 
     if advance_rotation and result.get("sent_count", 0) > 0:
         mgr.advance_rotation_if_sent()
+    result["send_mode"] = send_mode
+    result["send_as_channel_used"] = send_as or ""
     return result
 
 
@@ -1936,18 +1970,11 @@ async def broadcast_launch_step_ready(query: CallbackQuery):
         return
 
     problems: list[tuple[str, str]] = []
-    send_as_status = "ok"
-    if send_mode == "channel":
-        if not send_as_channel:
-            send_as_status = "send_as_missing"
-        else:
-            try:
-                ent = await client.get_entity(send_as_channel)
-                ok_send_as, reason = await _telethon_can_send_to_entity(client, ent)
-                if not ok_send_as:
-                    send_as_status = "send_as_no_access" if reason in ("not_participant", "admin_required", "resolve_failed") else reason
-            except Exception:
-                send_as_status = "send_as_no_access"
+    send_as_status, _ = await _check_send_as_for_mode(
+        client,
+        send_mode=send_mode,
+        send_as_channel=send_as_channel,
+    )
 
     for group in selected_groups:
         try:
@@ -2045,6 +2072,7 @@ def _readiness_reason_label(code: str) -> str:
         "not_connected": "❌ Аккаунт не подключен",
         "send_as_missing": "❌ Не выбран send-as канал",
         "send_as_no_access": "❌ Нет доступа к send-as каналу",
+        "send_as_rights_missing": "❌ Не хватает прав send-as (post/edit/delete)",
         "resolve_failed": "❌ Не найден/не доступен",
         "not_participant": "🚫 Не участник",
         "restricted": "🚫 Ограничен на отправку",
@@ -2073,7 +2101,8 @@ async def _telethon_can_send_to_entity(client, entity) -> tuple[bool, str]:
     if banned and getattr(banned, "send_messages", False):
         return False, "restricted"
 
-    # Для каналов (broadcast=True) нужно право постинга (обычно админ)
+    # Для каналов (broadcast=True) здесь проверяем только базовый доступ к постингу.
+    # Подробные права send-as (post/edit/delete) проверяются отдельно в _telethon_send_as_rights.
     is_channel = bool(getattr(entity, "broadcast", False))
     if is_channel:
         if getattr(perms, "is_creator", False):
@@ -2087,6 +2116,83 @@ async def _telethon_can_send_to_entity(client, entity) -> tuple[bool, str]:
 
     # Для обычных групп/супергрупп считаем ок, если не забанен
     return True, "ok"
+
+
+def _send_as_rights_text(rights: dict[str, bool]) -> str:
+    return (
+        "\nПрава send-as:\n"
+        f"• отправка: {'✅' if rights.get('can_post') else '❌'}\n"
+        f"• редактирование: {'✅' if rights.get('can_edit') else '❌'}\n"
+        f"• удаление: {'✅' if rights.get('can_delete') else '❌'}"
+    )
+
+
+def _missing_send_as_rights(rights: dict[str, bool]) -> list[str]:
+    missing = []
+    if not rights.get("can_post"):
+        missing.append("отправка")
+    if not rights.get("can_edit"):
+        missing.append("редактирование")
+    if not rights.get("can_delete"):
+        missing.append("удаление")
+    return missing
+
+
+async def _telethon_send_as_rights(client, entity) -> tuple[bool, str, dict[str, bool]]:
+    import telethon.errors
+
+    rights = {"can_post": False, "can_edit": False, "can_delete": False}
+    try:
+        perms = await client.get_permissions(entity, "me")
+    except telethon.errors.UserNotParticipantError:
+        return False, "not_participant", rights
+    except Exception:
+        return False, "resolve_failed", rights
+
+    banned = getattr(perms, "banned_rights", None)
+    if banned and getattr(banned, "send_messages", False):
+        return False, "restricted", rights
+
+    if getattr(perms, "is_creator", False):
+        rights = {"can_post": True, "can_edit": True, "can_delete": True}
+        return True, "ok", rights
+
+    admin_rights = getattr(perms, "admin_rights", None)
+    is_channel = bool(getattr(entity, "broadcast", False))
+    if is_channel and not getattr(perms, "is_admin", False):
+        return False, "admin_required", rights
+
+    rights = {
+        "can_post": bool(admin_rights and getattr(admin_rights, "post_messages", False)) if is_channel else True,
+        "can_edit": bool(admin_rights and getattr(admin_rights, "edit_messages", False)),
+        "can_delete": bool(admin_rights and getattr(admin_rights, "delete_messages", False)),
+    }
+    if all(rights.values()):
+        return True, "ok", rights
+    return False, "send_as_rights_missing", rights
+
+
+async def _check_send_as_for_mode(client, *, send_mode: str, send_as_channel: str) -> tuple[str, dict[str, bool]]:
+    rights = {"can_post": False, "can_edit": False, "can_delete": False}
+    if send_mode != "channel":
+        return "ok", rights
+    if not send_as_channel:
+        return "send_as_missing", rights
+    try:
+        ent = await client.get_entity(send_as_channel)
+    except Exception:
+        return "send_as_no_access", rights
+
+    ok_send_as, reason = await _telethon_can_send_to_entity(client, ent)
+    if not ok_send_as:
+        status = "send_as_no_access" if reason in ("not_participant", "admin_required", "resolve_failed") else reason
+        return status, rights
+
+    ok_rights, rights_reason, rights = await _telethon_send_as_rights(client, ent)
+    if not ok_rights:
+        status = "send_as_no_access" if rights_reason in ("not_participant", "admin_required", "resolve_failed") else rights_reason
+        return status, rights
+    return "ok", rights
 
 
 async def _readiness_check_connected_account(user_id: int) -> tuple[bool, str, object | None, str]:
@@ -2167,21 +2273,22 @@ async def broadcast_readiness(query: CallbackQuery):
 
     # Check send-as channel if needed
     send_as_status = "ok"
+    send_as_rights = {"can_post": False, "can_edit": False, "can_delete": False}
     send_as_note = ""
     if send_mode == "channel":
-        if not send_as_channel:
-            send_as_status = "send_as_missing"
-        else:
-            try:
-                ent = await client.get_entity(send_as_channel)
-                ok_send_as, reason = await _telethon_can_send_to_entity(client, ent)
-                if not ok_send_as:
-                    send_as_status = "send_as_no_access" if reason in ("not_participant", "admin_required", "resolve_failed") else reason
-            except Exception:
-                send_as_status = "send_as_no_access"
-
-        if send_as_status != "ok":
-            send_as_note = f"\n{_readiness_reason_label(send_as_status)}: <code>{send_as_channel or 'не выбран'}</code>"
+        send_as_status, send_as_rights = await _check_send_as_for_mode(
+            client,
+            send_mode=send_mode,
+            send_as_channel=send_as_channel,
+        )
+        send_as_note = (
+            f"\n{_readiness_reason_label(send_as_status)}: <code>{send_as_channel or 'не выбран'}</code>"
+            + _send_as_rights_text(send_as_rights)
+        )
+        if send_as_status == "send_as_rights_missing":
+            missing = _missing_send_as_rights(send_as_rights)
+            if missing:
+                send_as_note += f"\nНе хватает: <b>{', '.join(missing)}</b>"
 
     # Check each selected group
     for group in selected_groups:
@@ -2212,6 +2319,7 @@ async def broadcast_readiness(query: CallbackQuery):
     # Render summary
     lines = [
         "🧭 <b>Готовность</b>\n",
+        "Отправка выполняется подключённым <b>MTProto-аккаунтом</b> (не Bot API-ботом).",
         f"Аккаунт: <b>{who}</b>",
         f"Режим: <b>{'от канала' if send_mode == 'channel' else 'от пользователя'}</b>",
         f"Групп выбрано: <b>{len(selected_groups)}</b>",
@@ -2231,7 +2339,8 @@ async def broadcast_readiness(query: CallbackQuery):
     lines.append("\nЧто делать:")
     lines.append("- добавьте аккаунт в проблемные группы и снимите ограничения")
     if send_mode == "channel":
-        lines.append("- добавьте аккаунт админом в send-as канал и выдайте право постинга")
+        lines.append("- добавьте аккаунт админом в send-as канал")
+        lines.append("- выдайте права: отправка, редактирование и удаление сообщений")
 
     await query.message.edit_text(
         "\n".join(lines),
@@ -3344,9 +3453,16 @@ async def _start_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: b
 async def broadcast_channels(query: CallbackQuery):
     user_id = query.from_user.id
     state = scoped_broadcast_manager(user_id).load()
+    campaign = state.get("campaign", {}) if isinstance(state.get("campaign", {}), dict) else {}
+    selected = (campaign.get("send_as_channel") or "").strip()
+    selected_label = selected or "не выбран"
     await query.message.edit_text(
         "📢 <b>Каналы send-as</b>\n\n"
-        "Выберите активный канал отправки или добавьте новый.",
+        "Можно хранить несколько каналов и быстро переключаться между ними.\n"
+        "Для отправки используется только <b>один активный</b> канал.\n"
+        f"Сейчас активный: <code>{selected_label}</code>\n\n"
+        "Важно: в режиме «от канала» подключённый MTProto-аккаунт должен быть админом канала "
+        "с правами отправки, редактирования и удаления сообщений.",
         parse_mode="HTML",
         reply_markup=broadcast_channels_keyboard(state),
     )
@@ -3357,7 +3473,8 @@ async def broadcast_channels(query: CallbackQuery):
 async def broadcast_add_channel_prompt(query: CallbackQuery, state: FSMContext):
     await query.message.edit_text(
         "➕ <b>Добавить канал send-as</b>\n\n"
-        "Отправьте username канала в формате <code>@my_channel</code>.",
+        "Отправьте username канала в формате <code>@my_channel</code>.\n"
+        "Канал попадёт в список, а активный канал можно переключать кнопками.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_channels")],
@@ -3383,7 +3500,7 @@ async def broadcast_add_channel_input(message: Message, state: FSMContext):
     await state.set_state(MainMenu.viewing)
     state_data = bm.load()
     await message.answer(
-        "✅ Канал добавлен.",
+        "✅ Канал добавлен в список send-as.",
         reply_markup=broadcast_channels_keyboard(state_data),
     )
 
@@ -3400,7 +3517,7 @@ async def broadcast_set_channel(query: CallbackQuery):
     state = bm.set_send_as_channel(channel)
     state = invalidate_readiness_if_needed(bm, reason="send_as_changed")
     await query.message.edit_text(
-        "📢 <b>Каналы send-as</b>\n\nАктивный канал обновлён.",
+        f"📢 <b>Каналы send-as</b>\n\nАктивный канал обновлён: <code>{channel}</code>.",
         parse_mode="HTML",
         reply_markup=broadcast_channels_keyboard(state),
     )
@@ -4019,6 +4136,11 @@ async def _run_broadcast_test_for_groups(
     title: str = "ТЕСТИРОВАНИЕ ГРУПП",
 ) -> None:
     tested_total = len(test_groups)
+    state_now = bm.load()
+    campaign_state = state_now.get("campaign", {}) if isinstance(state_now.get("campaign", {}), dict) else {}
+    expected_sender_kind = "channel" if campaign_state.get("send_mode", "user") == "channel" else "user"
+    expected_sender_label = _sender_kind_human(expected_sender_kind)
+    expected_send_as = (campaign_state.get("send_as_channel") or "").strip()
 
     # Test broadcast is always free: no balance check, no deduction.
     balance_mgr = scoped_balance_manager(user_id)
@@ -4029,6 +4151,9 @@ async def _run_broadcast_test_for_groups(
         f"🧪 <b>{title}</b>\n\n"
         "🆓 Тест бесплатный — посты не списываются.\n"
         f"Выбрано: <b>{selected_total}</b> | К тесту: <b>{tested_total}</b>\n"
+        f"Ожидаемый отправитель: <b>{expected_sender_label}</b>"
+        + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
+        + "\n"
         f"Отправляю тестовые сообщения в <b>{tested_total}</b> групп...\n"
         "Не закрывайте чат!",
         parse_mode="HTML",
@@ -4046,6 +4171,7 @@ async def _run_broadcast_test_for_groups(
         )
 
     sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
+    sent_senders = result.get("sent_senders", {}) if isinstance(result.get("sent_senders", {}), dict) else {}
     send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
     blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
 
@@ -4089,6 +4215,42 @@ async def _run_broadcast_test_for_groups(
             failed_groups[group] = reason
 
     balance_after_test = balance_mgr.get_balance()
+    sender_counts = {"user": 0, "channel": 0, "unknown": 0}
+    mismatch_groups: list[str] = []
+    mismatch_details: list[str] = []
+    for group in working_groups:
+        meta = sent_senders.get(group, {})
+        kind = str(meta.get("kind") or "unknown")
+        if kind not in sender_counts:
+            kind = "unknown"
+        sender_counts[kind] += 1
+        if kind in {"user", "channel"} and kind != expected_sender_kind:
+            mismatch_groups.append(group)
+            mismatch_details.append(
+                f"- {_format_test_group_label(group)}: фактически <b>{_sender_kind_human(kind)}</b> ({_sender_meta_short(meta)})"
+            )
+
+    sender_diag_lines = [
+        "👤 <b>Диагностика отправителя</b>",
+        f"Ожидалось: <b>{expected_sender_label}</b>"
+        + (f" <code>{expected_send_as}</code>" if expected_sender_kind == "channel" and expected_send_as else ""),
+        (
+            "Фактически: "
+            f"пользователь <b>{sender_counts['user']}</b>, "
+            f"канал <b>{sender_counts['channel']}</b>, "
+            f"не определён <b>{sender_counts['unknown']}</b>"
+        ),
+    ]
+    if mismatch_groups:
+        sender_diag_lines.append("⚠️ Обнаружено несоответствие ожидаемому отправителю (запуск не блокируется):")
+        sender_diag_lines.extend(mismatch_details[:5])
+        if len(mismatch_details) > 5:
+            sender_diag_lines.append(f"… и ещё {len(mismatch_details) - 5}")
+    elif working_groups:
+        sender_diag_lines.append("✅ Несоответствий не найдено.")
+    else:
+        sender_diag_lines.append("ℹ️ Нет успешных отправок для проверки отправителя.")
+    sender_diag_text = "\n".join(sender_diag_lines)
 
     # Build group links section (before the wait loop, so it's static)
     MAX_LINK_GROUPS = 15
@@ -4180,6 +4342,8 @@ async def _run_broadcast_test_for_groups(
 
     full_text = (
         test_result_text
+        + "\n\n"
+        + sender_diag_text
         + "\n\n🆓 <b>Тест бесплатный:</b> потрачено 0 постов\n"
         + f"💰 <b>Баланс:</b> {balance_after_test} постов (было {balance_before_test})"
         + f"\n{cleanup_summary}"
