@@ -2007,9 +2007,8 @@ def account_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def account_methods_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Подключение по номеру телефона", callback_data="acc_phone")],
-        [InlineKeyboardButton(text="📷 Подключение по QR-коду", callback_data="acc_qr")],
-        [InlineKeyboardButton(text="🪪 Подключение по API ID / API Hash", callback_data="acc_api")],
+        [InlineKeyboardButton(text="📷 Подключение по QR-коду (15 сек)", callback_data="acc_qr")],
+        [InlineKeyboardButton(text="🪪 Подключение по API ID / API Hash (2 мин)", callback_data="acc_api")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="acc_menu")],
     ])
 
@@ -2197,9 +2196,8 @@ async def account_warning_complete(query: CallbackQuery, state: FSMContext):
     await _safe_edit_text(
         query.message,
         "🧩 <b>Выберите метод подключения аккаунта</b>\n\n"
-        "1) По номеру телефона — код придёт в Telegram\n"
-        "2) QR — отсканируйте код из Telegram\n"
-        "3) API ID/Hash — расширенный режим\n\n"
+        "1) QR — отсканируйте код из Telegram\n"
+        "2) API ID/Hash — расширенный режим\n\n"
         f"Таймаут кода: <b>{code_ttl_seconds()} сек</b> (я проверяю своим таймером).",
         reply_markup=account_methods_keyboard(),
         disable_web_page_preview=True,
