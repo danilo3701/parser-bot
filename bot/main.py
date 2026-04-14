@@ -1468,6 +1468,7 @@ def broadcast_test_result_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="🔁 Повторить тест проблемных", callback_data="bc_test_retry_failed")],
         [InlineKeyboardButton(text="🧹 Отключить заблокированные", callback_data="bc_test_disable_failed")],
+        [InlineKeyboardButton(text="🗂 Посты / заменить", callback_data="bc_posts")],
         [InlineKeyboardButton(text="➕ Добавить группы", callback_data="bc_groups")],
         [InlineKeyboardButton(text="🚀 Открыть запуск рассылки", callback_data="bc_launch_menu")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
@@ -4336,12 +4337,29 @@ async def _run_broadcast_test_for_groups(
     expected_sender_label = _sender_kind_human(expected_sender_kind)
     expected_send_as = (campaign_state.get("send_as_channel") or "").strip()
 
+    # Build group links section (static; reused in all test screens).
+    MAX_LINK_GROUPS = 30
+    groups_link_lines = []
+    for g in test_groups[:MAX_LINK_GROUPS]:
+        ref = str(g).strip()
+        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
+        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
+            groups_link_lines.append(f"• <code>{ref}</code>")
+        else:
+            slug = ref.lstrip("@")
+            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
+    extra = len(test_groups) - MAX_LINK_GROUPS
+    if extra > 0:
+        groups_link_lines.append(f"…и ещё {extra}")
+    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
+
     # Test broadcast is always free: no balance check, no deduction.
     balance_mgr = scoped_balance_manager(user_id)
     balance_before_test = balance_mgr.get_balance()
-    started_perf = asyncio.get_running_loop().time()
+    loop = asyncio.get_running_loop()
+    started_perf = loop.time()
 
-    await query.message.edit_text(
+    start_text = (
         f"🧪 <b>{title}</b>\n\n"
         "🆓 Тест бесплатный — посты не списываются.\n"
         f"Выбрано: <b>{selected_total}</b> | К тесту: <b>{tested_total}</b>\n"
@@ -4349,13 +4367,76 @@ async def _run_broadcast_test_for_groups(
         + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
         + "\n"
         f"Отправляю тестовые посты в <b>{tested_total}</b> групп...\n"
-        "Не закрывайте чат!",
+    )
+    if groups_links_text:
+        start_text += f"\n<b>Группы теста:</b>\n{groups_links_text}\n"
+    start_text += "\nНе закрывайте чат!"
+
+    await query.message.edit_text(
+        start_text,
         parse_mode="HTML",
+        disable_web_page_preview=True,
     )
     await query.answer()
 
     started_at = datetime.now(timezone.utc).isoformat()
     user_lock = _broadcast_lock_for(user_id)
+
+    ui_last_update = 0.0
+
+    async def progress_callback(info: dict) -> None:
+        nonlocal ui_last_update
+        try:
+            processed = int(info.get("processed", 0) or 0)
+        except Exception:
+            processed = 0
+        try:
+            total = int(info.get("total", tested_total) or tested_total)
+        except Exception:
+            total = tested_total
+        now = loop.time()
+        # Throttle UI updates to avoid Telegram edit flood.
+        if processed < total and (now - ui_last_update) < 2.0:
+            return
+        ui_last_update = now
+
+        elapsed_seconds = max(0, int(round(now - started_perf)))
+        sent_count = int(info.get("sent_count", 0) or 0)
+        skipped_count = int(info.get("skipped_count", 0) or 0)
+        blocked_count = int(info.get("blocked_count", 0) or 0)
+        failed_count = int(info.get("failed_count", 0) or 0)
+        group_now = str(info.get("group") or "").strip()
+        group_label = _format_test_group_label(group_now) if group_now else ""
+
+        text = (
+            f"🧪 <b>{title}</b>\n\n"
+            "🆓 Тест бесплатный — посты не списываются.\n"
+            f"⏱ Прошло: <b>{elapsed_seconds}</b> сек\n"
+            f"Проверено: <b>{processed}</b> из <b>{total}</b>\n\n"
+            f"✅ Успешно: <b>{sent_count}</b>\n"
+            f"❌ Ошибки: <b>{failed_count}</b>\n"
+            f"🚫 Заблок: <b>{blocked_count}</b>\n"
+            f"⏭ Пропущено: <b>{skipped_count}</b>\n"
+            "\n"
+            f"Ожидаемый отправитель: <b>{expected_sender_label}</b>"
+            + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
+            + "\n"
+        )
+        if group_label:
+            text += f"\nТекущая группа: {group_label}\n"
+        if groups_links_text:
+            text += f"\n<b>Группы теста:</b>\n{groups_links_text}\n"
+        text += "\nНе закрывайте чат!"
+
+        try:
+            await query.message.edit_text(
+                text,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+
     async with user_lock:
         result = await execute_broadcast(
             user_id,
@@ -4363,6 +4444,7 @@ async def _run_broadcast_test_for_groups(
             advance_rotation=False,
             is_test=True,
             test_marker="🧪",
+            progress_callback=progress_callback,
         )
 
     sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
@@ -4446,22 +4528,6 @@ async def _run_broadcast_test_for_groups(
     else:
         sender_diag_lines.append("ℹ️ Нет успешных отправок для проверки отправителя.")
     sender_diag_text = "\n".join(sender_diag_lines)
-
-    # Build group links section (before the wait loop, so it's static)
-    MAX_LINK_GROUPS = 15
-    groups_link_lines = []
-    for g in test_groups[:MAX_LINK_GROUPS]:
-        ref = str(g).strip()
-        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
-        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
-            groups_link_lines.append(f"• <code>{ref}</code>")
-        else:
-            slug = ref.lstrip("@")
-            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
-    extra = len(test_groups) - MAX_LINK_GROUPS
-    if extra > 0:
-        groups_link_lines.append(f"…и ещё {extra}")
-    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
 
     # Wait N seconds with progress updates, then verify/delete test messages.
     total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
