@@ -4055,7 +4055,16 @@ async def broadcast_groups_add_input(message: Message, state: FSMContext):
         )
         return
 
-    added = add_user_broadcast_group(user_id, ref)
+    if is_owner(user_id):
+        groups = load_groups()
+        if ref in groups:
+            added = False
+        else:
+            add_group(ref)
+            added = True
+    else:
+        added = add_user_broadcast_group(user_id, ref)
+
     if not added:
         await message.answer(
             "⚠️ <b>Уже есть в списке.</b>\n\n"
@@ -4107,7 +4116,17 @@ async def broadcast_group_delete_one(query: CallbackQuery):
     user_id = query.from_user.id
     group = query.data[len("bcgdel_"):]
     bm = scoped_broadcast_manager(user_id)
-    if delete_user_broadcast_group(user_id, group):
+    if is_owner(user_id):
+        groups = load_groups()
+        if group in groups:
+            delete_group(group)
+            deleted = True
+        else:
+            deleted = False
+    else:
+        deleted = delete_user_broadcast_group(user_id, group)
+
+    if deleted:
         bm.unselect_groups([group])
         invalidate_readiness_if_needed(bm, reason="groups_changed")
         await query.answer("✅ Удалено")
