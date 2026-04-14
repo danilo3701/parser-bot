@@ -15,6 +15,7 @@ class BroadcastManager:
 
     def _default_state(self) -> dict:
         return {
+            "scanner_session": "",
             "send_as_channels": [],
             "broadcast_groups_state": {},
             "broadcast_schedule": {
@@ -77,6 +78,7 @@ class BroadcastManager:
         state.setdefault("campaign", self._default_state()["campaign"])
         state.setdefault("broadcast_schedule", self._default_state()["broadcast_schedule"])
         state.setdefault("send_as_channels", [])
+        state.setdefault("scanner_session", "")
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
@@ -497,6 +499,20 @@ class BroadcastManager:
         self.reset_test_flag_in_state(state)
         self.save(state)
         return state
+
+    def get_scanner_session(self) -> str:
+        state = self.load()
+        value = state.get("scanner_session", "")
+        return value if isinstance(value, str) else ""
+
+    def set_scanner_session(self, session_string: str) -> dict:
+        state = self.load()
+        state["scanner_session"] = (session_string or "").strip()
+        self.save(state)
+        return state
+
+    def clear_scanner_session(self) -> dict:
+        return self.set_scanner_session("")
 
     # ─── Notifications ──────────────────────────────────────────────────────────
 

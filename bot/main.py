@@ -45,7 +45,7 @@ from categories import (
     add_subcategory,
     resolve_results_channel_for_selection,
 )
-from scanner import scan_groups_history, monitor_groups_realtime
+from scanner import scan_groups_history, monitor_groups_realtime, ScannerNeedsAuthError
 from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
@@ -332,6 +332,7 @@ current_scan_task: asyncio.Task | None = None
 current_monitor_task: asyncio.Task | None = None
 monitor_stop_event: asyncio.Event | None = None
 pending_logins: dict[int, PendingLogin] = {}
+scanner_pending_login: dict[int, PendingLogin] = {}  # For scanner Telegram auth
 
 
 # ─── Состояния ───────────────────────────────────────────────────────────────
@@ -365,6 +366,8 @@ class MainMenu(StatesGroup):
     connecting_account_api = State()        # ввод api_id (шаг 1)
     connecting_account_api_hash = State()   # ввод api_hash (шаг 2)
     connecting_account_api_phone = State()  # ввод телефона (шаг 3)
+    scanner_auth_code = State()             # ввод кода подтверждения для сканера
+    scanner_auth_password = State()         # ввод пароля 2FA для сканера
 
 
 # ─── Хелперы для клавиатур ───────────────────────────────────────────────────
@@ -1686,6 +1689,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def back_to_main(query: CallbackQuery, state: FSMContext):
     await query.answer()
     await state.set_state(MainMenu.viewing)
+    await _cleanup_scanner_pending_login(query.from_user.id)
     bm_state = scoped_broadcast_manager(query.from_user.id).load()
     schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
     cat_state = load()
@@ -2304,6 +2308,189 @@ async def _cleanup_pending_login(user_id: int) -> None:
         await pending.client.disconnect()
     except Exception:
         pass
+
+
+async def _cleanup_scanner_pending_login(user_id: int) -> None:
+    """Cleanup scanner pending login (same as broadcast account)."""
+    pending = scanner_pending_login.pop(user_id, None)
+    if not pending:
+        return
+    try:
+        await pending.client.disconnect()
+    except Exception:
+        pass
+
+
+async def _start_scanner_phone_login(message: Message, state: FSMContext, *, phone: str) -> None:
+    """Start scanner Telegram login flow via phone."""
+    user_id = message.from_user.id
+    await _cleanup_scanner_pending_login(user_id)
+
+    from mtproto_accounts import make_client_from_string_session
+
+    client = make_client_from_string_session(API_ID, API_HASH)
+    try:
+        await client.connect()
+        await client.send_code_request(phone)
+    except Exception as exc:
+        await client.disconnect()
+        await message.answer(f"❌ Ошибка отправки кода: {type(exc).__name__}", reply_markup=back_button())
+        return
+
+    pending = new_pending_login(method="phone", api_id=API_ID, api_hash=API_HASH, phone=phone, client=client)
+    scanner_pending_login[user_id] = pending
+    await state.set_state(MainMenu.scanner_auth_code)
+    await message.answer(
+        "📱 <b>Telegram прислал код подтверждения</b>\n\n"
+        "Введите код (обычно 5 цифр), пример: <code>12345</code>\n\n"
+        "⚠️ <b>Важно:</b> читайте код из <b>уведомления</b> (не открывая чат Telegram). "
+        "Если вы откроете сообщение в приложении — код сразу истечёт.\n\n"
+        f"Я жду код <b>{code_ttl_seconds()} сек</b>, потом попрошу запросить заново.",
+        parse_mode="HTML",
+        reply_markup=back_button(),
+    )
+
+
+@dp.message(MainMenu.scanner_auth_code)
+async def scanner_auth_code_input(message: Message, state: FSMContext):
+    """Handle scanner auth code input."""
+    import telethon.errors
+
+    user_id = message.from_user.id
+    pending = scanner_pending_login.get(user_id)
+    if not pending:
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Нет активного подключения.", reply_markup=back_button())
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_scanner_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Таймаут. Попробуйте сканирование заново.", reply_markup=back_button())
+        return
+
+    code = "".join(ch for ch in (message.text or "") if ch.isdigit())
+    if len(code) < 4 or len(code) > 8:
+        await message.answer("❌ Введите только цифры, например <code>12345</code>.", parse_mode="HTML", reply_markup=back_button())
+        return
+
+    try:
+        await pending.client.sign_in(phone=pending.phone, code=code)
+    except telethon.errors.SessionPasswordNeededError:
+        await state.set_state(MainMenu.scanner_auth_password)
+        await message.answer("🔐 Включена 2FA. Введите пароль:", reply_markup=back_button())
+        return
+    except telethon.errors.PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуйте ещё раз.", reply_markup=back_button())
+        return
+    except telethon.errors.PhoneCodeExpiredError:
+        await _cleanup_scanner_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Код истёк. Попробуйте сканирование заново.", reply_markup=back_button())
+        return
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка авторизации: {type(exc).__name__}", reply_markup=back_button())
+        return
+
+    await _finalize_scanner_login(message, state, user_id=user_id, phone=pending.phone)
+
+
+@dp.message(MainMenu.scanner_auth_password)
+async def scanner_auth_password_input(message: Message, state: FSMContext):
+    """Handle scanner 2FA password input."""
+    import telethon.errors
+
+    user_id = message.from_user.id
+    pending = scanner_pending_login.get(user_id)
+    if not pending:
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Нет активного подключения.", reply_markup=back_button())
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_scanner_pending_login(user_id)
+        await state.set_state(MainMenu.viewing)
+        await message.answer("❌ Таймаут. Попробуйте сканирование заново.", reply_markup=back_button())
+        return
+
+    password = (message.text or "").strip()
+    if not password:
+        await message.answer("❌ Пароль пуст.", reply_markup=back_button())
+        return
+
+    try:
+        await pending.client.sign_in(password=password)
+    except telethon.errors.PasswordHashInvalidError:
+        await message.answer("❌ Неверный пароль. Попробуйте ещё раз.", reply_markup=back_button())
+        return
+    except Exception as exc:
+        await message.answer(f"❌ Ошибка 2FA: {type(exc).__name__}", reply_markup=back_button())
+        return
+
+    await _finalize_scanner_login(message, state, user_id=user_id, phone=pending.phone)
+
+
+async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_id: int, phone: str) -> None:
+    """Finalize scanner login and save session, then resume scan."""
+    from mtproto_accounts import extract_session_string
+
+    pending = scanner_pending_login.get(user_id)
+    if not pending:
+        return
+
+    # Save the session string for future use
+    session_string = extract_session_string(pending.client)
+    scoped_broadcast_manager(user_id).set_scanner_session(session_string)
+
+    await _cleanup_scanner_pending_login(user_id)
+
+    # Get saved scan parameters and resume
+    data = await state.get_data()
+    await state.set_state(MainMenu.viewing)
+
+    await message.answer("✅ Авторизация прошла успешно!", reply_markup=back_button())
+
+    # Resume scan if we have the parameters
+    if data.get("scan_days") and data.get("scan_direction") and data.get("scan_keywords"):
+        await message.answer("⏳ Запускаю сканирование...", reply_markup=back_button())
+        await asyncio.sleep(1)  # Small delay to avoid rate limiting
+
+        try:
+            count, processed, skipped = await scan_groups_history(
+                days=data.get("scan_days", 30),
+                keywords=data.get("scan_keywords", []),
+                anti_keywords=load_anti_keywords(),
+                results_channel=data.get("scan_results_channel"),
+                include_source_header=data.get("scan_include_source_header", False),
+                session_path=SESSION_PATH,
+                session_string=session_string,  # Use the newly authenticated session
+            )
+
+            if isinstance(skipped, str):  # Error
+                await message.answer(
+                    f"❌ <b>Ошибка при сканировании</b>\n\n{skipped}",
+                    parse_mode="HTML",
+                    reply_markup=back_button()
+                )
+            else:
+                direction = get_directions(load()).get(data.get("scan_direction", ""), {})
+                direction_name = direction.get("name", "Сканирование")
+                await message.answer(
+                    f"✅ <b>Сканирование завершено!</b>\n\n"
+                    f"📂 Направление: {direction_name}\n"
+                    f"🎯 Найдено: <b>{count}</b> совпадений\n"
+                    f"📅 Период: {data.get('scan_days', 30)} дней\n\n"
+                    f"🔑 Ключевых слов использовано: <b>{len(data.get('scan_keywords', []))}</b>",
+                    parse_mode="HTML",
+                    reply_markup=back_button()
+                )
+        except Exception as e:
+            print(f"Ошибка при возобновлении сканирования: {e}")
+            await message.answer(
+                f"❌ <b>Ошибка при сканировании</b>\n\n{str(e)}",
+                parse_mode="HTML",
+                reply_markup=back_button()
+            )
 
 
 async def _safe_edit_text(msg: Message, text: str, *, parse_mode: str = "HTML", reply_markup=None, disable_web_page_preview: bool = False) -> None:
@@ -4540,7 +4727,18 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
     )
     await query.answer()
 
+    # Save scan parameters to FSM data for potential resume after auth
+    await state.update_data(
+        scan_days=days,
+        scan_direction=dir_id,
+        scan_keywords=keywords,
+        scan_results_channel=results_channel,
+        scan_include_source_header=should_include_source_header(results_channel),
+        scan_message_id=query.message.message_id,
+    )
+
     try:
+        scanner_session = scoped_broadcast_manager(query.from_user.id).get_scanner_session()
         # Запускаем сканирование как отдельную задачу для возможности отмены
         current_scan_task = asyncio.create_task(scan_groups_history(
             days=days,
@@ -4549,6 +4747,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
             results_channel=results_channel,
             include_source_header=should_include_source_header(results_channel),
             session_path=SESSION_PATH,
+            session_string=scanner_session,
         ))
         count, processed, skipped = await current_scan_task
 
@@ -4570,6 +4769,10 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
             parse_mode="HTML",
             reply_markup=back_button()
         )
+
+    except ScannerNeedsAuthError as e:
+        # Telegram login code needed for scanner
+        await _start_scanner_phone_login(query.message, state, phone=e.phone)
 
     except asyncio.CancelledError:
         await query.message.edit_text(
@@ -4642,6 +4845,7 @@ async def _monitor_runner(
     results_channel: int,
     stop_event: asyncio.Event,
     include_source_header: bool,
+    session_string: str,
 ):
     try:
         await monitor_groups_realtime(
@@ -4652,6 +4856,7 @@ async def _monitor_runner(
             session_path=SESSION_PATH,
             groups=load_groups(),
             stop_event=stop_event,
+            session_string=session_string,
         )
     except asyncio.CancelledError:
         raise
@@ -4684,6 +4889,7 @@ async def monitor_on(query: CallbackQuery):
         return
 
     monitor_stop_event = asyncio.Event()
+    scanner_session = scoped_broadcast_manager(query.from_user.id).get_scanner_session()
     current_monitor_task = asyncio.create_task(
         _monitor_runner(
             keywords=keywords,
@@ -4691,6 +4897,7 @@ async def monitor_on(query: CallbackQuery):
             results_channel=results_channel,
             stop_event=monitor_stop_event,
             include_source_header=should_include_source_header(results_channel),
+            session_string=scanner_session,
         )
     )
 

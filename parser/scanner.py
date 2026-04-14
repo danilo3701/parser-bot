@@ -13,6 +13,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 import telethon.errors
 try:
     import snowballstemmer
@@ -24,6 +25,15 @@ from groups_manager import load_groups
 from dedupe_store import DedupeStore
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+
+# ─── Custom Exceptions ───────────────────────────────────────────────────────
+
+class ScannerNeedsAuthError(Exception):
+    """Raised when scanner needs user to enter Telegram auth code via bot."""
+    def __init__(self, phone: str):
+        self.phone = phone
+        super().__init__(f"Scanner needs auth code for {phone}")
 
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
@@ -120,6 +130,7 @@ async def scan_groups_history(
     results_channel: int = None,
     include_source_header: bool = False,
     session_path: Path | str | None = None,
+    session_string: str = "",
 ) -> tuple:
     """
     Сканирует историю групп за N дней.
@@ -151,8 +162,19 @@ async def scan_groups_history(
     resolved_session = Path(session_path).resolve() if session_path else SESSION_PATH
 
     async def _start_client():
-        client = TelegramClient(str(resolved_session), API_ID, API_HASH)
-        await client.start(phone=PHONE, password=PASSWORD)
+        # Use StringSession if provided (from saved persistent session), otherwise use file session
+        if session_string:
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        else:
+            client = TelegramClient(str(resolved_session), API_ID, API_HASH)
+
+        await client.connect()
+
+        # Check if already authorized; if not, signal bot to trigger auth flow
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise ScannerNeedsAuthError(phone=PHONE)
+
         return client
 
     async def _recover_and_retry(err_msg: str):
@@ -176,6 +198,9 @@ async def scan_groups_history(
 
     try:
         client = await _start_client()
+    except ScannerNeedsAuthError as e:
+        # Signal to bot that auth is needed
+        raise e
     except sqlite3.OperationalError as e:
         if "database is locked" in str(e).lower():
             recovery = await _recover_and_retry("Ошибка авторизации: database is locked")
@@ -440,6 +465,7 @@ async def monitor_groups_realtime(
     session_path: Path | str | None = None,
     groups: list[str] | None = None,
     stop_event: asyncio.Event | None = None,
+    session_string: str = "",
 ) -> None:
     """Realtime monitor for new messages in groups with keyword matching."""
     if keywords is None:
@@ -460,8 +486,19 @@ async def monitor_groups_realtime(
     resolved_session = Path(session_path).resolve() if session_path else SESSION_PATH
 
     async def _start_client():
-        client = TelegramClient(str(resolved_session), API_ID, API_HASH)
-        await client.start(phone=PHONE, password=PASSWORD)
+        # Use StringSession if provided (from saved persistent session), otherwise use file session
+        if session_string:
+            client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+        else:
+            client = TelegramClient(str(resolved_session), API_ID, API_HASH)
+
+        await client.connect()
+
+        # Check if already authorized; if not, signal bot to trigger auth flow
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise ScannerNeedsAuthError(phone=PHONE)
+
         return client
 
     async def _recover_and_retry(err_msg: str):
@@ -483,6 +520,9 @@ async def monitor_groups_realtime(
 
     try:
         client = await _start_client()
+    except ScannerNeedsAuthError as e:
+        # Signal to bot that auth is needed
+        raise e
     except sqlite3.OperationalError as e:
         if "database is locked" in str(e).lower():
             client = await _recover_and_retry("Ошибка авторизации: database is locked")
