@@ -534,7 +534,7 @@ def broadcast_test_intro_text() -> str:
         "Отправка идёт от подключённого MTProto-аккаунта (не от Bot API-бота).\n"
         "Это снижает риск жалоб, ограничений и блокировки аккаунта (вплоть до 24 часов).\n\n"
         "Что делает тест:\n"
-        "• отправляет тестовые сообщения в выбранные группы;\n"
+        "• отправляет тестовые посты в выбранные группы;\n"
         "• ждёт 60 секунд и проверяет результат;\n"
         "• показывает ожидаемого и фактического отправителя;\n"
         "• автоматически отключает нерабочие группы;\n"
@@ -4348,7 +4348,7 @@ async def _run_broadcast_test_for_groups(
         f"Ожидаемый отправитель: <b>{expected_sender_label}</b>"
         + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
         + "\n"
-        f"Отправляю тестовые сообщения в <b>{tested_total}</b> групп...\n"
+        f"Отправляю тестовые посты в <b>{tested_total}</b> групп...\n"
         "Не закрывайте чат!",
         parse_mode="HTML",
     )
@@ -4475,7 +4475,7 @@ async def _run_broadcast_test_for_groups(
             bar = "█" * filled + "░" * (10 - filled)
             try:
                 message_text = (
-                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ СООБЩЕНИЙ</b>\n\n"
+                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ ПОСТОВ</b>\n\n"
                     f"⏳ Осталось: <b>{remaining}</b> сек\n"
                     f"<code>{bar}</code>\n\n"
                 )
@@ -4522,7 +4522,7 @@ async def _run_broadcast_test_for_groups(
                 f"(таймаут {total_seconds} сек)."
             )
     else:
-        cleanup_summary = f"🧹 <b>Удаление тест-постов:</b> тестовые сообщения не отправлены (таймаут {total_seconds} сек)."
+        cleanup_summary = f"🧹 <b>Удаление тест-постов:</b> тестовые посты не отправлены (таймаут {total_seconds} сек)."
 
     duration_seconds = max(1, int(round(asyncio.get_running_loop().time() - started_perf)))
     test_result_text = broadcast_test_result_text(

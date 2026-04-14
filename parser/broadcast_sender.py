@@ -198,20 +198,7 @@ async def send_broadcast_campaign_with_client(
         sent = False
         sent_message_id = None
         try:
-            if is_test:
-                kwargs = {"link_preview": False}
-                if send_as_entity is not None:
-                    kwargs["send_as"] = send_as_entity
-                sent_msg = await client.send_message(
-                    group_entity,
-                    f"{test_marker} Тестовое сообщение. Проверка доступа.",
-                    **kwargs,
-                )
-                sent = True
-                sent_message_id = getattr(sent_msg, "id", None)
-                if sent_msg is not None:
-                    result["sent_senders"][group] = await _message_sender_meta(sent_msg)
-            elif as_copy:
+            if as_copy:
                 kwargs = {"as_copy": True}
                 if send_as_entity is not None:
                     kwargs["send_as"] = send_as_entity
@@ -231,9 +218,12 @@ async def send_broadcast_campaign_with_client(
                         as_copy=True,
                     )
                 if isinstance(forwarded, list) and forwarded:
-                    sent_message_id = getattr(forwarded[0], "id", None)
+                    forwarded_msg = forwarded[0]
                 else:
-                    sent_message_id = getattr(forwarded, "id", None)
+                    forwarded_msg = forwarded
+                sent_message_id = getattr(forwarded_msg, "id", None)
+                if is_test and forwarded_msg is not None:
+                    result["sent_senders"][group] = await _message_sender_meta(forwarded_msg)
                 sent = True
             else:
                 kwargs = {"link_preview": False}
@@ -242,23 +232,12 @@ async def send_broadcast_campaign_with_client(
                 sent_msg = await client.send_message(group_entity, source_message, **kwargs)
                 sent = True
                 sent_message_id = getattr(sent_msg, "id", None)
+                if is_test and sent_msg is not None:
+                    result["sent_senders"][group] = await _message_sender_meta(sent_msg)
         except telethon.errors.FloodWaitError as exc:
             await asyncio.sleep(exc.seconds + 1)
             try:
-                if is_test:
-                    kwargs = {"link_preview": False}
-                    if send_as_entity is not None:
-                        kwargs["send_as"] = send_as_entity
-                    sent_msg = await client.send_message(
-                        group_entity,
-                        f"{test_marker} Тестовое сообщение. Проверка доступа.",
-                        **kwargs,
-                    )
-                    sent = True
-                    sent_message_id = getattr(sent_msg, "id", None)
-                    if sent_msg is not None:
-                        result["sent_senders"][group] = await _message_sender_meta(sent_msg)
-                else:
+                if as_copy:
                     kwargs = {"as_copy": True}
                     if send_as_entity is not None:
                         kwargs["send_as"] = send_as_entity
@@ -278,10 +257,22 @@ async def send_broadcast_campaign_with_client(
                             as_copy=True,
                         )
                     if isinstance(forwarded, list) and forwarded:
-                        sent_message_id = getattr(forwarded[0], "id", None)
+                        forwarded_msg = forwarded[0]
                     else:
-                        sent_message_id = getattr(forwarded, "id", None)
+                        forwarded_msg = forwarded
+                    sent_message_id = getattr(forwarded_msg, "id", None)
+                    if is_test and forwarded_msg is not None:
+                        result["sent_senders"][group] = await _message_sender_meta(forwarded_msg)
                     sent = True
+                else:
+                    kwargs = {"link_preview": False}
+                    if send_as_entity is not None:
+                        kwargs["send_as"] = send_as_entity
+                    sent_msg = await client.send_message(group_entity, source_message, **kwargs)
+                    sent = True
+                    sent_message_id = getattr(sent_msg, "id", None)
+                    if is_test and sent_msg is not None:
+                        result["sent_senders"][group] = await _message_sender_meta(sent_msg)
             except Exception as retry_exc:
                 reason = _normalize_reason(retry_exc)
                 if _is_hard_permission_reason(reason):
