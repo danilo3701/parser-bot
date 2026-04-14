@@ -210,17 +210,18 @@ async def send_broadcast_campaign_with_client(
                         **kwargs,
                     )
                 except TypeError:
-                    # Older Telethon builds may not support send_as/as_copy in forward_messages
-                    forwarded = await client.forward_messages(
-                        entity=group_entity,
-                        messages=[source_message_id],
-                        from_peer=source_entity,
-                        as_copy=True,
-                    )
-                if isinstance(forwarded, list) and forwarded:
-                    forwarded_msg = forwarded[0]
+                    # Compatibility fallback for Telethon signature mismatches:
+                    # send the same source message content directly.
+                    send_kwargs = {"link_preview": False}
+                    if send_as_entity is not None:
+                        send_kwargs["send_as"] = send_as_entity
+                    sent_msg = await client.send_message(group_entity, source_message, **send_kwargs)
+                    forwarded_msg = sent_msg
                 else:
-                    forwarded_msg = forwarded
+                    if isinstance(forwarded, list) and forwarded:
+                        forwarded_msg = forwarded[0]
+                    else:
+                        forwarded_msg = forwarded
                 sent_message_id = getattr(forwarded_msg, "id", None)
                 if is_test and forwarded_msg is not None:
                     result["sent_senders"][group] = await _message_sender_meta(forwarded_msg)
@@ -249,17 +250,16 @@ async def send_broadcast_campaign_with_client(
                             **kwargs,
                         )
                     except TypeError:
-                        # Older Telethon builds may not support send_as/as_copy in forward_messages
-                        forwarded = await client.forward_messages(
-                            entity=group_entity,
-                            messages=[source_message_id],
-                            from_peer=source_entity,
-                            as_copy=True,
-                        )
-                    if isinstance(forwarded, list) and forwarded:
-                        forwarded_msg = forwarded[0]
+                        send_kwargs = {"link_preview": False}
+                        if send_as_entity is not None:
+                            send_kwargs["send_as"] = send_as_entity
+                        sent_msg = await client.send_message(group_entity, source_message, **send_kwargs)
+                        forwarded_msg = sent_msg
                     else:
-                        forwarded_msg = forwarded
+                        if isinstance(forwarded, list) and forwarded:
+                            forwarded_msg = forwarded[0]
+                        else:
+                            forwarded_msg = forwarded
                     sent_message_id = getattr(forwarded_msg, "id", None)
                     if is_test and forwarded_msg is not None:
                         result["sent_senders"][group] = await _message_sender_meta(forwarded_msg)
