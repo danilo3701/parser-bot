@@ -871,7 +871,7 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
             if test_reason in {"invalid_last_test_at", "missing_last_test_at"}:
                 last_test_label = " (время теста не определено)"
     schedule_status = "включено" if schedule.get("enabled", True) else "выключено"
-    tz = schedule.get("tz", BROADCAST_TZ)
+    tz = _effective_tz(int(user_id), state) if user_id is not None else schedule.get("tz", BROADCAST_TZ)
 
     weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
     active_days = []
@@ -954,7 +954,7 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
         f"Недоступных групп: <b>{blocked_count}</b>\n"
         f"Тест: <b>{test_status}</b>{last_test_label}\n\n"
         f"Расписание: <b>{schedule_status}</b>\n"
-        f"TZ: <b>{tz}</b>\n"
+        f"TZ: <b>{_tz_label(tz)}</b>\n"
         f"Неделя: <b>{weekly_label}</b>"
     )
 
@@ -1532,8 +1532,12 @@ async def scheduler_loop():
                 if not schedule.get("enabled", True):
                     continue
 
-                tz_name = schedule.get("tz", BROADCAST_TZ)
-                now_local = datetime.now(ZoneInfo(tz_name))
+                tz_name = _effective_tz(user_id, state)
+                try:
+                    now_local = datetime.now(ZoneInfo(tz_name))
+                except Exception:
+                    tz_name = DEFAULT_TZ
+                    now_local = datetime.now(ZoneInfo(tz_name))
                 date_str = now_local.strftime("%Y-%m-%d")
 
                 weekday = WEEKDAYS[now_local.weekday()]
@@ -4726,6 +4730,120 @@ async def settings_callback(query: CallbackQuery):
         reply_markup=settings_keyboard(user_id=user_id)
     )
     await query.answer()
+
+
+async def _render_tz_back(query: CallbackQuery, state: FSMContext | None, back: str) -> None:
+    user_id = query.from_user.id
+    kind, arg = _back_view_kind(back)
+
+    if state is not None:
+        await state.set_state(MainMenu.viewing)
+
+    if kind == "bc_schedule":
+        data = scoped_broadcast_manager(user_id).load()
+        await query.message.edit_text(
+            broadcast_week_text(data, user_id=user_id),
+            parse_mode="HTML",
+            reply_markup=broadcast_week_keyboard(data, user_id=user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if kind == "bcs_day":
+        weekday = (arg or "").strip()
+        if weekday not in WEEKDAYS:
+            data = scoped_broadcast_manager(user_id).load()
+            await query.message.edit_text(
+                broadcast_week_text(data, user_id=user_id),
+                parse_mode="HTML",
+                reply_markup=broadcast_week_keyboard(data, user_id=user_id),
+                disable_web_page_preview=True,
+            )
+            return
+        data = scoped_broadcast_manager(user_id).load()
+        await query.message.edit_text(
+            broadcast_day_text(data, weekday, user_id=user_id),
+            parse_mode="HTML",
+            reply_markup=broadcast_day_keyboard(data, weekday, user_id=user_id),
+            disable_web_page_preview=True,
+        )
+        return
+
+    if kind == "bc_settings":
+        await query.message.edit_text(
+            broadcast_settings_text(user_id),
+            parse_mode="HTML",
+            reply_markup=broadcast_settings_keyboard(user_id=user_id),
+        )
+        return
+
+    if kind == "settings":
+        await query.message.edit_text(
+            _settings_text_for_user(user_id),
+            parse_mode="HTML",
+            reply_markup=settings_keyboard(user_id=user_id),
+        )
+        return
+
+    # Fallback: go to global settings
+    await query.message.edit_text(
+        _settings_text_for_user(user_id),
+        parse_mode="HTML",
+        reply_markup=settings_keyboard(user_id=user_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("tzm|"))
+async def tz_menu_open(query: CallbackQuery, state: FSMContext):
+    user_id = query.from_user.id
+    parts = (query.data or "").split("|")
+    if len(parts) != 3:
+        await query.answer("Неверная команда.", show_alert=True)
+        return
+    back = parts[1]
+    try:
+        page = int(parts[2] or "0")
+    except Exception:
+        page = 0
+
+    bm_state = scoped_broadcast_manager(user_id).load()
+    current_tz = _effective_tz(user_id, bm_state)
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        _tz_menu_text(current_tz),
+        parse_mode="HTML",
+        reply_markup=_tz_menu_keyboard(current_tz=current_tz, back=back, page=page),
+        disable_web_page_preview=True,
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("tzs|"))
+async def tz_menu_set(query: CallbackQuery, state: FSMContext):
+    user_id = query.from_user.id
+    parts = (query.data or "").split("|", 2)
+    if len(parts) != 3:
+        await query.answer("Неверная команда.", show_alert=True)
+        return
+    back = parts[1]
+    tz = parts[2]
+
+    if tz not in TOP_TIMEZONES:
+        await query.answer("❌ Недопустимый часовой пояс.", show_alert=True)
+        return
+
+    try:
+        set_user_tz(user_id, tz)
+    except Exception:
+        await query.answer("❌ Не удалось сохранить.", show_alert=True)
+        return
+
+    # Keep schedule working: write TZ into broadcast_state too.
+    bm = scoped_broadcast_manager(user_id)
+    bm.set_schedule_tz(tz)
+
+    await _render_tz_back(query, state, back)
+    await query.answer("✅ TZ обновлён")
 
 
 @dp.callback_query(F.data == "settings_notifications")
