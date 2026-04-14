@@ -17,6 +17,7 @@ from datetime import datetime, time, timezone, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, FSInputFile, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
@@ -1008,35 +1009,35 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
 
     rows = []
     # Add balance button at the top
-    rows.append([InlineKeyboardButton(text=f"Баланс: {balance} постов", callback_data="bc_balance")])
+    rows.append([InlineKeyboardButton(text=f"💰 Баланс: {balance} постов", callback_data="bc_balance")])
 
     # Add account connection button first (goes directly to warning pages)
-    rows.append([InlineKeyboardButton(text="Подключить аккаунт", callback_data="acc_methods")])
+    rows.append([InlineKeyboardButton(text="🔑 Подключить аккаунт", callback_data="acc_methods")])
 
     if send_mode == "user":
-        mode_text = "Режим: от пользователя"
+        mode_text = "📣 Режим: от пользователя"
     else:
-        mode_text = f"Режим: от канала ({active_send_as or 'не выбран'})"
+        mode_text = f"📣 Режим: от канала ({active_send_as or 'не выбран'})"
     rows.append([InlineKeyboardButton(text=mode_text, callback_data="bc_mode_toggle")])
 
     if send_mode == "channel":
-        rows.append([InlineKeyboardButton(text="Каналы send-as", callback_data="bc_channels")])
+        rows.append([InlineKeyboardButton(text="📢 Каналы send-as", callback_data="bc_channels")])
 
-    rows.append([InlineKeyboardButton(text=f"Посты ({len(posts)}/10)", callback_data="bc_posts")])
-    rows.append([InlineKeyboardButton(text="Группы рассылки", callback_data="bc_groups")])
-    rows.append([InlineKeyboardButton(text="Запустить рассылку", callback_data="bc_launch_menu")])
-    rows.append([InlineKeyboardButton(text="Настройки", callback_data="bc_settings")])
-    rows.append([InlineKeyboardButton(text="Расписание (неделя)", callback_data="bc_schedule")])
+    rows.append([InlineKeyboardButton(text=f"🗂 Посты ({len(posts)}/10)", callback_data="bc_posts")])
+    rows.append([InlineKeyboardButton(text="👥 Группы рассылки", callback_data="bc_groups")])
+    rows.append([InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="bc_launch_menu")])
+    rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="bc_settings")])
+    rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
 
     # Only render pause/resume button if broadcast was ever launched
     started_at = state.get("broadcast_schedule", {}).get("started_at")
     if started_at:
         rows.append([InlineKeyboardButton(
-            text="Приостановить рассылку" if schedule_enabled else "Возобновить рассылку",
+            text="⏸ Приостановить авторассылку" if schedule_enabled else "▶️ Возобновить авторассылку",
             callback_data="main_bc_toggle",
         )])
 
-    rows.append([InlineKeyboardButton(text="Назад", callback_data="back_main")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2084,7 +2085,8 @@ async def broadcast_launch_menu(query: CallbackQuery):
     bm = scoped_broadcast_manager(user_id)
     groups = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups)
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         broadcast_launch_text(state, user_id=user_id),
         parse_mode="HTML",
         reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2113,7 +2115,8 @@ async def broadcast_launch_step_ready(query: CallbackQuery):
         campaign_state["readiness_mode_snapshot"] = snapshot
         campaign_state["readiness_last_reason"] = "no_groups_selected"
         bm.save(state)
-        await query.message.edit_text(
+        await _safe_edit_text(
+            query.message,
             broadcast_launch_text(state, user_id=user_id, notice=_readiness_reason_human("no_groups_selected")),
             parse_mode="HTML",
             reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2131,7 +2134,8 @@ async def broadcast_launch_step_ready(query: CallbackQuery):
         campaign_state["readiness_mode_snapshot"] = snapshot
         campaign_state["readiness_last_reason"] = "not_connected"
         bm.save(state)
-        await query.message.edit_text(
+        await _safe_edit_text(
+            query.message,
             broadcast_launch_text(state, user_id=user_id, notice=_readiness_reason_human("not_connected")),
             parse_mode="HTML",
             reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2172,7 +2176,8 @@ async def broadcast_launch_step_ready(query: CallbackQuery):
     bm.save(state)
 
     notice = "Готовность пройдена. Можно запускать шаг 2." if total_problems == 0 else _readiness_reason_human(campaign_state["readiness_last_reason"])
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         broadcast_launch_text(state, user_id=user_id, notice=notice),
         parse_mode="HTML",
         reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2189,7 +2194,8 @@ async def broadcast_launch_step_test(query: CallbackQuery):
     steps = get_setup_steps(user_id, state, groups)
 
     if not all(bool(steps.get(key)) for key in ("account", "posts", "groups", "schedule", "readiness")):
-        await query.message.edit_text(
+        await _safe_edit_text(
+            query.message,
             broadcast_launch_text(state, user_id=user_id, notice=_launch_block_reason(state, steps)),
             parse_mode="HTML",
             reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2197,7 +2203,8 @@ async def broadcast_launch_step_test(query: CallbackQuery):
         await query.answer("Шаг 2 пока недоступен")
         return
 
-    await query.message.edit_text(
+    await _safe_edit_text(
+        query.message,
         broadcast_test_intro_text(),
         parse_mode="HTML",
         reply_markup=broadcast_test_intro_keyboard(),
@@ -2214,7 +2221,8 @@ async def broadcast_launch_step_mass(query: CallbackQuery):
     steps = get_setup_steps(user_id, state, groups)
 
     if not bool(steps.get("test")):
-        await query.message.edit_text(
+        await _safe_edit_text(
+            query.message,
             broadcast_launch_text(state, user_id=user_id, notice=_launch_block_reason(state, steps)),
             parse_mode="HTML",
             reply_markup=broadcast_launch_keyboard(state, user_id=user_id),
@@ -2850,7 +2858,18 @@ async def _safe_edit_text(msg: Message, text: str, *, parse_mode: str = "HTML", 
             pass
         await msg.answer(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
     else:
-        await msg.edit_text(text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
+        try:
+            await msg.edit_text(
+                text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        except TelegramBadRequest as exc:
+            # Safe no-op: Telegram rejects edits that don't change text/markup.
+            if "message is not modified" in str(exc).lower():
+                return
+            raise
 
 
 @dp.callback_query(F.data == "acc_menu")
