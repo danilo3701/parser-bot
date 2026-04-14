@@ -4393,107 +4393,47 @@ async def _run_broadcast_test_for_groups(
     expected_sender_label = _sender_kind_human(expected_sender_kind)
     expected_send_as = (campaign_state.get("send_as_channel") or "").strip()
 
-    # Build group links section (static; reused in all test screens).
-    MAX_LINK_GROUPS = 30
-    groups_link_lines = []
-    for g in test_groups[:MAX_LINK_GROUPS]:
-        ref = str(g).strip()
-        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
-        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
-            groups_link_lines.append(f"• <code>{ref}</code>")
-        else:
-            slug = ref.lstrip("@")
-            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
-    extra = len(test_groups) - MAX_LINK_GROUPS
-    if extra > 0:
-        groups_link_lines.append(f"…и ещё {extra}")
-    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
-
     # Test broadcast is always free: no balance check, no deduction.
     balance_mgr = scoped_balance_manager(user_id)
     balance_before_test = balance_mgr.get_balance()
     loop = asyncio.get_running_loop()
     started_perf = loop.time()
+    verify_seconds = 10
+    inter_group_pause_seconds = 5
 
-    start_text = (
-        f"🧪 <b>{title}</b>\n\n"
-        "🆓 Тест бесплатный — посты не списываются.\n"
-        f"Выбрано: <b>{selected_total}</b> | К тесту: <b>{tested_total}</b>\n"
-        f"Ожидаемый отправитель: <b>{expected_sender_label}</b>"
-        + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
-        + "\n"
-        f"Отправляю тестовые посты в <b>{tested_total}</b> групп...\n"
-    )
-    if groups_links_text:
-        start_text += f"\n<b>Группы теста:</b>\n{groups_links_text}\n"
-    start_text += "\nНе закрывайте чат!"
-
-    await query.message.edit_text(
-        start_text,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-    await query.answer()
-
-    started_at = datetime.now(timezone.utc).isoformat()
     user_lock = _broadcast_lock_for(user_id)
+    processed_groups = 0
+    success_groups: list[str] = []
+    failed_groups: dict[str, str] = {}
+    sent_senders: dict[str, dict] = {}
+    cleanup_found_count = 0
+    cleanup_deleted_count = 0
+    live_rows: list[str] = []
 
-    ui_last_update = 0.0
-    last_processed = 0
-
-    async def progress_callback(info: dict) -> None:
-        nonlocal ui_last_update
-        nonlocal last_processed
-        try:
-            processed = int(info.get("processed", 0) or 0)
-        except Exception:
-            processed = 0
-        try:
-            total = int(info.get("total", tested_total) or tested_total)
-        except Exception:
-            total = tested_total
-        now = loop.time()
-        # Throttle UI updates to avoid Telegram edit flood.
-        if processed <= last_processed:
-            return
-        if processed < total and (now - ui_last_update) < 0.8:
-            return
-        ui_last_update = now
-        last_processed = processed
-
-        elapsed_seconds = max(0, int(round(now - started_perf)))
-        sent_count = int(info.get("sent_count", 0) or 0)
-        skipped_count = int(info.get("skipped_count", 0) or 0)
-        blocked_count = int(info.get("blocked_count", 0) or 0)
-        failed_count = int(info.get("failed_count", 0) or 0)
-        group_now = str(info.get("group") or "").strip()
-        group_label = _format_test_group_label(group_now) if group_now else ""
-
-        pct = int(round((processed / total) * 100)) if total > 0 else 0
+    async def _render_live(*, phase_text: str, current_group: str | None = None) -> None:
+        elapsed_seconds = max(0, int(round(loop.time() - started_perf)))
+        total = max(1, tested_total)
+        pct = int(round((processed_groups / total) * 100))
         bar_filled = min(10, max(0, int(round((pct / 100) * 10))))
         progress_bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        current_label = _format_test_group_label(current_group) if current_group else "—"
+        results_text = "\n".join(live_rows[-15:]) if live_rows else "— пока нет результатов —"
 
         text = (
-            f"🧪 <b>{title}</b>\n\n"
+            "🧪 <b>ТЕСТ ГРУПП (ПО ОДНОЙ)</b>\n\n"
             "🆓 Тест бесплатный — посты не списываются.\n"
-            f"⏱ Прошло: <b>{elapsed_seconds}</b> сек\n"
-            f"Проверено: <b>{processed}</b> из <b>{total}</b>\n\n"
+            f"Проверено: <b>{processed_groups}</b> из <b>{tested_total}</b>\n"
             f"<code>{progress_bar}</code> {pct}%\n\n"
-            f"✅ Успешно: <b>{sent_count}</b>\n"
-            f"❌ Ошибки: <b>{failed_count}</b>\n"
-            f"🚫 Заблок: <b>{blocked_count}</b>\n"
-            f"⏭ Пропущено: <b>{skipped_count}</b>\n"
-            "\n"
+            f"⏱ Прошло: <b>{elapsed_seconds}</b> сек\n"
+            f"Шаг: <b>{phase_text}</b>\n"
+            f"Текущая группа: <b>{current_label}</b>\n"
             f"Ожидаемый отправитель: <b>{expected_sender_label}</b>"
             + (f" (<code>{expected_send_as}</code>)" if expected_sender_kind == "channel" and expected_send_as else "")
-            + "\n"
+            + "\n\n"
+            "<b>Результаты:</b>\n"
+            f"{results_text}\n\n"
+            "Не закрывайте чат!"
         )
-        if group_label:
-            text += f"\nТекущая группа: {group_label}\n"
-        if groups_links_text:
-            text += f"\n<b>Группы теста:</b>\n{groups_links_text}\n"
-        text += "\nНе закрывайте чат!"
-
         try:
             await query.message.edit_text(
                 text,
@@ -4503,77 +4443,125 @@ async def _run_broadcast_test_for_groups(
         except Exception:
             pass
 
-    async with user_lock:
-        result = await execute_broadcast(
-            user_id,
-            test_groups,
-            advance_rotation=False,
-            is_test=True,
-            test_marker="🧪",
-            progress_callback=progress_callback,
-        )
+    await _render_live(phase_text="подготовка теста")
+    await query.answer()
 
-    sent_message_ids = result.get("sent_message_ids", {}) if isinstance(result.get("sent_message_ids", {}), dict) else {}
-    sent_senders = result.get("sent_senders", {}) if isinstance(result.get("sent_senders", {}), dict) else {}
-    send_errors = result.get("send_errors", {}) if isinstance(result.get("send_errors", {}), dict) else {}
-    failed_excs = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
-    blocked = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+    for idx, group in enumerate(test_groups, start=1):
+        group_label = _format_test_group_label(group)
+        started_at = datetime.now(timezone.utc).isoformat()
 
-    for group, err in blocked.items():
-        bm.set_group_blocked(group, err)
+        await _render_live(phase_text="отправка поста", current_group=group)
 
-    for group in test_groups:
-        if group in sent_message_ids:
+        async with user_lock:
+            one_result = await execute_broadcast(
+                user_id,
+                [group],
+                advance_rotation=False,
+                is_test=True,
+                test_marker="🧪",
+            )
+
+        one_sent_ids = one_result.get("sent_message_ids", {}) if isinstance(one_result.get("sent_message_ids", {}), dict) else {}
+        one_senders = one_result.get("sent_senders", {}) if isinstance(one_result.get("sent_senders", {}), dict) else {}
+        one_errors = one_result.get("send_errors", {}) if isinstance(one_result.get("send_errors", {}), dict) else {}
+        one_failed = one_result.get("failed_groups", {}) if isinstance(one_result.get("failed_groups", {}), dict) else {}
+        one_blocked = one_result.get("blocked_groups", {}) if isinstance(one_result.get("blocked_groups", {}), dict) else {}
+
+        if group in one_blocked:
+            bm.set_group_blocked(group, str(one_blocked.get(group) or "blocked"))
+
+        if group not in one_sent_ids:
+            normalized = str(one_errors.get(group) or "").strip().lower()
+            if normalized in {"", "other"} and one_failed.get(group):
+                reason_raw = str(one_failed.get(group))
+            else:
+                reason_raw = str(one_errors.get(group) or one_blocked.get(group) or one_failed.get(group) or "other")
+            reason_code = _normalize_test_error_reason(reason_raw)
             bm.set_group_last_test(
                 group,
-                status="ok",
-                reason="ok",
-                message_id=int(sent_message_ids.get(group) or 0) if sent_message_ids.get(group) else None,
-                sent_at=started_at,
-                verified_at=None,
-            )
-        else:
-            normalized = str(send_errors.get(group) or "").strip().lower()
-            reason_raw = str(
-                (
-                    failed_excs.get(group)
-                    if normalized in {"", "other"} and failed_excs.get(group)
-                    else (send_errors.get(group) or blocked.get(group) or failed_excs.get(group) or "other")
-                )
-            )
-            reason_lower = reason_raw.lower()
-            status = "deleted" if "delete" in reason_lower else "failed"
-            bm.set_group_last_test(
-                group,
-                status=status,
+                status="failed",
                 reason=reason_raw,
                 message_id=None,
                 sent_at=started_at,
-                verified_at=None,
+                verified_at=datetime.now(timezone.utc).isoformat(),
             )
+            failed_groups[group] = reason_raw
+            live_rows.append(f"❌ {group_label} — <code>{reason_code}</code>")
+            processed_groups = idx
+            await _render_live(phase_text="ошибка отправки", current_group=group)
+        else:
+            message_id = int(one_sent_ids[group])
+            for remain in range(verify_seconds, 0, -1):
+                await _render_live(phase_text=f"проверка группы: {remain} сек", current_group=group)
+                await asyncio.sleep(1)
 
-    if result.get("sent_count", 0) > 0:
-        bm.mark_test_passed()
-    else:
-        bm.reset_test_flag()
+            ok_verify, _, verify_client, _ = await _readiness_check_connected_account(user_id)
+            verify_row = {"found": False, "deleted": False}
+            if ok_verify and verify_client:
+                try:
+                    cleanup = await verify_and_delete_test_messages(
+                        client=verify_client,
+                        test_message_ids={group: message_id},
+                        wait_seconds=0,
+                    )
+                    verify_row = cleanup.get(group, {"found": False, "deleted": False})
+                except Exception:
+                    verify_row = {"found": False, "deleted": False}
+                finally:
+                    try:
+                        await verify_client.disconnect()
+                    except Exception:
+                        pass
 
-    # Build lists of working and failed groups (negative-first).
-    working_groups = list(sent_message_ids.keys()) if sent_message_ids else []
-    failed_groups: dict[str, str] = {}
-    for group in test_groups:
-        if group not in working_groups:
-            normalized = str(send_errors.get(group) or "").strip().lower()
-            if normalized in {"", "other"} and failed_excs.get(group):
-                reason = str(failed_excs.get(group) or "unknown")
+            found_ok = bool(verify_row.get("found"))
+            deleted_ok = bool(verify_row.get("deleted"))
+            if found_ok:
+                cleanup_found_count += 1
+            if deleted_ok:
+                cleanup_deleted_count += 1
+
+            if found_ok:
+                bm.set_group_last_test(
+                    group,
+                    status="ok",
+                    reason="ok",
+                    message_id=message_id,
+                    sent_at=started_at,
+                    verified_at=datetime.now(timezone.utc).isoformat(),
+                )
+                success_groups.append(group)
+                if group in one_senders and isinstance(one_senders[group], dict):
+                    sent_senders[group] = one_senders[group]
+                live_rows.append(f"✅ {group_label}")
             else:
-                reason = str(send_errors.get(group) or blocked.get(group) or failed_excs.get(group) or "unknown")
-            failed_groups[group] = reason
+                verify_error = str(verify_row.get("verify_error") or "").strip()
+                reason_raw = verify_error or "deleted"
+                reason_code = _normalize_test_error_reason(reason_raw)
+                status = "deleted" if reason_code == "deleted" else "failed"
+                bm.set_group_last_test(
+                    group,
+                    status=status,
+                    reason=reason_raw,
+                    message_id=message_id,
+                    sent_at=started_at,
+                    verified_at=datetime.now(timezone.utc).isoformat(),
+                )
+                failed_groups[group] = reason_raw
+                live_rows.append(f"❌ {group_label} — <code>{reason_code}</code>")
+
+            processed_groups = idx
+            await _render_live(phase_text="группа проверена", current_group=group)
+
+        if idx < tested_total:
+            for remain in range(inter_group_pause_seconds, 0, -1):
+                await _render_live(phase_text=f"пауза перед следующей группой: {remain} сек", current_group=group)
+                await asyncio.sleep(1)
 
     balance_after_test = balance_mgr.get_balance()
     sender_counts = {"user": 0, "channel": 0, "unknown": 0}
     mismatch_groups: list[str] = []
     mismatch_details: list[str] = []
-    for group in working_groups:
+    for group in success_groups:
         meta = sent_senders.get(group, {})
         kind = str(meta.get("kind") or "unknown")
         if kind not in sender_counts:
@@ -4601,78 +4589,27 @@ async def _run_broadcast_test_for_groups(
         sender_diag_lines.extend(mismatch_details[:5])
         if len(mismatch_details) > 5:
             sender_diag_lines.append(f"… и ещё {len(mismatch_details) - 5}")
-    elif working_groups:
+    elif success_groups:
         sender_diag_lines.append("✅ Несоответствий не найдено.")
     else:
         sender_diag_lines.append("ℹ️ Нет успешных отправок для проверки отправителя.")
     sender_diag_text = "\n".join(sender_diag_lines)
 
-    # Wait N seconds with progress updates, then verify/delete test messages.
-    total_seconds = max(int(BROADCAST_TEST_VERIFY_SECONDS), int(tested_total) * 10)
-    step_seconds = 10
-    test_message_ids = sent_message_ids
-    cleanup_summary = ""
-    if test_message_ids:
-        for elapsed in range(0, total_seconds + step_seconds, step_seconds):
-            remaining = max(0, total_seconds - elapsed)
-            filled = min(10, int((elapsed / total_seconds) * 10))
-            bar = "█" * filled + "░" * (10 - filled)
-            try:
-                message_text = (
-                    "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ ПОСТОВ</b>\n\n"
-                    f"⏳ Осталось: <b>{remaining}</b> сек\n"
-                    f"<code>{bar}</code>\n\n"
-                )
-                if groups_links_text:
-                    message_text += f"<b>Группы теста:</b>\n{groups_links_text}\n\n"
-                message_text += "Не закрывайте чат!"
-
-                await query.message.edit_text(
-                    message_text,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
-            if remaining > 0:
-                await asyncio.sleep(step_seconds)
-
-        ok, _, client, _ = await _readiness_check_connected_account(user_id)
-        cleanup = {}
-        if ok and client:
-            try:
-                cleanup = await verify_and_delete_test_messages(
-                    client=client,
-                    test_message_ids=test_message_ids,
-                    wait_seconds=0,
-                )
-            except Exception:
-                cleanup = {}
-            finally:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-
-            found_count = sum(1 for v in cleanup.values() if v.get("found"))
-            deleted_count = sum(1 for v in cleanup.values() if v.get("deleted"))
-            cleanup_summary = (
-                f"🧹 <b>Удаление тест-постов:</b> найдено {found_count}, удалено {deleted_count} "
-                f"(таймаут {total_seconds} сек)."
-            )
-        else:
-            cleanup_summary = (
-                f"🧹 <b>Удаление тест-постов:</b> не удалось подключиться "
-                f"(таймаут {total_seconds} сек)."
-            )
+    if success_groups:
+        bm.mark_test_passed()
     else:
-        cleanup_summary = f"🧹 <b>Удаление тест-постов:</b> тестовые посты не отправлены (таймаут {total_seconds} сек)."
+        bm.reset_test_flag()
+
+    cleanup_summary = (
+        "🧪 <b>Режим проверки:</b> по одной группе (10 сек проверка + 5 сек пауза)\n"
+        f"🔎 <b>Служебная проверка:</b> подтверждено {cleanup_found_count} | очищено {cleanup_deleted_count}"
+    )
 
     duration_seconds = max(1, int(round(asyncio.get_running_loop().time() - started_perf)))
     test_result_text = broadcast_test_result_text(
         selected_total=selected_total,
         tested_total=tested_total,
-        success_count=len(working_groups),
+        success_count=len(success_groups),
         failed_groups=failed_groups,
         preblocked_count=preblocked_count,
         duration_seconds=duration_seconds,
