@@ -535,7 +535,7 @@ def broadcast_test_intro_text() -> str:
         "Это снижает риск жалоб, ограничений и блокировки аккаунта (вплоть до 24 часов).\n\n"
         "Что делает тест:\n"
         "• отправляет тестовые посты в выбранные группы;\n"
-        "• ждёт 60 секунд и проверяет результат;\n"
+        "• ждёт динамическое время и проверяет результат;\n"
         "• показывает ожидаемого и фактического отправителя;\n"
         "• автоматически отключает нерабочие группы;\n"
         "• показывает отчёт: сколько прошло и сколько отключено.\n\n"
@@ -545,7 +545,7 @@ def broadcast_test_intro_text() -> str:
 
 def broadcast_test_intro_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
+        [InlineKeyboardButton(text="🚀 Начать тест", callback_data="bc_test_start")],
         [InlineKeyboardButton(text="ℹ️ Подробнее", callback_data="bc_test_info")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_launch_menu")],
     ])
@@ -565,7 +565,7 @@ def broadcast_test_info_text() -> str:
 
 def broadcast_test_info_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Начать тест (60 сек)", callback_data="bc_test_start")],
+        [InlineKeyboardButton(text="🚀 Начать тест", callback_data="bc_test_start")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_launch_menu")],
     ])
 
@@ -1103,10 +1103,7 @@ def broadcast_posts_keyboard(state: dict) -> InlineKeyboardMarkup:
 
 def broadcast_posts_add_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Добавить еще", callback_data="bcp_more"),
-            InlineKeyboardButton(text="✅ Готово", callback_data="bcp_done"),
-        ],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="bcp_done")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_posts")],
     ])
 
@@ -1505,11 +1502,7 @@ def broadcast_groups_keyboard(
 
     buttons = []
     if allow_manage:
-        buttons.append([
-            InlineKeyboardButton(text="➕ Добавить по @", callback_data="bcg_add_at"),
-            InlineKeyboardButton(text="➕ Добавить по ссылке", callback_data="bcg_add_link"),
-        ])
-        buttons.append([InlineKeyboardButton(text="➕ Добавить (любой формат)", callback_data="bcg_add")])
+        buttons.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="bcg_add")])
     for group in page_groups:
         group_meta = groups_state.get(group, {})
         blocked = group_meta.get("status") == "blocked"
@@ -3810,7 +3803,8 @@ async def broadcast_posts_add_prompt(query: CallbackQuery, state: FSMContext):
         return
     await query.message.edit_text(
         "➕ <b>Добавить пост</b>\n\n"
-        "Пришлите пост (текст/фото/видео). Я сохраню его в служебный канал.\n\n"
+        "Пришлите пост (текст/фото/видео). Я сохраню его в служебный канал.\n"
+        "После сохранения сразу жду следующий пост — кнопку «Добавить ещё» нажимать не нужно.\n\n"
         "Лимит: <b>10</b> постов.",
         parse_mode="HTML",
         reply_markup=broadcast_posts_add_keyboard(),
@@ -3909,7 +3903,7 @@ async def broadcast_posts_add_input(message: Message, state: FSMContext):
     )
 
     await message.answer(
-        "✅ Пост сохранён.\n\nМожно добавить ещё или завершить.",
+        "✅ Пост сохранён.\n\nЖду следующий пост. Когда закончите, нажмите «✅ Готово».",
         reply_markup=broadcast_posts_add_keyboard(),
     )
 
@@ -3949,7 +3943,6 @@ async def broadcast_groups_page(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bcg_add")
 async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
-    user_id = query.from_user.id
     await state.set_state(MainMenu.adding_broadcast_group)
     await query.message.edit_text(
         "➕ <b>Добавить чат/группу</b>\n\n"
@@ -3964,10 +3957,6 @@ async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
         "<i>Примечание: рассылка возможна только если подключённый аккаунт состоит в этом чате.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Примеры @", callback_data="bcg_add_at"),
-                InlineKeyboardButton(text="Примеры ссылок", callback_data="bcg_add_link"),
-            ],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
         ]),
         disable_web_page_preview=True,
@@ -4087,7 +4076,7 @@ async def broadcast_groups_add_input(message: Message, state: FSMContext):
             ])
         )
 
-    await state.set_state(MainMenu.viewing)
+    await state.set_state(MainMenu.adding_broadcast_group)
 
 
 @dp.callback_query(F.data == "bcg_delete_mode")

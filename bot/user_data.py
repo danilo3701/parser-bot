@@ -56,11 +56,24 @@ def normalize_group_ref(raw: str) -> str | None:
     if not s:
         return None
 
-    # t.me/<username>
-    s = re.sub(r"^\s*(https?://)?t\.me/", "", s, flags=re.IGNORECASE).strip()
+    # Accept public t.me links with optional scheme/www and extra tail.
+    # Examples:
+    #   https://t.me/username
+    #   http://t.me/username/
+    #   t.me/username?start=abc
+    m = re.match(r"^(?:https?://)?(?:www\.)?t\.me/(.+)$", s, flags=re.IGNORECASE)
+    if m:
+        s = (m.group(1) or "").strip()
+        s = s.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
+        if "/" in s:
+            s = s.split("/", 1)[0].strip()
 
     if s.startswith("@"):
         s = s[1:].strip()
+
+    # Explicitly skip invite links for now (out of current scope).
+    if s.startswith("+") or s.lower().startswith("joinchat"):
+        return None
 
     # numeric chat id
     if re.fullmatch(r"-?\d{5,}", s):
