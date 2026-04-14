@@ -1210,8 +1210,6 @@ def broadcast_groups_keyboard(
             prefix = "✅" if group in selected else "▫️"
             text = f"{prefix} {status_icon} {label}".replace("  ", " ").strip()
         row = [InlineKeyboardButton(text=text, callback_data=f"bcg_{group}")]
-        if allow_manage:
-            row.append(InlineKeyboardButton(text="🗑", callback_data=f"bcgd_{group}"))
         buttons.append(row)
 
     nav = []
@@ -1221,6 +1219,10 @@ def broadcast_groups_keyboard(
     if page < total_pages - 1:
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"bcgp_{page + 1}"))
     buttons.append(nav)
+
+    if allow_manage and total > 0:
+        buttons.append([InlineKeyboardButton(text="🗑 Удалить группу", callback_data="bcg_delete_mode")])
+
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -3176,10 +3178,15 @@ async def broadcast_groups_add_prompt(query: CallbackQuery, state: FSMContext):
     await state.set_state(MainMenu.adding_broadcast_group)
     await query.message.edit_text(
         "➕ <b>Добавить чат/группу</b>\n\n"
-        "Способы:\n"
-        "1) Напишите <code>@username</code> или <code>t.me/username</code> или просто <code>username</code>\n"
-        "2) Перешлите сюда сообщение из нужной группы/чата (я сохраню chat_id)\n\n"
-        "Примечание: рассылка возможна только если подключенный аккаунт состоит в этой группе/чате.",
+        "<b>Поддерживаемые форматы:</b>\n"
+        "• <code>@username</code>\n"
+        "• <code>https://t.me/username</code>\n"
+        "• <code>t.me/username</code>\n"
+        "• просто <code>username</code> (от 5 символов)\n"
+        "• <code>chat_id</code> (числовой, например <code>-1001234567890</code>)\n\n"
+        "Или перешлите любое сообщение из нужного чата — я распознаю автоматически.\n\n"
+        "⚠️ <b>Отправляйте по одной группе за раз.</b>\n\n"
+        "<i>Примечание: рассылка возможна только если подключённый аккаунт состоит в этом чате.</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
@@ -3240,24 +3247,50 @@ async def broadcast_groups_add_input(message: Message, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data.startswith("bcgd_"))
-async def broadcast_group_delete(query: CallbackQuery):
+@dp.callback_query(F.data == "bcg_delete_mode")
+async def broadcast_group_delete_mode(query: CallbackQuery):
     user_id = query.from_user.id
-    if is_owner(user_id):
-        await query.answer("Для админа список групп фиксированный.", show_alert=True)
+    groups = scoped_load_broadcast_groups(user_id)
+    if not groups:
+        await query.answer("Нет групп для удаления.", show_alert=True)
         return
-    group = query.data[len("bcgd_"):]
+
+    # Строим клавиатуру для выбора группы на удаление
+    rows = []
+    for group in groups:
+        label = format_group_ref(group)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"bcgdel_{group}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")])
+
+    await query.message.edit_text(
+        "🗑 <b>Выберите группу для удаления:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("bcgdel_"))
+async def broadcast_group_delete_one(query: CallbackQuery):
+    user_id = query.from_user.id
+    group = query.data[len("bcgdel_"):]
     bm = scoped_broadcast_manager(user_id)
     if delete_user_broadcast_group(user_id, group):
         bm.unselect_groups([group])
         invalidate_readiness_if_needed(bm, reason="groups_changed")
-        await query.answer("Удалено")
+        await query.answer("✅ Удалено")
     else:
-        await query.answer("Не найдено", show_alert=True)
+        await query.answer("❌ Не найдено", show_alert=True)
+        return
 
+    # Возвращаемся в обычное меню групп
     groups = scoped_load_broadcast_groups(user_id)
     state = bm.ensure_groups_known(groups)
-    await query.message.edit_reply_markup(
+    await query.message.edit_text(
+        "👥 <b>Группы рассылки</b>\n\n"
+        "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
+        "Нажмите на группу, чтобы переключить.",
+        parse_mode="HTML",
         reply_markup=broadcast_groups_keyboard(state, groups=groups, page=0, allow_manage=True)
     )
 
