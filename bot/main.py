@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, FSInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BufferedInputFile, FSInputFile, InputMediaPhoto
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
@@ -2539,6 +2539,8 @@ async def _start_phone_login(message: Message, state: FSMContext, *, api_id: int
     await message.answer(
         "✅ Код отправлен.\n\n"
         "Введите код (обычно 5 цифр), пример: <code>12345</code>\n\n"
+        "⚠️ <b>Важно:</b> читайте код из <b>уведомления</b> (не открывая чат Telegram). "
+        "Если вы откроете сообщение в приложении — код сразу истечёт.\n\n"
         f"Я жду код <b>{code_ttl_seconds()} сек</b>, потом попрошу запросить заново.",
         parse_mode="HTML",
         reply_markup=account_cancel_keyboard(),
