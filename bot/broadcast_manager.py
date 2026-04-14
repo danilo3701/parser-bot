@@ -20,6 +20,7 @@ class BroadcastManager:
             "broadcast_schedule": {
                 "enabled": True,
                 "tz": self.default_tz,
+                "started_at": None,
             },
             "campaign": {
                 "send_mode": "user",
@@ -88,6 +89,22 @@ class BroadcastManager:
             state["broadcast_schedule"] = schedule
         schedule.setdefault("enabled", True)
         schedule.setdefault("tz", self.default_tz)
+
+        # Migration: set started_at for users who had successful runs before this field existed
+        if "started_at" not in schedule:
+            last_runs = state.get("last_runs", {})
+            if last_runs:
+                # Find the earliest updated_at across all run records
+                earliest = None
+                for run in last_runs.values():
+                    if isinstance(run, dict):
+                        ts = run.get("updated_at")
+                        if ts and isinstance(ts, str):
+                            if earliest is None or ts < earliest:
+                                earliest = ts
+                schedule["started_at"] = earliest or datetime.now(timezone.utc).isoformat()
+            else:
+                schedule["started_at"] = None
 
         notifications = state.get("notifications")
         if not isinstance(notifications, dict):
@@ -601,4 +618,12 @@ class BroadcastManager:
         daily_counts[today] = current + 1
 
         self.save(state)
+        return state
+
+    def set_started_at(self) -> dict:
+        state = self.load()
+        schedule = state.setdefault("broadcast_schedule", self._default_state()["broadcast_schedule"])
+        if not schedule.get("started_at"):
+            schedule["started_at"] = datetime.now(timezone.utc).isoformat()
+            self.save(state)
         return state

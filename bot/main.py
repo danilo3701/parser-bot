@@ -941,7 +941,14 @@ def broadcast_summary_text(state: dict, *, user_id: int | None = None, groups: l
                 "────────────────────\n"
             )
 
-    status_indicator = "✅ Рассылка активна" if schedule.get("enabled", True) else "❌ Рассылка остановлена"
+    # 3-state status indicator: not launched / active / paused
+    started_at = schedule.get("started_at")
+    if not started_at:
+        status_indicator = "⚪️ Рассылка не запущена"
+    elif schedule.get("enabled", True):
+        status_indicator = "✅ Рассылка активна"
+    else:
+        status_indicator = "⏸ Рассылка приостановлена"
 
     return (
         step_progress +
@@ -987,10 +994,15 @@ def broadcast_main_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarku
     rows.append([InlineKeyboardButton(text="🚀 Запустить рассылку", callback_data="bc_launch_menu")])
     rows.append([InlineKeyboardButton(text="⚙️ Настройки", callback_data="bc_settings")])
     rows.append([InlineKeyboardButton(text="📅 Расписание (неделя)", callback_data="bc_schedule")])
-    rows.append([InlineKeyboardButton(
-        text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
-        callback_data="main_bc_toggle",
-    )])
+
+    # Only render pause/resume button if broadcast was ever launched
+    started_at = state.get("broadcast_schedule", {}).get("started_at")
+    if started_at:
+        rows.append([InlineKeyboardButton(
+            text="⏸ Приостановить рассылку" if schedule_enabled else "▶️ Возобновить рассылку",
+            callback_data="main_bc_toggle",
+        )])
+
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1532,6 +1544,10 @@ async def scheduler_loop():
                 if not schedule.get("enabled", True):
                     continue
 
+                # Skip if broadcast has never been launched
+                if not schedule.get("started_at"):
+                    continue
+
                 tz_name = _effective_tz(user_id, state)
                 try:
                     now_local = datetime.now(ZoneInfo(tz_name))
@@ -1689,7 +1705,17 @@ async def back_to_main(query: CallbackQuery, state: FSMContext):
 async def main_bc_toggle(query: CallbackQuery):
     bm = scoped_broadcast_manager(query.from_user.id)
     bm_state = bm.load()
-    schedule_enabled = bm_state.get("broadcast_schedule", {}).get("enabled", True)
+    schedule = bm_state.get("broadcast_schedule", {})
+
+    # Guard: only allow pause/resume if broadcast has been launched
+    if not schedule.get("started_at"):
+        await query.answer(
+            "Сначала запустите рассылку (🚀 Запустить рассылку → шаг 3).",
+            show_alert=True,
+        )
+        return
+
+    schedule_enabled = schedule.get("enabled", True)
 
     # If schedule is ON, show confirmation before stopping
     if schedule_enabled:
@@ -3886,6 +3912,22 @@ async def broadcast_test_v2(query: CallbackQuery):
     )
     balance_after_test = balance_mgr.get_balance()
 
+    # Build group links section (before the wait loop, so it's static)
+    MAX_LINK_GROUPS = 15
+    groups_link_lines = []
+    for g in test_groups[:MAX_LINK_GROUPS]:
+        ref = str(g).strip()
+        # Numeric chat IDs (e.g. -1001234567890 or id:...) cannot have a t.me URL
+        if ref.startswith("id:") or re.fullmatch(r"-?\d+", ref):
+            groups_link_lines.append(f"• <code>{ref}</code>")
+        else:
+            slug = ref.lstrip("@")
+            groups_link_lines.append(f'• <a href="https://t.me/{slug}">@{slug}</a>')
+    extra = len(test_groups) - MAX_LINK_GROUPS
+    if extra > 0:
+        groups_link_lines.append(f"…и ещё {extra}")
+    groups_links_text = "\n".join(groups_link_lines) if groups_link_lines else ""
+
     # Wait 60 seconds with progress updates, then verify/delete test messages.
     total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
     step_seconds = 10
@@ -3897,12 +3939,19 @@ async def broadcast_test_v2(query: CallbackQuery):
             filled = min(10, int((elapsed / total_seconds) * 10))
             bar = "█" * filled + "░" * (10 - filled)
             try:
-                await query.message.edit_text(
+                message_text = (
                     "🧪 <b>ПРОВЕРКА ТЕСТОВЫХ СООБЩЕНИЙ</b>\n\n"
                     f"⏳ Осталось: <b>{remaining}</b> сек\n"
                     f"<code>{bar}</code>\n\n"
-                    "Не закрывайте чат!",
+                )
+                if groups_links_text:
+                    message_text += f"<b>Группы теста:</b>\n{groups_links_text}\n\n"
+                message_text += "Не закрывайте чат!"
+
+                await query.message.edit_text(
+                    message_text,
                     parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
             except Exception:
                 pass
@@ -4129,6 +4178,8 @@ async def broadcast_confirm_mass(query: CallbackQuery):
                 sent_count=sent_count,
                 summary=f"Массовая рассылка: {sent_count} групп",
             )
+            # Set started_at on first successful launch (idempotent)
+            bm.set_started_at()
 
     # Get updated balance
     balance_after = balance_mgr.get_balance()
