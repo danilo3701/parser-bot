@@ -1673,8 +1673,9 @@ async def execute_broadcast(
             source_channel=source_channel,
             source_message_id=source_message_id,
             send_as_channel=send_as,
-            delay_seconds=1.5 if is_test else 5.0,
-            jitter_seconds=0.5 if is_test else 5.0,
+            # Keep test pacing identical to mass broadcast to reduce risk of rate limits.
+            delay_seconds=5.0,
+            jitter_seconds=5.0,
             as_copy=True,
             is_test=is_test,
             test_marker=test_marker,
@@ -4389,9 +4390,11 @@ async def _run_broadcast_test_for_groups(
     user_lock = _broadcast_lock_for(user_id)
 
     ui_last_update = 0.0
+    last_processed = 0
 
     async def progress_callback(info: dict) -> None:
         nonlocal ui_last_update
+        nonlocal last_processed
         try:
             processed = int(info.get("processed", 0) or 0)
         except Exception:
@@ -4402,9 +4405,12 @@ async def _run_broadcast_test_for_groups(
             total = tested_total
         now = loop.time()
         # Throttle UI updates to avoid Telegram edit flood.
-        if processed < total and (now - ui_last_update) < 2.0:
+        if processed <= last_processed:
+            return
+        if processed < total and (now - ui_last_update) < 0.8:
             return
         ui_last_update = now
+        last_processed = processed
 
         elapsed_seconds = max(0, int(round(now - started_perf)))
         sent_count = int(info.get("sent_count", 0) or 0)
@@ -4414,11 +4420,16 @@ async def _run_broadcast_test_for_groups(
         group_now = str(info.get("group") or "").strip()
         group_label = _format_test_group_label(group_now) if group_now else ""
 
+        pct = int(round((processed / total) * 100)) if total > 0 else 0
+        bar_filled = min(10, max(0, int(round((pct / 100) * 10))))
+        progress_bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
         text = (
             f"🧪 <b>{title}</b>\n\n"
             "🆓 Тест бесплатный — посты не списываются.\n"
             f"⏱ Прошло: <b>{elapsed_seconds}</b> сек\n"
             f"Проверено: <b>{processed}</b> из <b>{total}</b>\n\n"
+            f"<code>{progress_bar}</code> {pct}%\n\n"
             f"✅ Успешно: <b>{sent_count}</b>\n"
             f"❌ Ошибки: <b>{failed_count}</b>\n"
             f"🚫 Заблок: <b>{blocked_count}</b>\n"
@@ -4548,7 +4559,7 @@ async def _run_broadcast_test_for_groups(
     sender_diag_text = "\n".join(sender_diag_lines)
 
     # Wait N seconds with progress updates, then verify/delete test messages.
-    total_seconds = max(10, BROADCAST_TEST_VERIFY_SECONDS)
+    total_seconds = max(int(BROADCAST_TEST_VERIFY_SECONDS), int(tested_total) * 10)
     step_seconds = 10
     test_message_ids = sent_message_ids
     cleanup_summary = ""
