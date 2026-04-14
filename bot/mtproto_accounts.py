@@ -13,7 +13,8 @@ def accounts_path() -> Path:
     raw = (os.getenv("MT_ACCOUNTS_PATH") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return (Path(__file__).parent / "mtproto_accounts.json").resolve()
+    from storage_paths import base_data_dir
+    return (base_data_dir() / "mtproto_accounts.json").resolve()
 
 
 def code_ttl_seconds() -> int:
