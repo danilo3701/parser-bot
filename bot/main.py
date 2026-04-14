@@ -74,6 +74,7 @@ from user_data import (
     normalize_group_ref,
     user_broadcast_state_path,
 )
+from user_settings import DEFAULT_TZ, TOP_TIMEZONES, get_user_tz, set_user_tz
 
 # Подхватываем bot/.env независимо от того, из какой папки запускают бота
 load_dotenv(Path(__file__).parent / ".env")
@@ -114,6 +115,148 @@ WEEKDAY_NAMES = {
     "sat": "СБ",
     "sun": "ВС",
 }
+
+
+TZ_LABELS: dict[str, str] = {
+    "Europe/Madrid": "Madrid",
+    "Europe/London": "London",
+    "Europe/Berlin": "Berlin",
+    "Europe/Paris": "Paris",
+    "Europe/Kyiv": "Kyiv",
+    "Europe/Moscow": "Moscow",
+    "Asia/Almaty": "Almaty",
+    "Asia/Jakarta": "Jakarta (WIB)",
+    "Asia/Makassar": "Makassar (WITA)",
+    "Asia/Jayapura": "Jayapura (WIT)",
+    "America/New_York": "New York",
+    "America/Chicago": "Chicago",
+    "America/Denver": "Denver",
+    "America/Los_Angeles": "Los Angeles",
+    "UTC": "UTC",
+    "Asia/Dubai": "Dubai",
+    "Asia/Singapore": "Singapore",
+    "Asia/Bangkok": "Bangkok",
+    "Asia/Tokyo": "Tokyo",
+    "Australia/Sydney": "Sydney",
+}
+
+
+def _is_zoneinfo_tz(tz: str) -> bool:
+    tz = (tz or "").strip()
+    if not tz:
+        return False
+    try:
+        ZoneInfo(tz)
+        return True
+    except Exception:
+        return False
+
+
+def _effective_tz(user_id: int, state: dict | None = None) -> str:
+    """
+    Effective TZ: broadcast_schedule.tz (if valid) -> user_settings.tz -> DEFAULT_TZ.
+
+    Note: UI only allows selecting from TOP_TIMEZONES, but existing states may contain other IANA ids.
+    """
+    if isinstance(state, dict):
+        schedule = state.get("broadcast_schedule")
+        if isinstance(schedule, dict):
+            tz = (schedule.get("tz") or "").strip()
+            if tz and _is_zoneinfo_tz(tz):
+                return tz
+    try:
+        tz = get_user_tz(int(user_id))
+    except Exception:
+        tz = ""
+    if tz and _is_zoneinfo_tz(tz):
+        return tz
+    return DEFAULT_TZ
+
+
+def _tz_label(tz: str) -> str:
+    return TZ_LABELS.get(tz, tz)
+
+
+def _tz_button_label(tz: str) -> str:
+    return f"🌍 TZ: {_tz_label(tz)}"
+
+
+def _tz_menu_text(current_tz: str) -> str:
+    return (
+        "🌍 <b>Часовой пояс</b>\n\n"
+        f"Текущий: <b>{_tz_label(current_tz)}</b>\n\n"
+        "Выберите основной пояс для бота.\n"
+        "Расписание авторассылки будет использовать этот TZ."
+    )
+
+
+def _tz_menu_keyboard(*, current_tz: str, back: str, page: int) -> InlineKeyboardMarkup:
+    page_size = 12
+    total_pages = max(1, (len(TOP_TIMEZONES) + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+
+    start = page * page_size
+    items = TOP_TIMEZONES[start:start + page_size]
+
+    rows: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for tz in items:
+        label = _tz_label(tz)
+        prefix = "✅ " if tz == current_tz else ""
+        row.append(InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"tzs|{back}|{tz}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"tzm|{back}|{page - 1}"))
+        else:
+            nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"tzm|{back}|{page + 1}"))
+        else:
+            nav.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+        rows.append(nav)
+
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _back_view_kind(back: str) -> tuple[str, str | None]:
+    """
+    Returns (kind, arg) for supported back targets.
+    """
+    if back == "bc_schedule":
+        return "bc_schedule", None
+    if back.startswith("bcs_day_"):
+        return "bcs_day", back[len("bcs_day_"):]
+    if back == "bc_settings":
+        return "bc_settings", None
+    if back == "settings":
+        return "settings", None
+    return "unknown", None
+
+
+def _settings_text_for_user(user_id: int) -> str:
+    tz = _effective_tz(int(user_id))
+    return (
+        "⚙️ <b>Настройки</b>\n\n"
+        f"🌍 TZ: <b>{_tz_label(tz)}</b>"
+    )
+
+
+def _broadcast_settings_text_for_user(user_id: int) -> str:
+    tz = _effective_tz(int(user_id))
+    return (
+        "⚙️ <b>Настройки рассылки</b>\n\n"
+        f"🌍 TZ: <b>{_tz_label(tz)}</b>\n\n"
+        "Здесь находятся настройки, которые относятся только к разделу «Рассылка»."
+    )
 
 
 def _normalize_hhmm(raw_value: str) -> str | None:
@@ -278,11 +421,15 @@ def main_keyboard(schedule_enabled: bool = True):
     ])
 
 
-def settings_keyboard():
+def settings_keyboard(*, user_id: int | None = None):
+    tz = _effective_tz(int(user_id)) if user_id is not None else DEFAULT_TZ
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📂 Категории", callback_data="categories"),
             InlineKeyboardButton(text="📊 Группы", callback_data="groups"),
+        ],
+        [
+            InlineKeyboardButton(text=_tz_button_label(tz), callback_data="tzm|settings|0"),
         ],
         [
             InlineKeyboardButton(text="🚫 Стоп-слова", callback_data="anti_keywords"),
@@ -344,18 +491,15 @@ def notifications_threshold_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def broadcast_settings_text() -> str:
-    return (
-        "⚙️ <b>Настройки рассылки</b>\n\n"
-        "Здесь находятся настройки, которые относятся только к разделу «Рассылка».\n"
-        "Новые параметры будут добавляться сюда."
-    )
+def broadcast_settings_text(user_id: int) -> str:
+    return _broadcast_settings_text_for_user(int(user_id))
 
 
-def broadcast_settings_keyboard() -> InlineKeyboardMarkup:
+def broadcast_settings_keyboard(*, user_id: int) -> InlineKeyboardMarkup:
+    tz = _effective_tz(int(user_id))
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Уведомления", callback_data="settings_notifications")],
-        [InlineKeyboardButton(text="🧩 Скоро: другие настройки", callback_data="noop")],
+        [InlineKeyboardButton(text=_tz_button_label(tz), callback_data="tzm|bc_settings|0")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
     ])
 
@@ -919,13 +1063,23 @@ def broadcast_posts_add_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def broadcast_week_text(state: dict) -> str:
+def broadcast_week_text(state: dict, *, user_id: int) -> str:
     schedule_enabled = state.get("broadcast_schedule", {}).get("enabled", True)
     weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
+    tz = _effective_tz(int(user_id), state)
+    try:
+        now_label = datetime.now(ZoneInfo(tz)).strftime("%H:%M")
+    except Exception:
+        tz = DEFAULT_TZ
+        now_label = datetime.now(ZoneInfo(tz)).strftime("%H:%M")
+
     lines = [
         "📅 <b>Расписание (неделя)</b>",
         "",
         f"Авторассылка: <b>{'ON' if schedule_enabled else 'OFF'}</b>",
+        f"TZ: <b>{_tz_label(tz)}</b>",
+        f"Сейчас: <b>{now_label}</b>",
+        "Все времена расписания указаны в этом TZ.",
         "Правило MVP: <b>1 запуск в день</b> (07:00–21:59).",
         "",
         "Текущие дни:",
@@ -943,16 +1097,18 @@ def broadcast_week_text(state: dict) -> str:
     return "\n".join(lines)
 
 
-def broadcast_week_keyboard() -> InlineKeyboardMarkup:
+def broadcast_week_keyboard(state: dict, *, user_id: int) -> InlineKeyboardMarkup:
+    tz = _effective_tz(int(user_id), state)
     days = [(WEEKDAY_NAMES[wd], f"bcs_day_{wd}") for wd in WEEKDAYS]
     row1 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[:3]]
     row2 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[3:6]]
     row3 = [InlineKeyboardButton(text=label, callback_data=cb) for label, cb in days[6:]]
-    row3.append(InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast"))
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
+    row3.append(InlineKeyboardButton(text=_tz_button_label(tz), callback_data="tzm|bc_schedule|0"))
+    row4 = [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3, row4])
 
 
-def broadcast_day_text(state: dict, weekday: str) -> str:
+def broadcast_day_text(state: dict, weekday: str, *, user_id: int) -> str:
     weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
     meta = weekly.get(weekday) or {}
     name = WEEKDAY_NAMES.get(weekday, weekday)
@@ -960,19 +1116,28 @@ def broadcast_day_text(state: dict, weekday: str) -> str:
     t = meta.get("time")
     status = "✅ открыт" if enabled else "⛔️ закрыт"
     time_label = f"<b>{t}</b>" if t else "не задано"
+    tz = _effective_tz(int(user_id), state)
+    try:
+        now_label = datetime.now(ZoneInfo(tz)).strftime("%H:%M")
+    except Exception:
+        tz = DEFAULT_TZ
+        now_label = datetime.now(ZoneInfo(tz)).strftime("%H:%M")
     return (
         f"📅 <b>День: {name}</b>\n\n"
         f"Статус: <b>{status}</b>\n"
-        f"Время: {time_label}\n\n"
+        f"Время: {time_label}\n"
+        f"TZ: <b>{_tz_label(tz)}</b> (сейчас {now_label})\n\n"
+        "Все времена для этого дня указаны в этом TZ.\n\n"
         "Введите время в формате <code>HH:MM</code> (например, <code>10:00</code> или <code>10.00</code>)."
     )
 
 
-def broadcast_day_keyboard(state: dict, weekday: str) -> InlineKeyboardMarkup:
+def broadcast_day_keyboard(state: dict, weekday: str, *, user_id: int) -> InlineKeyboardMarkup:
     weekly = state.get("weekly_schedule", {}) if isinstance(state.get("weekly_schedule", {}), dict) else {}
     meta = weekly.get(weekday) or {}
     enabled = bool(meta.get("enabled"))
     t = meta.get("time")
+    tz = _effective_tz(int(user_id), state)
     buttons = [
         [
             InlineKeyboardButton(text="✏️ Установить время" if not t else "✏️ Изменить время", callback_data=f"bcs_set_{weekday}"),
@@ -982,7 +1147,10 @@ def broadcast_day_keyboard(state: dict, weekday: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⛔️ Закрыть день" if enabled else "✅ Открыть день", callback_data=f"bcs_toggle_{weekday}"),
             InlineKeyboardButton(text="📋 Скопировать на…", callback_data=f"bcs_copy_{weekday}"),
         ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_schedule")],
+        [
+            InlineKeyboardButton(text=_tz_button_label(tz), callback_data=f"tzm|bcs_day_{weekday}|0"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data="bc_schedule"),
+        ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1759,10 +1927,11 @@ async def broadcast_launch_step_mass(query: CallbackQuery):
 
 @dp.callback_query(F.data == "bc_settings")
 async def broadcast_settings_menu(query: CallbackQuery):
+    user_id = query.from_user.id
     await query.message.edit_text(
-        broadcast_settings_text(),
+        broadcast_settings_text(user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_settings_keyboard(),
+        reply_markup=broadcast_settings_keyboard(user_id=user_id),
     )
     await query.answer()
 
@@ -3204,6 +3373,18 @@ async def broadcast_groups_add_input(message: Message, state: FSMContext):
         await message.answer("⛔️ Доступ только для пользователей.", reply_markup=back_button())
         return
 
+    # Валидация: не более одной группы за раз
+    if message.text:
+        lines = [l.strip() for l in message.text.strip().splitlines() if l.strip()]
+        if len(lines) > 1:
+            await message.answer(
+                "❌ Отправляйте по одной группе за раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+                ])
+            )
+            return
+
     ref = None
     # Forwarded message: try to extract chat id from multiple Bot API variants
     forward_from_chat = getattr(message, "forward_from_chat", None)
@@ -3225,26 +3406,42 @@ async def broadcast_groups_add_input(message: Message, state: FSMContext):
         ref = normalize_group_ref(message.text or "")
 
     if not ref:
-        await message.answer("❌ Не удалось распознать группу/чат. Пришлите @username или перешлите сообщение из чата.")
+        await message.answer(
+            "❌ <b>Не удалось распознать группу/чат.</b>\n\n"
+            "<b>Поддерживаемые форматы:</b>\n"
+            "• <code>@username</code>\n"
+            "• <code>https://t.me/username</code>\n"
+            "• числовой <code>chat_id</code>\n\n"
+            "Или перешлите любое сообщение из чата.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+            ])
+        )
         return
 
     added = add_user_broadcast_group(user_id, ref)
     if not added:
-        await message.answer("⚠️ Уже есть в списке.")
+        await message.answer(
+            "⚠️ <b>Уже есть в списке.</b>\n\n"
+            "Вы можете добавить другую группу или нажмите <b>◀️ Назад</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+            ])
+        )
+        return
     else:
-        await message.answer(f"✅ Добавлено: <code>{format_group_ref(ref)}</code>", parse_mode="HTML")
+        await message.answer(
+            f"✅ <b>Добавлено:</b> <code>{format_group_ref(ref)}</code>\n\n"
+            "Можете добавить ещё или нажмите <b>◀️ Назад</b>.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_groups")],
+            ])
+        )
 
     await state.set_state(MainMenu.viewing)
-    bm = scoped_broadcast_manager(user_id)
-    groups = scoped_load_broadcast_groups(user_id)
-    data = bm.ensure_groups_known(groups)
-    await message.answer(
-        "👥 <b>Выбор групп для рассылки</b>\n\n"
-        "✅ выбранные, ▫️ невыбранные, 🚫 недоступные.\n"
-        "Нажмите на группу, чтобы переключить.",
-        parse_mode="HTML",
-        reply_markup=broadcast_groups_keyboard(data, groups=groups, page=0, allow_manage=True),
-    )
 
 
 @dp.callback_query(F.data == "bcg_delete_mode")
@@ -3352,9 +3549,9 @@ async def broadcast_schedule_week(query: CallbackQuery, state: FSMContext):
     await state.set_state(MainMenu.viewing)
     data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
-        broadcast_week_text(data),
+        broadcast_week_text(data, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_week_keyboard(),
+        reply_markup=broadcast_week_keyboard(data, user_id=user_id),
         disable_web_page_preview=True,
     )
     await query.answer()
@@ -3370,9 +3567,9 @@ async def broadcast_schedule_day_open(query: CallbackQuery, state: FSMContext):
     await state.set_state(MainMenu.viewing)
     data = scoped_broadcast_manager(user_id).load()
     await query.message.edit_text(
-        broadcast_day_text(data, weekday),
+        broadcast_day_text(data, weekday, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_day_keyboard(data, weekday),
+        reply_markup=broadcast_day_keyboard(data, weekday, user_id=user_id),
         disable_web_page_preview=True,
     )
     await query.answer()
@@ -3424,7 +3621,7 @@ async def broadcast_schedule_day_set_input(message: Message, state: FSMContext):
     await message.answer(
         f"✅ Время сохранено: <b>{WEEKDAY_NAMES.get(weekday, weekday)} {hhmm}</b>",
         parse_mode="HTML",
-        reply_markup=broadcast_day_keyboard(st, weekday),
+        reply_markup=broadcast_day_keyboard(st, weekday, user_id=user_id),
     )
 
 
@@ -3438,9 +3635,9 @@ async def broadcast_schedule_day_clear(query: CallbackQuery):
         return
     data = bm.set_weekday_time(weekday, None)
     await query.message.edit_text(
-        broadcast_day_text(data, weekday),
+        broadcast_day_text(data, weekday, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_day_keyboard(data, weekday),
+        reply_markup=broadcast_day_keyboard(data, weekday, user_id=user_id),
     )
     await query.answer("Очищено")
 
@@ -3458,9 +3655,9 @@ async def broadcast_schedule_day_toggle(query: CallbackQuery):
     new_enabled = not bool(meta.get("enabled"))
     data = bm.set_weekday_enabled(weekday, new_enabled)
     await query.message.edit_text(
-        broadcast_day_text(data, weekday),
+        broadcast_day_text(data, weekday, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_day_keyboard(data, weekday),
+        reply_markup=broadcast_day_keyboard(data, weekday, user_id=user_id),
     )
     await query.answer("Обновлено")
 
@@ -3498,9 +3695,9 @@ async def broadcast_schedule_copy_confirm(query: CallbackQuery, state: FSMContex
     await state.set_state(MainMenu.viewing)
     data = bm.load()
     await query.message.edit_text(
-        broadcast_day_text(data, source),
+        broadcast_day_text(data, source, user_id=user_id),
         parse_mode="HTML",
-        reply_markup=broadcast_day_keyboard(data, source),
+        reply_markup=broadcast_day_keyboard(data, source, user_id=user_id),
     )
     await query.answer("✅ Скопировано")
 
@@ -4522,10 +4719,11 @@ async def status_callback(query: CallbackQuery):
 
 @dp.callback_query(F.data == "settings")
 async def settings_callback(query: CallbackQuery):
+    user_id = query.from_user.id
     await query.message.edit_text(
-        "⚙️ <b>Настройки</b>",
+        _settings_text_for_user(user_id),
         parse_mode="HTML",
-        reply_markup=settings_keyboard()
+        reply_markup=settings_keyboard(user_id=user_id)
     )
     await query.answer()
 

@@ -82,6 +82,13 @@ class BroadcastManager:
         state.setdefault("notifications", self._default_state()["notifications"])
         state.setdefault("test_log", self._default_state()["test_log"])
 
+        schedule = state.get("broadcast_schedule")
+        if not isinstance(schedule, dict):
+            schedule = self._default_state()["broadcast_schedule"]
+            state["broadcast_schedule"] = schedule
+        schedule.setdefault("enabled", True)
+        schedule.setdefault("tz", self.default_tz)
+
         notifications = state.get("notifications")
         if not isinstance(notifications, dict):
             notifications = self._default_state()["notifications"]
@@ -415,6 +422,16 @@ class BroadcastManager:
     def set_schedule_enabled(self, enabled: bool) -> dict:
         state = self.load()
         state["broadcast_schedule"]["enabled"] = enabled
+        self.save(state)
+        return state
+
+    def set_schedule_tz(self, tz: str) -> dict:
+        state = self.load()
+        schedule = state.setdefault("broadcast_schedule", self._default_state()["broadcast_schedule"])
+        if not isinstance(schedule, dict):
+            schedule = self._default_state()["broadcast_schedule"]
+            state["broadcast_schedule"] = schedule
+        schedule["tz"] = (tz or "").strip()
         self.save(state)
         return state
 
