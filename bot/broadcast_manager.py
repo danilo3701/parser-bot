@@ -119,9 +119,11 @@ class BroadcastManager:
             else:
                 schedule["started_at"] = None
 
-        # Migration: add consecutive_failures field for existing groups
+        # Migration: add consecutive_failures field for existing groups (run once per user)
         groups_state = state.get("broadcast_groups_state", {})
-        if isinstance(groups_state, dict):
+        if isinstance(groups_state, dict) and any(
+            "consecutive_failures" not in g for g in groups_state.values() if isinstance(g, dict)
+        ):
             for g_state in groups_state.values():
                 if isinstance(g_state, dict):
                     g_state.setdefault("consecutive_failures", 0)
@@ -829,9 +831,7 @@ class BroadcastManager:
             "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
             "sent_message_ids": dict(sent_message_ids or {}),
         }
-        self.save(state)
-
-        # Append to run history
+        # Inline history append to avoid a second load+save cycle
         history_entry = {
             "id": run_id or uuid.uuid4().hex[:8],
             "kind": str(kind or "manual"),
@@ -848,7 +848,13 @@ class BroadcastManager:
             "post_total": int(post_total),
             "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
         }
-        self.append_run_history(history_entry)
+        history = state.setdefault("run_history", [])
+        if not isinstance(history, list):
+            history = []
+            state["run_history"] = history
+        history.append(history_entry)
+        state["run_history"] = history[-50:]
+        self.save(state)
         return state
 
     def get_consecutive_failed_runs(self) -> int:
@@ -880,7 +886,7 @@ class BroadcastManager:
 
     # ─── Per-group failure tracking ─────────────────────────────────────────────
 
-    def inc_group_consecutive_failures(self, group: str, reason: str = "") -> int:
+    def inc_group_consecutive_failures(self, group: str) -> int:
         """Increment consecutive failure counter for a group, return new count."""
         state = self.load()
         g_state = state["broadcast_groups_state"].setdefault(

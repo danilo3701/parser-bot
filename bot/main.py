@@ -1582,6 +1582,17 @@ def get_active_selected_groups(state: dict, groups: list[str]) -> list[str]:
     return get_active_selected_groups_from(state, groups)
 
 
+def _apply_group_failure_tracking(bm, result: dict) -> None:
+    """Process group failure counters and auto-block after threshold."""
+    failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+    for group, err in failed_groups.items():
+        count = bm.inc_group_consecutive_failures(group)
+        if count >= GROUP_CONSECUTIVE_FAILURE_LIMIT:
+            bm.set_group_unavailable(group, err)
+    for group in result.get("sent_message_ids", {}).keys():
+        bm.reset_group_consecutive_failures(group)
+
+
 def _rotation_info(state: dict) -> tuple[int, int, int]:
     """
     Returns (current_post_number_1based, total_posts, next_post_number_1based).
@@ -1857,16 +1868,8 @@ async def scheduler_loop():
                 for group, err in blocked_groups.items():
                     bm.set_group_blocked(group, err)
 
-                # Handle temporary failures: increment counter and auto-block after threshold
-                failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
-                for group, err in failed_groups.items():
-                    count = bm.inc_group_consecutive_failures(group, err)
-                    if count >= GROUP_CONSECUTIVE_FAILURE_LIMIT:
-                        bm.set_group_unavailable(group, err)
-
-                # Reset counters for successfully sent groups
-                for group in result.get("sent_message_ids", {}).keys():
-                    bm.reset_group_consecutive_failures(group)
+                # Handle temporary failures and success counters
+                _apply_group_failure_tracking(bm, result)
 
                 ok_run = bool(result.get("ok"))
                 status = "ok" if ok_run else "failed"
@@ -5055,16 +5058,8 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         for group, err in blocked_groups.items():
             bm.set_group_blocked(group, err)
 
-        # Handle temporary failures: increment counter and auto-block after threshold
-        failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
-        for group, err in failed_groups.items():
-            count = bm.inc_group_consecutive_failures(group, err)
-            if count >= GROUP_CONSECUTIVE_FAILURE_LIMIT:
-                bm.set_group_unavailable(group, err)
-
-        # Reset counters for successfully sent groups
-        for group in result.get("sent_message_ids", {}).keys():
-            bm.reset_group_consecutive_failures(group)
+        # Handle temporary failures and success counters
+        _apply_group_failure_tracking(bm, result)
 
         # Spend inside lock so next waiter sees updated balance.
         sent_count = int(result.get("sent_count", 0) or 0)
@@ -5095,8 +5090,6 @@ async def broadcast_confirm_mass(query: CallbackQuery):
             post_total=total_posts,
             next_post_index=next_post_for_user if next_post_for_user else None,
             sent_message_ids=result.get("sent_message_ids", {}),
-            slot=None,
-            run_id=None,
         )
 
     # Get updated balance
@@ -5247,7 +5240,7 @@ async def broadcast_run_history(query: CallbackQuery):
         history = []
 
     # Show most recent 15, newest first
-    recent = list(reversed(history[-15:]))
+    recent = history[-15:][::-1]
 
     if not recent:
         text = (
