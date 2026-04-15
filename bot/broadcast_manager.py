@@ -45,6 +45,8 @@ class BroadcastManager:
             # New schedule model: weekly day -> {enabled, time}
             "weekly_schedule": {wd: {"enabled": False, "time": None} for wd in WEEKDAYS},
             "last_runs": {},
+            # Run history: list of all manual and auto runs (capped at 50)
+            "run_history": [],
             # Runtime state for production resilience (Phase 8).
             # active_run is used to prevent parallel runs per user and to detect "stuck" runs after restarts.
             "runtime": {
@@ -88,6 +90,7 @@ class BroadcastManager:
         state.setdefault("scanner_session", "")
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
+        state.setdefault("run_history", [])
         state.setdefault("weekly_schedule", self._default_state()["weekly_schedule"])
         state.setdefault("runtime", self._default_state()["runtime"])
         state.setdefault("notifications", self._default_state()["notifications"])
@@ -115,6 +118,13 @@ class BroadcastManager:
                 schedule["started_at"] = earliest or datetime.now(timezone.utc).isoformat()
             else:
                 schedule["started_at"] = None
+
+        # Migration: add consecutive_failures field for existing groups
+        groups_state = state.get("broadcast_groups_state", {})
+        if isinstance(groups_state, dict):
+            for g_state in groups_state.values():
+                if isinstance(g_state, dict):
+                    g_state.setdefault("consecutive_failures", 0)
 
         notifications = state.get("notifications")
         if not isinstance(notifications, dict):
@@ -203,6 +213,7 @@ class BroadcastManager:
                     "status": "active",
                     "reason": "",
                     "updated_at": None,
+                    "consecutive_failures": 0,
                     "last_test_status": None,
                     "last_test_reason": None,
                     "last_test_message_id": None,
@@ -395,10 +406,24 @@ class BroadcastManager:
         state = self.load()
         group_state = state["broadcast_groups_state"].setdefault(
             group,
-            {"status": "active", "reason": "", "updated_at": None},
+            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
         )
         group_state["status"] = "blocked"
         group_state["reason"] = reason
+        group_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.save(state)
+        return state
+
+    def set_group_unavailable(self, group: str, reason: str) -> dict:
+        """Mark group as unavailable due to consecutive temporary failures."""
+        state = self.load()
+        group_state = state["broadcast_groups_state"].setdefault(
+            group,
+            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
+        )
+        group_state["status"] = "unavailable"
+        group_state["reason"] = reason
+        group_state["consecutive_failures"] = 0
         group_state["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.save(state)
         return state
@@ -407,7 +432,7 @@ class BroadcastManager:
         state = self.load()
         group_state = state["broadcast_groups_state"].setdefault(
             group,
-            {"status": "active", "reason": "", "updated_at": None},
+            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
         )
         group_state["status"] = "active"
         group_state["reason"] = ""
@@ -782,14 +807,17 @@ class BroadcastManager:
         post_total: int,
         next_post_index: int | None,
         sent_message_ids: dict | None = None,
+        slot: str | None = None,
+        run_id: str | None = None,
     ) -> dict:
         state = self.load()
         runtime = state.setdefault("runtime", self._default_state()["runtime"])
         runtime["active_run"] = None
+        finished_at = datetime.now(timezone.utc).isoformat()
         runtime["last_run"] = {
             "kind": str(kind or "manual"),
             "ok": bool(ok),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": finished_at,
             "summary": str(summary or ""),
             "groups_total": int(groups_total),
             "sent_count": int(sent_count),
@@ -802,6 +830,25 @@ class BroadcastManager:
             "sent_message_ids": dict(sent_message_ids or {}),
         }
         self.save(state)
+
+        # Append to run history
+        history_entry = {
+            "id": run_id or uuid.uuid4().hex[:8],
+            "kind": str(kind or "manual"),
+            "slot": slot,
+            "finished_at": finished_at,
+            "ok": bool(ok),
+            "summary": str(summary or ""),
+            "groups_total": int(groups_total),
+            "sent_count": int(sent_count),
+            "blocked_count": int(blocked_count),
+            "failed_count": int(failed_count),
+            "spent_posts": int(spent_posts),
+            "post_index": int(post_index),
+            "post_total": int(post_total),
+            "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
+        }
+        self.append_run_history(history_entry)
         return state
 
     def get_consecutive_failed_runs(self) -> int:
@@ -830,3 +877,43 @@ class BroadcastManager:
         runtime["consecutive_failed_runs"] = current
         self.save(state)
         return current
+
+    # ─── Per-group failure tracking ─────────────────────────────────────────────
+
+    def inc_group_consecutive_failures(self, group: str, reason: str = "") -> int:
+        """Increment consecutive failure counter for a group, return new count."""
+        state = self.load()
+        g_state = state["broadcast_groups_state"].setdefault(
+            group, {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0}
+        )
+        try:
+            current = int(g_state.get("consecutive_failures", 0))
+        except Exception:
+            current = 0
+        current = max(0, current) + 1
+        g_state["consecutive_failures"] = current
+        g_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.save(state)
+        return current
+
+    def reset_group_consecutive_failures(self, group: str) -> dict:
+        """Reset consecutive failure counter to 0 on successful broadcast."""
+        state = self.load()
+        g_state = state["broadcast_groups_state"].get(group)
+        if isinstance(g_state, dict):
+            g_state["consecutive_failures"] = 0
+            g_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.save(state)
+        return state
+
+    def append_run_history(self, entry: dict) -> dict:
+        """Append a run record to history and trim to 50 entries."""
+        state = self.load()
+        history = state.setdefault("run_history", [])
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        # Keep only the last 50 entries
+        state["run_history"] = history[-50:]
+        self.save(state)
+        return state

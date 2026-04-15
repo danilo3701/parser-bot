@@ -92,6 +92,7 @@ TEST_COOLDOWN_SECONDS = int(os.getenv("TEST_COOLDOWN_SECONDS", "30") or "30")
 TEST_MAX_PER_DAY = int(os.getenv("TEST_MAX_PER_DAY", "5") or "5")
 TEST_FRESH_TTL_SECONDS = int(os.getenv("TEST_FRESH_TTL_SECONDS", "86400") or "86400")
 READINESS_TTL_SECONDS = int(os.getenv("READINESS_TTL_SECONDS", "1800") or "1800")
+GROUP_CONSECUTIVE_FAILURE_LIMIT = 3
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
     int(item.strip())
@@ -868,7 +869,7 @@ def get_active_selected_groups_from(state: dict, groups: list[str]) -> list[str]
     return [
         group
         for group in (groups or [])
-        if group in selected and groups_state.get(group, {}).get("status") != "blocked"
+        if group in selected and groups_state.get(group, {}).get("status") not in ("blocked", "unavailable")
     ]
 
 
@@ -1505,7 +1506,9 @@ def broadcast_groups_keyboard(
         buttons.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="bcg_add")])
     for group in page_groups:
         group_meta = groups_state.get(group, {})
-        blocked = group_meta.get("status") == "blocked"
+        status = group_meta.get("status", "active")
+        blocked = status == "blocked"
+        unavailable = status == "unavailable"
         last_status = (group_meta.get("last_test_status") or "").strip()
         status_icon = {
             "ok": "✅",
@@ -1516,6 +1519,8 @@ def broadcast_groups_keyboard(
         label = format_group_ref(group)
         if blocked:
             text = f"🚫 {status_icon} {label}".replace("  ", " ").strip()
+        elif unavailable:
+            text = f"⛔ {status_icon} {label}".replace("  ", " ").strip()
         else:
             prefix = "✅" if group in selected else "▫️"
             text = f"{prefix} {status_icon} {label}".replace("  ", " ").strip()
@@ -1848,17 +1853,28 @@ async def scheduler_loop():
                             sent_count=sent_count,
                             summary=f"Авторассылка: {sent_count} групп",
                         )
-                for group, err in result.get("blocked_groups", {}).items():
+                blocked_groups = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
+                for group, err in blocked_groups.items():
                     bm.set_group_blocked(group, err)
+
+                # Handle temporary failures: increment counter and auto-block after threshold
+                failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+                for group, err in failed_groups.items():
+                    count = bm.inc_group_consecutive_failures(group, err)
+                    if count >= GROUP_CONSECUTIVE_FAILURE_LIMIT:
+                        bm.set_group_unavailable(group, err)
+
+                # Reset counters for successfully sent groups
+                for group in result.get("sent_message_ids", {}).keys():
+                    bm.reset_group_consecutive_failures(group)
 
                 ok_run = bool(result.get("ok"))
                 status = "ok" if ok_run else "failed"
                 bm.mark_slot_run(date_str, slot, status, result.get("summary", ""))
 
-                blocked_groups = result.get("blocked_groups", {}) if isinstance(result.get("blocked_groups", {}), dict) else {}
-                failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
                 after_state = bm.load()
                 next_post_for_user, total_posts_after, _ = _rotation_info(after_state)
+                slot_str = f"{date_str} {slot}"
                 bm.end_run(
                     kind="auto",
                     ok=ok_run,
@@ -1872,6 +1888,8 @@ async def scheduler_loop():
                     post_total=total_posts,
                     next_post_index=next_post_for_user if next_post_for_user else None,
                     sent_message_ids=result.get("sent_message_ids", {}),
+                    slot=slot_str,
+                    run_id=None,
                 )
 
                 if ok_run:
@@ -5037,6 +5055,17 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         for group, err in blocked_groups.items():
             bm.set_group_blocked(group, err)
 
+        # Handle temporary failures: increment counter and auto-block after threshold
+        failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
+        for group, err in failed_groups.items():
+            count = bm.inc_group_consecutive_failures(group, err)
+            if count >= GROUP_CONSECUTIVE_FAILURE_LIMIT:
+                bm.set_group_unavailable(group, err)
+
+        # Reset counters for successfully sent groups
+        for group in result.get("sent_message_ids", {}).keys():
+            bm.reset_group_consecutive_failures(group)
+
         # Spend inside lock so next waiter sees updated balance.
         sent_count = int(result.get("sent_count", 0) or 0)
         spend_ok = True
@@ -5053,7 +5082,6 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         # Persist last run details for "Publications" screen.
         after_state = bm.load()
         next_post_for_user, total_posts_after, _ = _rotation_info(after_state)
-        failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
         bm.end_run(
             kind="manual",
             ok=bool(result.get("ok")),
@@ -5067,6 +5095,8 @@ async def broadcast_confirm_mass(query: CallbackQuery):
             post_total=total_posts,
             next_post_index=next_post_for_user if next_post_for_user else None,
             sent_message_ids=result.get("sent_message_ids", {}),
+            slot=None,
+            run_id=None,
         )
 
     # Get updated balance
@@ -5097,11 +5127,21 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         if blocked_count > len(shown):
             result_text += "• ...\n"
 
+    if failed_count > 0:
+        shown_f = list(failed_groups.keys())[:5]
+        result_text += f"\n\n⚠️ <b>ВРЕМЕННЫЕ ОШИБКИ</b> ({failed_count}):\n"
+        for group in shown_f:
+            err = failed_groups.get(group, "unknown")
+            result_text += f"• <code>{group}</code> — {err}\n"
+        if failed_count > len(shown_f):
+            result_text += "• ...\n"
+
     await query.message.edit_text(
         result_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📄 Посмотреть публикации", callback_data="bc_publications")],
+            [InlineKeyboardButton(text="🕐 История рассылок", callback_data="bc_run_history")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
         ]),
     )
@@ -5189,7 +5229,65 @@ async def broadcast_last_run(query: CallbackQuery):
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📄 Посмотреть публикации", callback_data="bc_publications")],
+            [InlineKeyboardButton(text="🕐 История рассылок", callback_data="bc_run_history")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="broadcast")],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "bc_run_history")
+async def broadcast_run_history(query: CallbackQuery):
+    """Show broadcast run history (last 15 runs)."""
+    user_id = query.from_user.id
+    bm = scoped_broadcast_manager(user_id)
+    state = bm.load()
+    history = state.get("run_history", [])
+    if not isinstance(history, list):
+        history = []
+
+    # Show most recent 15, newest first
+    recent = list(reversed(history[-15:]))
+
+    if not recent:
+        text = (
+            "🕐 <b>История рассылок</b>\n\n"
+            "Запусков пока не было.\n"
+            "История появится после первой рассылки."
+        )
+    else:
+        lines = []
+        for entry in recent:
+            kind_label = "авто" if entry.get("kind") == "auto" else "ручная"
+            ok_icon = "✅" if entry.get("ok") else "❌"
+            finished_at = entry.get("finished_at", "")
+            try:
+                dt = datetime.fromisoformat(finished_at)
+                dt_label = dt.strftime("%d.%m %H:%M")
+            except Exception:
+                dt_label = finished_at[:16] if finished_at else "?"
+            sent = int(entry.get("sent_count", 0) or 0)
+            total = int(entry.get("groups_total", 0) or 0)
+            blocked = int(entry.get("blocked_count", 0) or 0)
+            failed = int(entry.get("failed_count", 0) or 0)
+            slot = entry.get("slot") or ""
+            slot_label = f" ({slot})" if slot else ""
+            line = (
+                f"{ok_icon} {dt_label} [{kind_label}{slot_label}] "
+                f"✉️{sent}/{total}"
+            )
+            if blocked:
+                line += f" 🚫{blocked}"
+            if failed:
+                line += f" ⚠️{failed}"
+            lines.append(line)
+        text = "🕐 <b>История рассылок</b> (последние 15)\n\n" + "\n".join(lines)
+
+    await query.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="bc_last_run")],
         ]),
     )
     await query.answer()
