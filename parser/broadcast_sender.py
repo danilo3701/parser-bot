@@ -376,3 +376,33 @@ async def verify_and_delete_test_messages(
         results[str(group)] = row
 
     return results
+
+
+async def verify_broadcast_messages(
+    *,
+    client,
+    message_ids: dict[str, int],
+    wait_seconds: int = 0,
+) -> dict[str, bool]:
+    """
+    Wait (optionally) and verify that broadcast messages are still present.
+
+    Returns: {group: True if message exists, False otherwise}
+    """
+    if wait_seconds and wait_seconds > 0:
+        await asyncio.sleep(wait_seconds)
+
+    results: dict[str, bool] = {}
+    for group, msg_id in (message_ids or {}).items():
+        found = False
+        try:
+            entity = await client.get_entity(_as_entity_ref(group))
+            message = await client.get_messages(entity, ids=int(msg_id))
+            if isinstance(message, list):
+                message = message[0] if message else None
+            found = bool(message)
+        except Exception:
+            found = False
+        results[str(group)] = bool(found)
+
+    return results

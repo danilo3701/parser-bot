@@ -192,6 +192,31 @@ class BalanceManager:
         self.save(state)
         return True
 
+    def refund_posts(self, amount: int, summary: str) -> bool:
+        """
+        Refund posts back to balance (e.g. post was removed after sending).
+
+        Args:
+            amount: Number of posts to refund
+            summary: Human-readable reason for refund
+
+        Returns:
+            True if successful
+        """
+        if amount <= 0:
+            return False
+
+        state = self.load()
+        state["posts"] = int(state.get("posts", 0) or 0) + int(amount)
+        state["history"].append({
+            "type": "refund",
+            "amount": int(amount),
+            "summary": str(summary or "").strip(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+        self.save(state)
+        return True
+
     def get_history(self, limit: int = 10) -> list:
         """Get transaction history (last N entries)."""
         state = self.load()

@@ -127,6 +127,12 @@ class BroadcastManager:
             for g_state in groups_state.values():
                 if isinstance(g_state, dict):
                     g_state.setdefault("consecutive_failures", 0)
+        if isinstance(groups_state, dict) and any(
+            "consecutive_unverified" not in g for g in groups_state.values() if isinstance(g, dict)
+        ):
+            for g_state in groups_state.values():
+                if isinstance(g_state, dict):
+                    g_state.setdefault("consecutive_unverified", 0)
 
         notifications = state.get("notifications")
         if not isinstance(notifications, dict):
@@ -216,6 +222,7 @@ class BroadcastManager:
                     "reason": "",
                     "updated_at": None,
                     "consecutive_failures": 0,
+                    "consecutive_unverified": 0,
                     "last_test_status": None,
                     "last_test_reason": None,
                     "last_test_message_id": None,
@@ -408,7 +415,13 @@ class BroadcastManager:
         state = self.load()
         group_state = state["broadcast_groups_state"].setdefault(
             group,
-            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
+            {
+                "status": "active",
+                "reason": "",
+                "updated_at": None,
+                "consecutive_failures": 0,
+                "consecutive_unverified": 0,
+            },
         )
         group_state["status"] = "blocked"
         group_state["reason"] = reason
@@ -421,7 +434,13 @@ class BroadcastManager:
         state = self.load()
         group_state = state["broadcast_groups_state"].setdefault(
             group,
-            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
+            {
+                "status": "active",
+                "reason": "",
+                "updated_at": None,
+                "consecutive_failures": 0,
+                "consecutive_unverified": 0,
+            },
         )
         group_state["status"] = "unavailable"
         group_state["reason"] = reason
@@ -434,7 +453,13 @@ class BroadcastManager:
         state = self.load()
         group_state = state["broadcast_groups_state"].setdefault(
             group,
-            {"status": "active", "reason": "", "updated_at": None, "consecutive_failures": 0},
+            {
+                "status": "active",
+                "reason": "",
+                "updated_at": None,
+                "consecutive_failures": 0,
+                "consecutive_unverified": 0,
+            },
         )
         group_state["status"] = "active"
         group_state["reason"] = ""
@@ -830,6 +855,11 @@ class BroadcastManager:
             "post_total": int(post_total),
             "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
             "sent_message_ids": dict(sent_message_ids or {}),
+            "verification_status": "pending",
+            "verification_results": {},
+            "verified_count": 0,
+            "not_verified_count": 0,
+            "refunded_posts": 0,
         }
         # Inline history append to avoid a second load+save cycle
         history_entry = {
@@ -847,6 +877,11 @@ class BroadcastManager:
             "post_index": int(post_index),
             "post_total": int(post_total),
             "next_post_index": int(next_post_index) if isinstance(next_post_index, int) else None,
+            "verification_status": "pending",
+            "verification_results": {},
+            "verified_count": 0,
+            "not_verified_count": 0,
+            "refunded_posts": 0,
         }
         history = state.setdefault("run_history", [])
         if not isinstance(history, list):
@@ -910,6 +945,77 @@ class BroadcastManager:
             g_state["consecutive_failures"] = 0
             g_state["updated_at"] = datetime.now(timezone.utc).isoformat()
             self.save(state)
+        return state
+
+    def inc_group_consecutive_unverified(self, group: str) -> int:
+        """Increment consecutive unverified counter for a group, return new count."""
+        state = self.load()
+        g_state = state["broadcast_groups_state"].setdefault(
+            group,
+            {
+                "status": "active",
+                "reason": "",
+                "updated_at": None,
+                "consecutive_failures": 0,
+                "consecutive_unverified": 0,
+            },
+        )
+        try:
+            current = int(g_state.get("consecutive_unverified", 0))
+        except Exception:
+            current = 0
+        current = max(0, current) + 1
+        g_state["consecutive_unverified"] = current
+        g_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.save(state)
+        return current
+
+    def reset_group_consecutive_unverified(self, group: str) -> dict:
+        """Reset consecutive unverified counter to 0 when post remains in group."""
+        state = self.load()
+        g_state = state["broadcast_groups_state"].get(group)
+        if isinstance(g_state, dict):
+            g_state["consecutive_unverified"] = 0
+            g_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self.save(state)
+        return state
+
+    def set_verification_results(
+        self,
+        results: dict[str, bool],
+        refunded: int,
+        verification_status: str = "complete",
+    ) -> dict:
+        state = self.load()
+        runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
+        last_run = runtime.get("last_run")
+        if not isinstance(last_run, dict):
+            return state
+
+        normalized_results = {str(group): bool(found) for group, found in (results or {}).items()}
+        verified_count = sum(1 for found in normalized_results.values() if found)
+        not_verified_count = sum(1 for found in normalized_results.values() if not found)
+        refunded_posts = max(0, int(refunded or 0))
+
+        last_run["verification_status"] = str(verification_status or "complete")
+        last_run["verification_results"] = normalized_results
+        last_run["verified_count"] = int(verified_count)
+        last_run["not_verified_count"] = int(not_verified_count)
+        last_run["refunded_posts"] = refunded_posts
+
+        finished_at = last_run.get("finished_at")
+        history = state.get("run_history", [])
+        if isinstance(history, list):
+            for entry in reversed(history):
+                if isinstance(entry, dict) and entry.get("finished_at") == finished_at:
+                    entry["verification_status"] = str(verification_status or "complete")
+                    entry["verification_results"] = normalized_results
+                    entry["verified_count"] = int(verified_count)
+                    entry["not_verified_count"] = int(not_verified_count)
+                    entry["refunded_posts"] = refunded_posts
+                    break
+
+        self.save(state)
         return state
 
     def append_run_history(self, entry: dict) -> dict:

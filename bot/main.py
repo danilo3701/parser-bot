@@ -51,7 +51,11 @@ from groups_manager import load_groups, add_group, delete_group
 from anti_keywords_manager import load_anti_keywords, add_anti_keyword, remove_anti_keyword
 from broadcast_manager import BroadcastManager
 from balance_manager import BalanceManager, scoped_balance_manager
-from broadcast_sender import send_broadcast_campaign_with_client, verify_and_delete_test_messages
+from broadcast_sender import (
+    send_broadcast_campaign_with_client,
+    verify_and_delete_test_messages,
+    verify_broadcast_messages,
+)
 from stripe_handler import create_checkout_session, process_webhook, STRIPE_PRICES
 from storage_paths import state_file, user_data_dir
 from mtproto_accounts import (
@@ -88,11 +92,13 @@ BROADCAST_TZ = os.getenv("BROADCAST_TZ", "Europe/Madrid")
 BROADCAST_TIMES = ["08:12", "11:33", "17:40", "22:30"]
 BROADCAST_TIME_OPTIONS = ["07:00", "08:12", "09:00", "11:33", "12:00", "15:00", "17:40", "18:00", "21:00", "22:30"]
 BROADCAST_TEST_VERIFY_SECONDS = int(os.getenv("BROADCAST_TEST_VERIFY_SECONDS", "60") or "60")
+BROADCAST_VERIFY_WAIT_SECONDS = 30
 TEST_COOLDOWN_SECONDS = int(os.getenv("TEST_COOLDOWN_SECONDS", "30") or "30")
 TEST_MAX_PER_DAY = int(os.getenv("TEST_MAX_PER_DAY", "5") or "5")
 TEST_FRESH_TTL_SECONDS = int(os.getenv("TEST_FRESH_TTL_SECONDS", "86400") or "86400")
 READINESS_TTL_SECONDS = int(os.getenv("READINESS_TTL_SECONDS", "1800") or "1800")
 GROUP_CONSECUTIVE_FAILURE_LIMIT = 3
+GROUP_CONSECUTIVE_UNVERIFIED_LIMIT = 3
 OWNER_IDS_ENV = os.getenv("OWNER_IDS") or os.getenv("OWNER_ID", "")
 OWNER_IDS = {
     int(item.strip())
@@ -1738,6 +1744,96 @@ async def notify_user(user_id: int, text: str):
         pass
 
 
+async def _run_post_broadcast_verification(user_id: int, sent_message_ids: dict[str, int]):
+    if not isinstance(sent_message_ids, dict) or not sent_message_ids:
+        return
+
+    await asyncio.sleep(BROADCAST_VERIFY_WAIT_SECONDS)
+
+    bm = scoped_broadcast_manager(user_id)
+    balance_mgr = scoped_balance_manager(user_id)
+    session_string = bm.get_scanner_session()
+    if not session_string:
+        bm.set_verification_results({}, refunded=0, verification_status="skipped")
+        await notify_user(user_id, "⚠️ Проверка публикаций пропущена: нет подключённого аккаунта")
+        return
+
+    meta = get_account(user_id) or {}
+    try:
+        api_id = int(meta.get("api_id") or 0)
+    except Exception:
+        api_id = 0
+    api_hash = (meta.get("api_hash") or "").strip()
+    if not api_id or not api_hash:
+        bm.set_verification_results({}, refunded=0, verification_status="skipped")
+        await notify_user(user_id, "⚠️ Проверка публикаций пропущена: нет api_id/api_hash аккаунта")
+        return
+
+    normalized_ids: dict[str, int] = {}
+    for group, mid in sent_message_ids.items():
+        try:
+            normalized_ids[str(group)] = int(mid)
+        except Exception:
+            continue
+    if not normalized_ids:
+        bm.set_verification_results({}, refunded=0, verification_status="skipped")
+        return
+
+    client = make_client_from_string_session(api_id, api_hash, session_string)
+    try:
+        await client.connect()
+        results = await verify_broadcast_messages(
+            client=client,
+            message_ids=normalized_ids,
+            wait_seconds=0,
+        )
+    except Exception:
+        bm.set_verification_results({}, refunded=0, verification_status="skipped")
+        await notify_user(user_id, "⚠️ Проверка публикаций не выполнена из-за ошибки подключения аккаунта")
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+    blocked_from_this_check = 0
+    for group, found in results.items():
+        if found:
+            bm.reset_group_consecutive_unverified(group)
+            continue
+        count = bm.inc_group_consecutive_unverified(group)
+        if count >= GROUP_CONSECUTIVE_UNVERIFIED_LIMIT:
+            bm.set_group_unavailable(group, "not_verified")
+            blocked_from_this_check += 1
+
+    not_found_groups = [group for group, found in results.items() if not found]
+    refund_count = len(not_found_groups)
+    if refund_count > 0:
+        balance_mgr.refund_posts(
+            refund_count,
+            f"Возврат за удалённые посты: {refund_count}",
+        )
+
+    bm.set_verification_results(results, refunded=refund_count, verification_status="complete")
+
+    total = len(results)
+    verified_count = sum(1 for found in results.values() if found)
+    not_verified_count = sum(1 for found in results.values() if not found)
+    lines = [
+        "✅ <b>ПРОВЕРКА ПУБЛИКАЦИЙ ЗАВЕРШЕНА</b>",
+        "",
+        f"Проверено: {total} сообщений",
+        f"✅ Подтверждено: {verified_count}",
+        f"❌ Удалено администраторами: {not_verified_count}",
+    ]
+    if refund_count > 0:
+        lines.extend(["", f"↩️ Возвращено на баланс: {refund_count} постов"])
+    if blocked_from_this_check > 0:
+        lines.extend(["", f"⛔ {blocked_from_this_check} групп заблокировано (3+ удалений подряд)"])
+    if refund_count == 0:
+        lines.extend(["", "Все публикации на месте 👍"])
+    await notify_user(user_id, "\n".join(lines))
+
+
 async def scheduler_loop():
     while True:
         try:
@@ -1894,6 +1990,10 @@ async def scheduler_loop():
                     slot=slot_str,
                     run_id=None,
                 )
+                if sent_count > 0:
+                    asyncio.create_task(
+                        _run_post_broadcast_verification(user_id, result.get("sent_message_ids", {}))
+                    )
 
                 if ok_run:
                     bm.reset_consecutive_failed_runs()
@@ -1922,6 +2022,8 @@ async def scheduler_loop():
                     f"💰 Потрачено: {sent_count} постов\n"
                     f"📉 Баланс: {new_balance} постов"
                 )
+                if sent_count > 0:
+                    analytics_text += f"\n\n⏳ Проверка публикаций через {BROADCAST_VERIFY_WAIT_SECONDS} сек..."
                 if failed_count > 0:
                     analytics_text += "\n\n⚠️ Есть неудачные группы — запустите тест."
                 await notify_user(user_id, analytics_text)
@@ -5063,6 +5165,7 @@ async def broadcast_confirm_mass(query: CallbackQuery):
 
         # Spend inside lock so next waiter sees updated balance.
         sent_count = int(result.get("sent_count", 0) or 0)
+        failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
         spend_ok = True
         if sent_count > 0:
             spend_ok = balance_mgr.spend_posts(
@@ -5094,7 +5197,6 @@ async def broadcast_confirm_mass(query: CallbackQuery):
 
     # Get updated balance
     balance_after = balance_mgr.get_balance()
-    failed_groups = result.get("failed_groups", {}) if isinstance(result.get("failed_groups", {}), dict) else {}
     blocked_count = len(blocked_groups)
     failed_count = len(failed_groups)
 
@@ -5128,6 +5230,12 @@ async def broadcast_confirm_mass(query: CallbackQuery):
             result_text += f"• <code>{group}</code> — {err}\n"
         if failed_count > len(shown_f):
             result_text += "• ...\n"
+    if sent_count > 0:
+        result_text += (
+            "\n\n⏳ <b>Проверяем публикации</b>\n"
+            f"Через {BROADCAST_VERIFY_WAIT_SECONDS} сек проверим, не удалили ли посты администраторы.\n"
+            "Если удалили — вернём посты на баланс."
+        )
 
     await query.message.edit_text(
         result_text,
@@ -5139,6 +5247,10 @@ async def broadcast_confirm_mass(query: CallbackQuery):
         ]),
     )
     await query.answer()
+    if sent_count > 0:
+        asyncio.create_task(
+            _run_post_broadcast_verification(user_id, result.get("sent_message_ids", {}))
+        )
 
 
 @dp.callback_query(F.data == "bc_publications")
@@ -5149,6 +5261,15 @@ async def broadcast_publications(query: CallbackQuery):
     runtime = state.get("runtime", {}) if isinstance(state.get("runtime", {}), dict) else {}
     last_run = runtime.get("last_run", {}) if isinstance(runtime.get("last_run", {}), dict) else {}
     sent_ids = last_run.get("sent_message_ids", {}) if isinstance(last_run.get("sent_message_ids", {}), dict) else {}
+    verification_status = str(last_run.get("verification_status") or "")
+    verification_results = (
+        last_run.get("verification_results", {})
+        if isinstance(last_run.get("verification_results", {}), dict)
+        else {}
+    )
+    verified_count = int(last_run.get("verified_count", 0) or 0)
+    not_verified_count = int(last_run.get("not_verified_count", 0) or 0)
+    refunded_posts = int(last_run.get("refunded_posts", 0) or 0)
 
     lines: list[str] = []
     for i, (group, mid) in enumerate(list(sent_ids.items()), start=1):
@@ -5158,7 +5279,14 @@ async def broadcast_publications(query: CallbackQuery):
             mid_int = None
         ref = format_group_ref(str(group))
         link = _public_group_link(str(group), mid_int)
-        if link:
+        group_key = str(group)
+        is_not_verified = verification_status == "complete" and verification_results.get(group_key) is False
+        if is_not_verified:
+            lines.append(f"{i}) {ref} -> ❌ не публиковалось (удалено)")
+            continue
+        if link and verification_status == "pending":
+            lines.append(f"{i}) {ref} -> {link} ⏳")
+        elif link:
             lines.append(f"{i}) {ref} -> {link}")
         else:
             lines.append(f"{i}) {ref} -> link недоступен (приватный чат)")
@@ -5171,6 +5299,15 @@ async def broadcast_publications(query: CallbackQuery):
         )
     else:
         text = "📄 <b>Публикации</b>\n\n" + "\n".join(lines)
+        if verification_status == "complete":
+            text += (
+                "\n\n"
+                f"✅ {verified_count} подтверждено | "
+                f"❌ {not_verified_count} удалено | "
+                f"↩️ {refunded_posts} возвращено"
+            )
+        elif verification_status == "pending":
+            text += "\n\n⏳ Проверка публикаций ещё выполняется..."
 
     await query.message.edit_text(
         text,
@@ -5263,6 +5400,7 @@ async def broadcast_run_history(query: CallbackQuery):
             total = int(entry.get("groups_total", 0) or 0)
             blocked = int(entry.get("blocked_count", 0) or 0)
             failed = int(entry.get("failed_count", 0) or 0)
+            refunded = int(entry.get("refunded_posts", 0) or 0)
             slot = entry.get("slot") or ""
             slot_label = f" ({slot})" if slot else ""
             line = (
@@ -5273,6 +5411,8 @@ async def broadcast_run_history(query: CallbackQuery):
                 line += f" 🚫{blocked}"
             if failed:
                 line += f" ⚠️{failed}"
+            if refunded > 0:
+                line += f" ↩️{refunded}"
             lines.append(line)
         text = "🕐 <b>История рассылок</b> (последние 15)\n\n" + "\n".join(lines)
 
