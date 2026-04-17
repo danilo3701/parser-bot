@@ -86,6 +86,8 @@ load_dotenv(Path(__file__).parent / ".env")
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("TG_API_ID", "0") or "0")
+API_HASH = (os.getenv("TG_API_HASH") or "").strip()
 DEFAULT_RESULTS_CHANNEL = int(os.getenv("DEFAULT_RESULTS_CHANNEL") or os.getenv("RESULTS_CHANNEL", "-1003761773885"))
 SOURCE_HEADER_CHANNEL_ID = int(os.getenv("SOURCE_HEADER_CHANNEL_ID", "-1003739349502"))
 BROADCAST_TZ = os.getenv("BROADCAST_TZ", "Europe/Madrid")
