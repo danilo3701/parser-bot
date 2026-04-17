@@ -2806,7 +2806,6 @@ def _serialize_scanner_pending_login(pending: PendingLogin) -> dict:
         "api_id": int(pending.api_id),
         "api_hash": pending.api_hash or "",
         "phone": pending.phone or "",
-        "session_string": extract_session_string(pending.client),
         "created_at": pending.created_at.isoformat(),
         "expires_at": pending.expires_at.isoformat(),
     }
@@ -2817,6 +2816,8 @@ def _persist_scanner_pending_login(user_id: int, pending: PendingLogin) -> None:
 
 
 async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
+    from telethon import TelegramClient
+
     payload = scoped_broadcast_manager(user_id).get_scanner_pending_auth()
     if not payload:
         return None
@@ -2825,7 +2826,6 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
         api_id = int(payload.get("api_id") or 0)
         api_hash = str(payload.get("api_hash") or "").strip()
         phone = str(payload.get("phone") or "").strip()
-        session_string = str(payload.get("session_string") or "").strip()
         created_at_raw = str(payload.get("created_at") or "").strip()
         expires_at_raw = str(payload.get("expires_at") or "").strip()
         created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.now(timezone.utc)
@@ -2834,11 +2834,11 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
             created_at = created_at.replace(tzinfo=timezone.utc)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if not api_id or not api_hash or not session_string:
+        if not api_id or not api_hash:
             raise ValueError("scanner_pending_auth_incomplete")
         if datetime.now(timezone.utc) > expires_at:
             raise TimeoutError("scanner_pending_auth_expired")
-        client = make_client_from_string_session(api_id, api_hash, session_string)
+        client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
         await client.connect()
     except Exception:
         scoped_broadcast_manager(user_id).clear_scanner_pending_auth()
@@ -2896,12 +2896,12 @@ def _save_pending_scan_request(
 
 async def _start_scanner_phone_login(message: Message, state: FSMContext, *, phone: str) -> None:
     """Start scanner Telegram login flow via phone."""
+    from telethon import TelegramClient
+
     user_id = message.from_user.id
     await _cleanup_scanner_pending_login(user_id)
 
-    from mtproto_accounts import make_client_from_string_session
-
-    client = make_client_from_string_session(API_ID, API_HASH)
+    client = TelegramClient(str(SESSION_PATH), API_ID, API_HASH)
     try:
         await client.connect()
         await client.send_code_request(phone)
