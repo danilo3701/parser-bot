@@ -2859,6 +2859,33 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
     return pending
 
 
+async def _build_scanner_fallback_pending() -> PendingLogin | None:
+    from telethon import TelegramClient
+
+    phone = (os.getenv("TG_PHONE") or "").strip()
+    if not API_ID or not API_HASH or not phone:
+        return None
+
+    try:
+        client = TelegramClient(str(SESSION_PATH), API_ID, API_HASH)
+        await client.connect()
+    except Exception:
+        return None
+
+    now = datetime.now(timezone.utc)
+    return PendingLogin(
+        method="phone",
+        created_at=now,
+        expires_at=now + timedelta(seconds=code_ttl_seconds()),
+        api_id=API_ID,
+        api_hash=API_HASH,
+        phone=phone,
+        client=client,
+        qr_login=None,
+        bg_task=None,
+    )
+
+
 async def _cleanup_scanner_pending_login(user_id: int, *, clear_persisted: bool = True) -> None:
     """Cleanup scanner pending login (same as broadcast account)."""
     pending = scanner_pending_login.pop(user_id, None)
@@ -2935,6 +2962,10 @@ async def scanner_auth_code_input(message: Message, state: FSMContext):
     if not pending:
         pending = await _restore_scanner_pending_login(user_id)
     if not pending:
+        pending = await _build_scanner_fallback_pending()
+        if pending:
+            scanner_pending_login[user_id] = pending
+    if not pending:
         await state.set_state(MainMenu.viewing)
         await message.answer("❌ Нет активного подключения. Запросите код заново.", reply_markup=back_button())
         return
@@ -2981,6 +3012,10 @@ async def scanner_auth_password_input(message: Message, state: FSMContext):
     pending = scanner_pending_login.get(user_id)
     if not pending:
         pending = await _restore_scanner_pending_login(user_id)
+    if not pending:
+        pending = await _build_scanner_fallback_pending()
+        if pending:
+            scanner_pending_login[user_id] = pending
     if not pending:
         await state.set_state(MainMenu.viewing)
         await message.answer("❌ Нет активного подключения. Запросите код заново.", reply_markup=back_button())
