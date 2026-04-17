@@ -16,6 +16,8 @@ class BroadcastManager:
     def _default_state(self) -> dict:
         return {
             "scanner_session": "",
+            "scanner_pending_auth": None,
+            "scanner_pending_request": None,
             "send_as_channels": [],
             "broadcast_groups_state": {},
             "broadcast_schedule": {
@@ -88,6 +90,8 @@ class BroadcastManager:
         state.setdefault("broadcast_schedule", self._default_state()["broadcast_schedule"])
         state.setdefault("send_as_channels", [])
         state.setdefault("scanner_session", "")
+        state.setdefault("scanner_pending_auth", None)
+        state.setdefault("scanner_pending_request", None)
         state.setdefault("broadcast_groups_state", {})
         state.setdefault("last_runs", {})
         state.setdefault("run_history", [])
@@ -590,6 +594,34 @@ class BroadcastManager:
 
     def clear_scanner_session(self) -> dict:
         return self.set_scanner_session("")
+
+    def get_scanner_pending_auth(self) -> dict:
+        state = self.load()
+        value = state.get("scanner_pending_auth")
+        return value if isinstance(value, dict) else {}
+
+    def set_scanner_pending_auth(self, payload: dict | None) -> dict:
+        state = self.load()
+        state["scanner_pending_auth"] = payload if isinstance(payload, dict) and payload else None
+        self.save(state)
+        return state
+
+    def clear_scanner_pending_auth(self) -> dict:
+        return self.set_scanner_pending_auth(None)
+
+    def get_scanner_pending_request(self) -> dict:
+        state = self.load()
+        value = state.get("scanner_pending_request")
+        return value if isinstance(value, dict) else {}
+
+    def set_scanner_pending_request(self, payload: dict | None) -> dict:
+        state = self.load()
+        state["scanner_pending_request"] = payload if isinstance(payload, dict) and payload else None
+        self.save(state)
+        return state
+
+    def clear_scanner_pending_request(self) -> dict:
+        return self.set_scanner_pending_request(None)
 
     # ─── Notifications ──────────────────────────────────────────────────────────
 

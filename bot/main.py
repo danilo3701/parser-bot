@@ -2801,15 +2801,97 @@ async def _cleanup_pending_login(user_id: int) -> None:
         pass
 
 
-async def _cleanup_scanner_pending_login(user_id: int) -> None:
+def _serialize_scanner_pending_login(pending: PendingLogin) -> dict:
+    return {
+        "api_id": int(pending.api_id),
+        "api_hash": pending.api_hash or "",
+        "phone": pending.phone or "",
+        "session_string": extract_session_string(pending.client),
+        "created_at": pending.created_at.isoformat(),
+        "expires_at": pending.expires_at.isoformat(),
+    }
+
+
+def _persist_scanner_pending_login(user_id: int, pending: PendingLogin) -> None:
+    scoped_broadcast_manager(user_id).set_scanner_pending_auth(_serialize_scanner_pending_login(pending))
+
+
+async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
+    payload = scoped_broadcast_manager(user_id).get_scanner_pending_auth()
+    if not payload:
+        return None
+
+    try:
+        api_id = int(payload.get("api_id") or 0)
+        api_hash = str(payload.get("api_hash") or "").strip()
+        phone = str(payload.get("phone") or "").strip()
+        session_string = str(payload.get("session_string") or "").strip()
+        created_at_raw = str(payload.get("created_at") or "").strip()
+        expires_at_raw = str(payload.get("expires_at") or "").strip()
+        created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.now(timezone.utc)
+        expires_at = datetime.fromisoformat(expires_at_raw) if expires_at_raw else datetime.now(timezone.utc)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if not api_id or not api_hash or not session_string:
+            raise ValueError("scanner_pending_auth_incomplete")
+        if datetime.now(timezone.utc) > expires_at:
+            raise TimeoutError("scanner_pending_auth_expired")
+        client = make_client_from_string_session(api_id, api_hash, session_string)
+        await client.connect()
+    except Exception:
+        scoped_broadcast_manager(user_id).clear_scanner_pending_auth()
+        return None
+
+    pending = PendingLogin(
+        method="phone",
+        created_at=created_at,
+        expires_at=expires_at,
+        api_id=api_id,
+        api_hash=api_hash,
+        phone=phone,
+        client=client,
+        qr_login=None,
+        bg_task=None,
+    )
+    scanner_pending_login[user_id] = pending
+    return pending
+
+
+async def _cleanup_scanner_pending_login(user_id: int, *, clear_persisted: bool = True) -> None:
     """Cleanup scanner pending login (same as broadcast account)."""
     pending = scanner_pending_login.pop(user_id, None)
     if not pending:
+        if clear_persisted:
+            scoped_broadcast_manager(user_id).clear_scanner_pending_auth()
         return
     try:
         await pending.client.disconnect()
     except Exception:
         pass
+    if clear_persisted:
+        scoped_broadcast_manager(user_id).clear_scanner_pending_auth()
+
+
+def _save_pending_scan_request(
+    user_id: int,
+    *,
+    days: int,
+    direction: str,
+    keywords: list[str],
+    results_channel: int,
+    include_source_header: bool,
+    message_id: int | None,
+) -> None:
+    scoped_broadcast_manager(user_id).set_scanner_pending_request({
+        "scan_days": int(days),
+        "scan_direction": str(direction or ""),
+        "scan_keywords": list(keywords or []),
+        "scan_results_channel": int(results_channel),
+        "scan_include_source_header": bool(include_source_header),
+        "scan_message_id": int(message_id) if message_id is not None else None,
+    })
 
 
 async def _start_scanner_phone_login(message: Message, state: FSMContext, *, phone: str) -> None:
@@ -2830,6 +2912,7 @@ async def _start_scanner_phone_login(message: Message, state: FSMContext, *, pho
 
     pending = new_pending_login(method="phone", api_id=API_ID, api_hash=API_HASH, phone=phone, client=client)
     scanner_pending_login[user_id] = pending
+    _persist_scanner_pending_login(user_id, pending)
     await state.set_state(MainMenu.scanner_auth_code)
     await message.answer(
         "📱 <b>Telegram прислал код подтверждения</b>\n\n"
@@ -2850,8 +2933,10 @@ async def scanner_auth_code_input(message: Message, state: FSMContext):
     user_id = message.from_user.id
     pending = scanner_pending_login.get(user_id)
     if not pending:
+        pending = await _restore_scanner_pending_login(user_id)
+    if not pending:
         await state.set_state(MainMenu.viewing)
-        await message.answer("❌ Нет активного подключения.", reply_markup=back_button())
+        await message.answer("❌ Нет активного подключения. Запросите код заново.", reply_markup=back_button())
         return
 
     if datetime.now(timezone.utc) > pending.expires_at:
@@ -2866,6 +2951,7 @@ async def scanner_auth_code_input(message: Message, state: FSMContext):
         return
 
     try:
+        await pending.client.connect()
         await pending.client.sign_in(phone=pending.phone, code=code)
     except telethon.errors.SessionPasswordNeededError:
         await state.set_state(MainMenu.scanner_auth_password)
@@ -2894,8 +2980,10 @@ async def scanner_auth_password_input(message: Message, state: FSMContext):
     user_id = message.from_user.id
     pending = scanner_pending_login.get(user_id)
     if not pending:
+        pending = await _restore_scanner_pending_login(user_id)
+    if not pending:
         await state.set_state(MainMenu.viewing)
-        await message.answer("❌ Нет активного подключения.", reply_markup=back_button())
+        await message.answer("❌ Нет активного подключения. Запросите код заново.", reply_markup=back_button())
         return
 
     if datetime.now(timezone.utc) > pending.expires_at:
@@ -2910,6 +2998,7 @@ async def scanner_auth_password_input(message: Message, state: FSMContext):
         return
 
     try:
+        await pending.client.connect()
         await pending.client.sign_in(password=password)
     except telethon.errors.PasswordHashInvalidError:
         await message.answer("❌ Неверный пароль. Попробуйте ещё раз.", reply_markup=back_button())
@@ -2937,6 +3026,11 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
 
     # Get saved scan parameters and resume
     data = await state.get_data()
+    persisted_request = scoped_broadcast_manager(user_id).get_scanner_pending_request()
+    if persisted_request:
+        merged = dict(persisted_request)
+        merged.update({k: v for k, v in data.items() if v is not None})
+        data = merged
     await state.set_state(MainMenu.viewing)
 
     await message.answer("✅ Авторизация прошла успешно!", reply_markup=back_button())
@@ -2975,6 +3069,7 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
                     parse_mode="HTML",
                     reply_markup=back_button()
                 )
+            scoped_broadcast_manager(user_id).clear_scanner_pending_request()
         except Exception as e:
             print(f"Ошибка при возобновлении сканирования: {e}")
             await message.answer(
@@ -5771,6 +5866,15 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         scan_include_source_header=should_include_source_header(results_channel),
         scan_message_id=query.message.message_id,
     )
+    _save_pending_scan_request(
+        query.from_user.id,
+        days=days,
+        direction=dir_id,
+        keywords=keywords,
+        results_channel=results_channel,
+        include_source_header=should_include_source_header(results_channel),
+        message_id=query.message.message_id,
+    )
 
     try:
         scanner_session = scoped_broadcast_manager(query.from_user.id).get_scanner_session()
@@ -5787,6 +5891,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         count, processed, skipped = await current_scan_task
 
         if isinstance(skipped, str):  # Ошибка авторизации/канала
+            scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
             await query.message.edit_text(
                 f"❌ <b>Ошибка при сканировании</b>\n\n{skipped}",
                 parse_mode="HTML",
@@ -5794,6 +5899,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
             )
             return
 
+        scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
         await query.message.edit_text(
             f"✅ <b>Сканирование завершено!</b>\n\n"
             f"📂 Направление: {direction_name}\n"
@@ -5810,6 +5916,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         await _start_scanner_phone_login(query.message, state, phone=e.phone)
 
     except asyncio.CancelledError:
+        scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
         await query.message.edit_text(
             f"❌ <b>Сканирование отменено</b>\n\n"
             f"📂 Направление: {direction_name}\n"
@@ -5820,6 +5927,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
 
     except Exception as e:
         print(f"Ошибка при сканировании: {e}")
+        scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
         await query.message.edit_text(
             f"❌ <b>Ошибка при сканировании</b>\n\n{str(e)}",
             parse_mode="HTML",
