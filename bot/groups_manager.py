@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from storage_paths import state_file
+from user_data import normalize_group_ref
 
 GROUPS_FILE = state_file("groups.json")
 
@@ -19,6 +20,9 @@ def save_groups(groups: list):
 
 
 def add_group(username: str):
+    username = normalize_group_ref(username) or ""
+    if not username:
+        return
     groups = load_groups()
     if username not in groups:
         groups.insert(0, username)
@@ -26,6 +30,9 @@ def add_group(username: str):
 
 
 def delete_group(username: str):
+    username = normalize_group_ref(username) or ""
+    if not username:
+        return
     groups = load_groups()
     if username in groups:
         groups.remove(username)

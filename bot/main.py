@@ -1562,8 +1562,8 @@ def groups_keyboard(page: int) -> InlineKeyboardMarkup:
 
     buttons = []
     buttons.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="group_add")])
-    for username in page_groups:
-        buttons.append([InlineKeyboardButton(text=f"@{username}", callback_data=f"group_view_{username}")])
+    for group_ref in page_groups:
+        buttons.append([InlineKeyboardButton(text=format_group_ref(group_ref), callback_data=f"group_view_{group_ref}")])
 
     nav = []
     if page > 0:
@@ -7036,12 +7036,12 @@ async def noop_callback(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("group_view_"))
 async def group_view(query: CallbackQuery):
-    username = query.data[len("group_view_"):]
+    group_ref = query.data[len("group_view_"):]
     await query.message.edit_text(
-        f"👥 <b>@{username}</b>",
+        f"👥 <b>{format_group_ref(group_ref)}</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🗑️ Удалить группу", callback_data=f"group_del_{username}")],
+            [InlineKeyboardButton(text="🗑️ Удалить группу", callback_data=f"group_del_{group_ref}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="groups")],
         ])
     )
@@ -7050,11 +7050,11 @@ async def group_view(query: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("group_del_"))
 async def group_delete(query: CallbackQuery):
-    username = query.data[len("group_del_"):]
-    delete_group(username)
+    group_ref = query.data[len("group_del_"):]
+    delete_group(group_ref)
     groups = load_groups()
     await query.message.edit_text(
-        f"✅ Группа @{username} удалена.\n\nВсего групп: <b>{len(groups)}</b>",
+        f"✅ Группа {format_group_ref(group_ref)} удалена.\n\nВсего групп: <b>{len(groups)}</b>",
         parse_mode="HTML",
         reply_markup=groups_keyboard(0)
     )
@@ -7067,7 +7067,8 @@ async def group_add_prompt(query: CallbackQuery, state: FSMContext):
         "➕ <b>Добавить группу</b>\n\n"
         "Отправьте одно из:\n"
         "• <code>@username</code>\n"
-        "• <code>https://t.me/username</code>",
+        "• <code>https://t.me/username</code>\n"
+        "• <code>-1002761923542</code>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="◀️ Отмена", callback_data="groups")],
@@ -7079,32 +7080,24 @@ async def group_add_prompt(query: CallbackQuery, state: FSMContext):
 
 @dp.message(MainMenu.adding_group)
 async def process_group_input(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if text.startswith("https://t.me/"):
-        username = text.split("t.me/")[-1].strip("/")
-    elif text.startswith("@"):
-        username = text[1:]
-    else:
-        await message.answer("❌ Неверный формат. Используй @username или https://t.me/username")
-        return
-
-    if "/" in username or " " in username or not username:
+    ref = normalize_group_ref(message.text or "")
+    if not ref:
         await message.answer("❌ Некорректное имя группы. Попробуй снова.")
         return
 
     groups = load_groups()
-    if username in groups:
+    if ref in groups:
         await message.answer(
-            f"⚠️ <b>Дубликат не сохранен</b>\n\nГруппа @{username} уже в списке.",
+            f"⚠️ <b>Дубликат не сохранен</b>\n\nГруппа {format_group_ref(ref)} уже в списке.",
             parse_mode="HTML"
         )
         return
 
-    add_group(username)
+    add_group(ref)
     groups = load_groups()
     await state.set_state(MainMenu.viewing)
     await message.answer(
-        f"✅ <b>Группа @{username} добавлена!</b>\n\nВсего групп: <b>{len(groups)}</b>",
+        f"✅ <b>Группа {format_group_ref(ref)} добавлена!</b>\n\nВсего групп: <b>{len(groups)}</b>",
         parse_mode="HTML",
         reply_markup=groups_keyboard(0)
     )
