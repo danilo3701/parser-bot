@@ -2961,6 +2961,103 @@ async def _start_scanner_phone_login(message: Message, state: FSMContext, *, pho
     )
 
 
+def scanner_auth_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📷 Войти по QR", callback_data="scanner_qr")],
+        [InlineKeyboardButton(text="📱 Войти по коду", callback_data="scanner_phone")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu")],
+    ])
+
+
+@dp.callback_query(F.data == "scanner_phone")
+async def scanner_auth_start_phone(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    phone = (data.get("scanner_auth_phone") or os.getenv("TG_PHONE") or "").strip()
+    if not phone:
+        await query.answer("Не задан номер TG_PHONE.", show_alert=True)
+        return
+    await query.answer()
+    await _start_scanner_phone_login(query.message, state, phone=phone)
+
+
+@dp.callback_query(F.data == "scanner_qr")
+async def scanner_auth_start_qr(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _cleanup_scanner_pending_login(query.from_user.id)
+    await _start_scanner_qr_login(query, state, refresh=False)
+
+
+@dp.callback_query(F.data == "scanner_qr_refresh")
+async def scanner_auth_qr_refresh(query: CallbackQuery, state: FSMContext):
+    await query.answer()
+    await _cleanup_scanner_pending_login(query.from_user.id)
+    await _start_scanner_qr_login(query, state, refresh=True)
+
+
+@dp.callback_query(F.data == "scanner_qr_check")
+async def scanner_auth_qr_check(query: CallbackQuery, state: FSMContext):
+    import telethon.errors
+
+    user_id = query.from_user.id
+    pending = scanner_pending_login.get(user_id)
+    if not pending or pending.method != "qr" or not pending.qr_login:
+        await query.answer("Нет активного QR.", show_alert=True)
+        return
+
+    if datetime.now(timezone.utc) > pending.expires_at:
+        await _cleanup_scanner_pending_login(user_id)
+        await query.answer("Таймаут QR. Создайте заново.", show_alert=True)
+        return
+
+    await query.answer("⏳ Проверяю статус QR...")
+
+    try:
+        await asyncio.wait_for(pending.qr_login.wait(), timeout=2.0)
+    except Exception:
+        pass
+
+    try:
+        await asyncio.wait_for(pending.client.get_me(), timeout=5.0)
+        await _finalize_scanner_login(query.message, state, user_id=user_id, phone="")
+        await query.answer("✅ QR отсканирован и авторизован!", show_alert=True)
+        return
+
+    except telethon.errors.SessionPasswordNeededError:
+        if user_id in OWNER_IDS and OWNER_2FA_PASSWORD:
+            try:
+                await pending.client.sign_in(password=OWNER_2FA_PASSWORD)
+                await _finalize_scanner_login(query.message, state, user_id=user_id, phone="")
+                await query.answer("✅ QR авторизован! (пароль введён автоматически)", show_alert=True)
+                return
+            except telethon.errors.PasswordHashInvalidError:
+                await query.answer("❌ OWNER_2FA_PASSWORD неверный!", show_alert=True)
+                await _cleanup_scanner_pending_login(user_id)
+                return
+            except Exception as exc:
+                await query.answer(f"❌ Ошибка пароля: {type(exc).__name__}", show_alert=True)
+                await _cleanup_scanner_pending_login(user_id)
+                return
+
+        await state.set_state(MainMenu.scanner_auth_password)
+        await _safe_edit_text(
+            query.message,
+            "🔐 <b>QR отсканирован!</b>\n\n"
+            "Но этот аккаунт защищён паролем 2FA.\n\n"
+            "Введите пароль (не код, а именно пароль):",
+            reply_markup=back_button(),
+        )
+        await query.answer("Требуется пароль", show_alert=True)
+        return
+
+    except asyncio.TimeoutError:
+        await query.answer("⏱ Не удалось подтвердить QR. Попробуйте снова.", show_alert=True)
+        return
+    except Exception as exc:
+        await query.answer(f"❌ Ошибка при QR: {type(exc).__name__}", show_alert=True)
+        await _cleanup_scanner_pending_login(user_id)
+        return
+
+
 @dp.message(MainMenu.scanner_auth_code)
 async def scanner_auth_code_input(message: Message, state: FSMContext):
     """Handle scanner auth code input."""
@@ -3116,7 +3213,7 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
                     parse_mode="HTML",
                     reply_markup=back_button()
                 )
-            scoped_broadcast_manager(user_id).clear_scanner_pending_request()
+
         except Exception as e:
             print(f"Ошибка при возобновлении сканирования: {e}")
             await message.answer(
@@ -3124,6 +3221,135 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
                 parse_mode="HTML",
                 reply_markup=back_button()
             )
+
+
+async def _scanner_qr_auto_watch(user_id: int, chat_id: int, qr_message_id: int) -> None:
+    """Background task: auto-detect QR scan and finalize scanner login (with 2FA support)."""
+    import telethon.errors
+
+    pending = scanner_pending_login.get(user_id)
+    if not pending or pending.method != "qr" or not pending.qr_login:
+        return
+
+    ttl = max((pending.expires_at - datetime.now(timezone.utc)).total_seconds(), 1.0)
+
+    try:
+        await asyncio.wait_for(pending.qr_login.wait(), timeout=ttl)
+
+    except asyncio.CancelledError:
+        return
+
+    except asyncio.TimeoutError:
+        scanner_pending_login.pop(user_id, None)
+        try:
+            await bot.send_message(
+                chat_id,
+                "⏰ QR-код истёк. Нажмите <b>Обновить QR</b> или вернитесь назад.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Обновить QR", callback_data="scanner_qr_refresh")],
+                    [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu")],
+                ]),
+            )
+        except Exception:
+            pass
+        return
+
+    key = StorageKey(bot_id=bot.id, chat_id=chat_id, user_id=user_id)
+    ctx = FSMContext(storage=dp.storage, key=key)
+
+    try:
+        try:
+            await pending.client.get_me()
+            msg = await bot.send_message(chat_id, "✅ QR авторизован!", reply_markup=back_button())
+            await _finalize_scanner_login(msg, ctx, user_id=user_id, phone="")
+            return
+
+        except telethon.errors.SessionPasswordNeededError:
+            if user_id in OWNER_IDS and OWNER_2FA_PASSWORD:
+                await pending.client.sign_in(password=OWNER_2FA_PASSWORD)
+                msg = await bot.send_message(chat_id, "✅ QR авторизован! (пароль введён автоматически)", reply_markup=back_button())
+                await _finalize_scanner_login(msg, ctx, user_id=user_id, phone="")
+                return
+
+            await ctx.set_state(MainMenu.scanner_auth_password)
+            try:
+                await bot.delete_message(chat_id, qr_message_id)
+            except Exception:
+                pass
+            await bot.send_message(
+                chat_id,
+                "🔐 <b>QR отсканирован!</b>\n\n"
+                "Но этот аккаунт защищён паролем 2FA.\n\n"
+                "Введите пароль (не код, а именно пароль):",
+                parse_mode="HTML",
+                reply_markup=back_button(),
+            )
+            return
+
+    except Exception:
+        scanner_pending_login.pop(user_id, None)
+        try:
+            await bot.send_message(chat_id, "❌ Ошибка при QR.", reply_markup=back_button())
+        except Exception:
+            pass
+
+
+async def _start_scanner_qr_login(query: CallbackQuery, state: FSMContext, *, refresh: bool) -> None:
+    if not API_ID or not API_HASH:
+        await query.answer("Не настроены TG_API_ID/TG_API_HASH.", show_alert=True)
+        return
+
+    user_id = query.from_user.id
+    client = make_client_from_string_session(API_ID, API_HASH)
+    try:
+        await client.connect()
+        qr_login = await client.qr_login()
+    except Exception as exc:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await query.answer(f"Не удалось создать QR: {type(exc).__name__}", show_alert=True)
+        return
+
+    pending = new_pending_login(method="qr", api_id=API_ID, api_hash=API_HASH, phone="", client=client)
+    pending.qr_login = qr_login
+    scanner_pending_login[user_id] = pending
+
+    try:
+        import qrcode
+
+        img = qrcode.make(qr_login.url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        photo = BufferedInputFile(buf.getvalue(), filename="scanner-login-qr.png")
+    except Exception:
+        await _cleanup_scanner_pending_login(user_id)
+        await query.answer("Нужен пакет qrcode для QR.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я отсканировал", callback_data="scanner_qr_check")],
+        [InlineKeyboardButton(text="🔄 Обновить QR", callback_data="scanner_qr_refresh")],
+        [InlineKeyboardButton(text="📱 Войти по коду", callback_data="scanner_phone")],
+        [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="menu")],
+    ])
+
+    await state.set_state(MainMenu.viewing)
+    sent = await query.message.answer_photo(
+        photo=photo,
+        caption=(
+            "📷 <b>QR-вход (сканер)</b>\n\n"
+            "Откройте Telegram → Settings → Devices → Scan QR.\n\n"
+            f"Таймаут: <b>{code_ttl_seconds()} сек</b>."
+        ),
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+    pending.bg_task = asyncio.create_task(_scanner_qr_auto_watch(user_id, query.message.chat.id, sent.message_id))
+    await query.answer("QR готов" if not refresh else "QR обновлён")
 
 
 async def _safe_edit_text(msg: Message, text: str, *, parse_mode: str = "HTML", reply_markup=None, disable_web_page_preview: bool = False) -> None:
@@ -5959,8 +6185,14 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         )
 
     except ScannerNeedsAuthError as e:
-        # Telegram login code needed for scanner
-        await _start_scanner_phone_login(query.message, state, phone=e.phone)
+        # Telegram login needed for scanner: offer QR or phone code
+        await state.update_data(scanner_auth_phone=(e.phone or "").strip())
+        await query.message.answer(
+            "🔐 <b>Нужна авторизация Telegram для сканирования</b>\n\n"
+            "Выберите способ входа:",
+            parse_mode="HTML",
+            reply_markup=scanner_auth_method_keyboard(),
+        )
 
     except asyncio.CancelledError:
         scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
