@@ -7372,9 +7372,27 @@ async def main():
     print("💬 Напиши /start в Telegram")
     print(f"📨 Канал по умолчанию: {DEFAULT_RESULTS_CHANNEL}")
     try:
+        from storage_paths import base_data_dir
+        from mtproto_accounts import accounts_path
+
+        data_dir = base_data_dir()
+        print(f"Data dir: {data_dir}")
         print(f"State file: {state_file('broadcast_state.json')}")
+        print(f"MTProto accounts: {accounts_path()}")
         print(f"User data dir: {user_data_dir()}")
         print(f"Session path: {SESSION_PATH}")
+
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            probe = (data_dir / "railway_write_probe.txt")
+            probe.write_text("ok\n", encoding="utf-8")
+            try:
+                entries = sorted(p.name for p in data_dir.iterdir())
+            except Exception:
+                entries = []
+            print(f"Data dir writable: True; entries: {entries[:25]}")
+        except Exception as exc:
+            print(f"Data dir writable: False ({type(exc).__name__})")
     except Exception:
         pass
 
