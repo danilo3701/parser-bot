@@ -2806,6 +2806,7 @@ def _serialize_scanner_pending_login(pending: PendingLogin) -> dict:
         "api_id": int(pending.api_id),
         "api_hash": pending.api_hash or "",
         "phone": pending.phone or "",
+        "phone_code_hash": getattr(pending, "phone_code_hash", "") or "",
         "created_at": pending.created_at.isoformat(),
         "expires_at": pending.expires_at.isoformat(),
     }
@@ -2816,8 +2817,6 @@ def _persist_scanner_pending_login(user_id: int, pending: PendingLogin) -> None:
 
 
 async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
-    from telethon import TelegramClient
-
     payload = scoped_broadcast_manager(user_id).get_scanner_pending_auth()
     if not payload:
         return None
@@ -2826,6 +2825,7 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
         api_id = int(payload.get("api_id") or 0)
         api_hash = str(payload.get("api_hash") or "").strip()
         phone = str(payload.get("phone") or "").strip()
+        phone_code_hash = str(payload.get("phone_code_hash") or "").strip()
         created_at_raw = str(payload.get("created_at") or "").strip()
         expires_at_raw = str(payload.get("expires_at") or "").strip()
         created_at = datetime.fromisoformat(created_at_raw) if created_at_raw else datetime.now(timezone.utc)
@@ -2838,7 +2838,7 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
             raise ValueError("scanner_pending_auth_incomplete")
         if datetime.now(timezone.utc) > expires_at:
             raise TimeoutError("scanner_pending_auth_expired")
-        client = TelegramClient(str(SESSION_PATH), api_id, api_hash)
+        client = make_client_from_string_session(api_id, api_hash)
         await client.connect()
     except Exception:
         scoped_broadcast_manager(user_id).clear_scanner_pending_auth()
@@ -2851,6 +2851,7 @@ async def _restore_scanner_pending_login(user_id: int) -> PendingLogin | None:
         api_id=api_id,
         api_hash=api_hash,
         phone=phone,
+        phone_code_hash=phone_code_hash,
         client=client,
         qr_login=None,
         bg_task=None,
@@ -2923,21 +2924,29 @@ def _save_pending_scan_request(
 
 async def _start_scanner_phone_login(message: Message, state: FSMContext, *, phone: str) -> None:
     """Start scanner Telegram login flow via phone."""
-    from telethon import TelegramClient
-
     user_id = message.from_user.id
     await _cleanup_scanner_pending_login(user_id)
 
-    client = TelegramClient(str(SESSION_PATH), API_ID, API_HASH)
     try:
+        client = make_client_from_string_session(API_ID, API_HASH)
         await client.connect()
-        await client.send_code_request(phone)
+        sent = await client.send_code_request(phone)
     except Exception as exc:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         await message.answer(f"❌ Ошибка отправки кода: {type(exc).__name__}", reply_markup=back_button())
         return
 
-    pending = new_pending_login(method="phone", api_id=API_ID, api_hash=API_HASH, phone=phone, client=client)
+    pending = new_pending_login(
+        method="phone",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        phone=phone,
+        client=client,
+        phone_code_hash=getattr(sent, "phone_code_hash", "") or "",
+    )
     scanner_pending_login[user_id] = pending
     _persist_scanner_pending_login(user_id, pending)
     await state.set_state(MainMenu.scanner_auth_code)
@@ -2983,7 +2992,10 @@ async def scanner_auth_code_input(message: Message, state: FSMContext):
 
     try:
         await pending.client.connect()
-        await pending.client.sign_in(phone=pending.phone, code=code)
+        kwargs = {"phone": pending.phone, "code": code}
+        if getattr(pending, "phone_code_hash", ""):
+            kwargs["phone_code_hash"] = pending.phone_code_hash
+        await pending.client.sign_in(**kwargs)
     except telethon.errors.SessionPasswordNeededError:
         await state.set_state(MainMenu.scanner_auth_password)
         await message.answer("🔐 Включена 2FA. Введите пароль:", reply_markup=back_button())

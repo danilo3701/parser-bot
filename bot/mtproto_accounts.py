@@ -129,11 +129,20 @@ class PendingLogin:
     api_hash: str
     phone: str
     client: object  # TelegramClient
+    phone_code_hash: str = ""
     qr_login: object | None = None
     bg_task: object | None = None  # asyncio.Task for QR auto-watch
 
 
-def new_pending_login(*, method: str, api_id: int, api_hash: str, phone: str, client: object) -> PendingLogin:
+def new_pending_login(
+    *,
+    method: str,
+    api_id: int,
+    api_hash: str,
+    phone: str,
+    client: object,
+    phone_code_hash: str = "",
+) -> PendingLogin:
     now = _now_utc()
     ttl = timedelta(seconds=code_ttl_seconds())
     return PendingLogin(
@@ -143,6 +152,7 @@ def new_pending_login(*, method: str, api_id: int, api_hash: str, phone: str, cl
         api_id=api_id,
         api_hash=api_hash,
         phone=phone,
+        phone_code_hash=phone_code_hash or "",
         client=client,
         qr_login=None,
     )
