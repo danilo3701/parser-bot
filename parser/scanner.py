@@ -127,6 +127,7 @@ async def scan_groups_history(
     max_messages: int = 10000,
     keywords: list = None,
     anti_keywords: list = None,
+    groups: list | None = None,
     results_channel: int = None,
     include_source_header: bool = False,
     session_path: Path | str | None = None,
@@ -148,7 +149,7 @@ async def scan_groups_history(
         return 0, 0, "Нет ключевых слов для сканирования"
     _compile_anti_keywords(anti_keywords)
 
-    groups = load_groups()
+    groups = list(groups or load_groups())
     # Дедуп только на время текущего сканирования (в памяти, без файла)
     dedupe_store = DedupeStore(None, ttl_seconds=None)
 

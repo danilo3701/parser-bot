@@ -371,6 +371,8 @@ class MainMenu(StatesGroup):
     scanning = State()
     selecting_direction = State()
     selecting_subcats = State()
+    selecting_scan_groups = State()
+    scan_custom_tags_input = State()
     editing_keywords = State()
     adding_subcat_keyword = State()
     adding_category_keyword = State()
@@ -1576,6 +1578,40 @@ def groups_keyboard(page: int) -> InlineKeyboardMarkup:
     buttons.append(nav)
 
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def scan_groups_keyboard(page: int, selected_groups: list[str]) -> InlineKeyboardMarkup:
+    groups = load_groups()
+    total = len(groups)
+    total_pages = max(1, (total + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * GROUPS_PER_PAGE
+    page_groups = groups[start:start + GROUPS_PER_PAGE]
+    selected_set = set(selected_groups or [])
+
+    buttons = []
+    buttons.append([InlineKeyboardButton(text="➕ Добавить группу", callback_data="scan_group_add")])
+    for group_ref in page_groups:
+        mark = "✅" if group_ref in selected_set else "▫️"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"{mark} {format_group_ref(group_ref)}",
+                callback_data=f"scan_group_toggle_{group_ref}",
+            )
+        ])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"scan_groups_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"scan_groups_page_{page + 1}"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="✅ Готово", callback_data="scan_groups_done")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="scan_groups_prev_step")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -2907,7 +2943,9 @@ def _save_pending_scan_request(
     *,
     days: int,
     direction: str,
+    mode: str = "category",
     keywords: list[str],
+    groups: list[str],
     results_channel: int,
     include_source_header: bool,
     message_id: int | None,
@@ -2915,7 +2953,9 @@ def _save_pending_scan_request(
     scoped_broadcast_manager(user_id).set_scanner_pending_request({
         "scan_days": int(days),
         "scan_direction": str(direction or ""),
+        "scan_mode": str(mode or "category"),
         "scan_keywords": list(keywords or []),
+        "scan_groups": list(groups or []),
         "scan_results_channel": int(results_channel),
         "scan_include_source_header": bool(include_source_header),
         "scan_message_id": int(message_id) if message_id is not None else None,
@@ -3180,7 +3220,7 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
     await message.answer("✅ Авторизация прошла успешно!", reply_markup=back_button())
 
     # Resume scan if we have the parameters
-    if data.get("scan_days") and data.get("scan_direction") and data.get("scan_keywords"):
+    if data.get("scan_days") and data.get("scan_keywords"):
         await message.answer("⏳ Запускаю сканирование...", reply_markup=back_button())
         await asyncio.sleep(1)  # Small delay to avoid rate limiting
 
@@ -3189,6 +3229,7 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
                 days=data.get("scan_days", 30),
                 keywords=data.get("scan_keywords", []),
                 anti_keywords=load_anti_keywords(),
+                groups=data.get("scan_groups", []),
                 results_channel=data.get("scan_results_channel"),
                 include_source_header=data.get("scan_include_source_header", False),
                 session_path=SESSION_PATH,
@@ -3202,12 +3243,17 @@ async def _finalize_scanner_login(message: Message, state: FSMContext, *, user_i
                     reply_markup=back_button()
                 )
             else:
-                direction = get_directions(load()).get(data.get("scan_direction", ""), {})
-                direction_name = direction.get("name", "Сканирование")
+                scan_mode = str(data.get("scan_mode") or "category")
+                if scan_mode == "custom":
+                    direction_name = "Свои теги"
+                else:
+                    direction = get_directions(load()).get(data.get("scan_direction", ""), {})
+                    direction_name = direction.get("name", "Сканирование")
                 await message.answer(
                     f"✅ <b>Сканирование завершено!</b>\n\n"
                     f"📂 Направление: {direction_name}\n"
                     f"🎯 Найдено: <b>{count}</b> совпадений\n"
+                    f"👥 Групп: <b>{len(data.get('scan_groups', []))}</b>\n"
                     f"📅 Период: {data.get('scan_days', 30)} дней\n\n"
                     f"🔑 Ключевых слов использовано: <b>{len(data.get('scan_keywords', []))}</b>",
                     parse_mode="HTML",
@@ -5935,7 +5981,10 @@ async def scan_callback(query: CallbackQuery, state: FSMContext):
     for dir_id, dir_data in directions.items():
         name = dir_data.get("name", dir_id)
         buttons.append([InlineKeyboardButton(text=name, callback_data=f"scan_dir_{dir_id}")])
+    buttons.append([InlineKeyboardButton(text="🏷 Свои теги", callback_data="scan_custom_tags")])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")])
+
+    await state.update_data(scan_mode="category", scan_custom_keywords=None)
 
     await query.message.edit_text(
         text,
@@ -5962,6 +6011,8 @@ async def scan_dir_callback(query: CallbackQuery, state: FSMContext):
     # Инициализируем FSM data для выбора подкатегорий
     await state.set_state(MainMenu.selecting_subcats)
     await state.update_data(
+        scan_mode="category",
+        scan_custom_keywords=None,
         current_direction=dir_id,
         selected_subcats=set()
     )
@@ -5998,6 +6049,24 @@ async def _render_subcats_list(query: CallbackQuery, dir_id: str, selected: set,
         text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+async def _render_scan_groups_step(message: Message, state: FSMContext, *, page: int = 0) -> None:
+    data = await state.get_data()
+    selected_groups = data.get("scan_selected_groups")
+    if not selected_groups:
+        selected_groups = list(load_groups())
+        await state.update_data(scan_selected_groups=selected_groups)
+    await state.set_state(MainMenu.selecting_scan_groups)
+    await state.update_data(scan_groups_page=int(page))
+    await message.edit_text(
+        f"👥 <b>Группы для парсинга</b>\n\n"
+        f"Всего групп: <b>{len(load_groups())}</b>\n"
+        f"Выбрано: <b>{len(selected_groups)}</b>\n\n"
+        "Выбери группы для этого запуска сканирования.",
+        parse_mode="HTML",
+        reply_markup=scan_groups_keyboard(page, selected_groups),
     )
 
 
@@ -6049,7 +6118,7 @@ async def scan_all_callback(query: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("scan_done_"))
 async def scan_done_callback(query: CallbackQuery, state: FSMContext):
-    """Готово с выбором подкатегорий, переходим к периоду"""
+    """Готово с выбором подкатегорий, переходим к выбору групп"""
     dir_id = query.data[len("scan_done_"):]
 
     data = await state.get_data()
@@ -6062,30 +6131,8 @@ async def scan_done_callback(query: CallbackQuery, state: FSMContext):
     # Сохраняем активный выбор
     set_active_selection(dir_id, list(selected))
 
-    # Переходим к выбору периода
-    text = (
-        f"<b>Направление:</b> {load()['directions'][dir_id]['name']}\n"
-        f"<b>Подкатегорий выбрано:</b> {len(selected)}\n\n"
-        f"<b>Выбери период сканирования:</b>"
-    )
-
-    await query.message.edit_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📅 7 дней", callback_data="scan_period_7"),
-                InlineKeyboardButton(text="📅 30 дней", callback_data="scan_period_30"),
-            ],
-            [
-                InlineKeyboardButton(text="📅 90 дней", callback_data="scan_period_90"),
-                InlineKeyboardButton(text="📅 Всё", callback_data="scan_period_999"),
-            ],
-            [
-                InlineKeyboardButton(text="← Подкатегории", callback_data=f"scan_dir_{dir_id}"),
-            ],
-        ])
-    )
+    await state.update_data(scan_selected_groups=list(load_groups()), scan_groups_page=0)
+    await _render_scan_groups_step(query.message, state, page=0)
     await query.answer()
 
 
@@ -6096,23 +6143,47 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
     parts = query.data.split("_")
     days = int(parts[2])
 
-    # Получаем активный выбор из categories.json
-    cat_state = load()
-    dir_id = get_active_direction(cat_state)
-    direction = get_directions(cat_state).get(dir_id, {})
-    direction_name = direction.get("name", dir_id)
-    results_channel, channel_error = resolve_results_channel_for_selection(cat_state, DEFAULT_RESULTS_CHANNEL)
-    if channel_error:
-        await query.answer(f"❌ {channel_error}", show_alert=True)
+    data = await state.get_data()
+    scan_mode = str(data.get("scan_mode") or "category")
+    scan_groups = list(data.get("scan_selected_groups") or [])
+    if not scan_groups:
+        scan_groups = list(load_groups())
+    if not scan_groups:
+        await query.answer("❌ Нет групп для сканирования. Добавь хотя бы одну группу.", show_alert=True)
         return
 
-    keywords = get_active_keywords()
-    if not keywords:
-        await query.answer("❌ Нет ключевых слов для выбранных подкатегорий", show_alert=True)
-        return
+    if scan_mode == "custom":
+        dir_id = "__custom__"
+        direction_name = "Свои теги"
+        channel_error = None
+        results_channel, _ = resolve_active_results_channel()
+        if results_channel is None:
+            results_channel = DEFAULT_RESULTS_CHANNEL
+        keywords = list(data.get("scan_custom_keywords") or [])
+        if not keywords:
+            await query.answer("❌ Сначала введи свои теги", show_alert=True)
+            return
+    else:
+        # Получаем активный выбор из categories.json
+        cat_state = load()
+        dir_id = get_active_direction(cat_state)
+        direction = get_directions(cat_state).get(dir_id, {})
+        direction_name = direction.get("name", dir_id)
+        results_channel, channel_error = resolve_results_channel_for_selection(cat_state, DEFAULT_RESULTS_CHANNEL)
+        if channel_error:
+            await query.answer(f"❌ {channel_error}", show_alert=True)
+            return
+
+        keywords = get_active_keywords()
+        if not keywords:
+            await query.answer("❌ Нет ключевых слов для выбранных подкатегорий", show_alert=True)
+            return
 
     # DEBUG: Log what we got
-    print(f"DEBUG execute_scan: dir_id={dir_id}, selected_subcats={get_active_subcategory_ids(cat_state)}")
+    if scan_mode == "custom":
+        print(f"DEBUG execute_scan(custom): tags_count={len(keywords)}")
+    else:
+        print(f"DEBUG execute_scan: dir_id={dir_id}, selected_subcats={get_active_subcategory_ids(cat_state)}")
     print(f"DEBUG execute_scan: keywords_count={len(keywords)}")
     if keywords:
         print(f"DEBUG execute_scan: sample_keywords={keywords[:3]}")
@@ -6120,6 +6191,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
     # Уведомление о начале
     await query.message.edit_text(
         f"⏳ <b>Сканирование: {direction_name}</b>\n\n"
+        f"Групп: {len(scan_groups)}\n"
         f"Период: {days} дней\n"
         f"Ключевых слов: {len(keywords)}\n\n"
         "Это может занять несколько минут...",
@@ -6134,7 +6206,9 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
     await state.update_data(
         scan_days=days,
         scan_direction=dir_id,
+        scan_mode=scan_mode,
         scan_keywords=keywords,
+        scan_groups=scan_groups,
         scan_results_channel=results_channel,
         scan_include_source_header=should_include_source_header(results_channel),
         scan_message_id=query.message.message_id,
@@ -6143,7 +6217,9 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         query.from_user.id,
         days=days,
         direction=dir_id,
+        mode=scan_mode,
         keywords=keywords,
+        groups=scan_groups,
         results_channel=results_channel,
         include_source_header=should_include_source_header(results_channel),
         message_id=query.message.message_id,
@@ -6156,6 +6232,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
             days=days,
             keywords=keywords,
             anti_keywords=load_anti_keywords(),
+            groups=scan_groups,
             results_channel=results_channel,
             include_source_header=should_include_source_header(results_channel),
             session_path=SESSION_PATH,
@@ -6177,6 +6254,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
             f"✅ <b>Сканирование завершено!</b>\n\n"
             f"📂 Направление: {direction_name}\n"
             f"🎯 Найдено: <b>{count}</b> совпадений\n"
+            f"👥 Групп: <b>{len(scan_groups)}</b>\n"
             f"📅 Период: {days} дней\n\n"
             f"🔑 Ключевых слов использовано: <b>{len(keywords)}</b>\n\n"
             f"📨 Результаты пересланы в <code>{format_channel_label(results_channel)}</code>",
@@ -6198,7 +6276,7 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         scoped_broadcast_manager(query.from_user.id).clear_scanner_pending_request()
         await query.message.edit_text(
             f"❌ <b>Сканирование отменено</b>\n\n"
-            f"📂 Направление: {direction_name}\n"
+            f"📂 Режим: {direction_name}\n"
             f"📅 Период: {days} дней",
             parse_mode="HTML",
             reply_markup=back_button()
@@ -6214,6 +6292,8 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         )
 
     finally:
+        if scan_mode == "custom":
+            await state.update_data(scan_mode=None, scan_custom_keywords=None)
         current_scan_task = None
 
 
@@ -7437,6 +7517,180 @@ async def group_view(query: CallbackQuery):
     await query.answer()
 
 
+def _parse_custom_scan_tags(raw_text: str) -> list[str]:
+    normalized = (raw_text or "").replace("\n", ",")
+    parts = []
+    for chunk in normalized.split(","):
+        for item in chunk.split("#"):
+            tag = item.strip()
+            if tag:
+                parts.append(tag)
+
+    # Dedup (case-insensitive), keep input order.
+    seen = set()
+    result = []
+    for tag in parts:
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(tag)
+    return result
+
+
+@dp.callback_query(F.data == "scan_custom_tags")
+async def scan_custom_tags_callback(query: CallbackQuery, state: FSMContext):
+    await state.set_state(MainMenu.scan_custom_tags_input)
+    await state.update_data(scan_mode="custom", scan_custom_keywords=None)
+    await query.message.edit_text(
+        "🏷 <b>Свои теги</b>\n\n"
+        "Введи слова/фразы для разового сканирования.\n"
+        "Разделители: запятая, # или новая строка.\n\n"
+        "Примеры:\n"
+        "• <code>репетитор, подготовка к егэ, английский онлайн</code>\n"
+        "• <code>репетитор #подготовка к егэ #английский онлайн</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад к направлениям", callback_data="scan")],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.message(MainMenu.scan_custom_tags_input)
+async def scan_custom_tags_input(message: Message, state: FSMContext):
+    tags = _parse_custom_scan_tags((message.text or "").strip())
+    if not tags:
+        await message.answer(
+            "❌ Не нашёл ни одного тега. Введите слова/фразы через запятую, # или с новой строки."
+        )
+        return
+
+    await state.update_data(scan_mode="custom", scan_custom_keywords=tags)
+    await state.set_state(MainMenu.viewing)
+    await state.update_data(scan_selected_groups=list(load_groups()), scan_groups_page=0)
+    sent = await message.answer(
+        f"<b>Свои теги:</b> {len(tags)}\n\nОткрываю выбор групп для парсинга...",
+        parse_mode="HTML",
+    )
+    await _render_scan_groups_step(sent, state, page=0)
+
+
+@dp.callback_query(F.data.startswith("scan_groups_page_"))
+async def scan_groups_page_callback(query: CallbackQuery, state: FSMContext):
+    page = int(query.data.split("_")[-1])
+    await _render_scan_groups_step(query.message, state, page=page)
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith("scan_group_toggle_"))
+async def scan_group_toggle_callback(query: CallbackQuery, state: FSMContext):
+    group_ref = query.data[len("scan_group_toggle_"):]
+    data = await state.get_data()
+    selected = list(data.get("scan_selected_groups") or [])
+    if group_ref in selected:
+        selected = [g for g in selected if g != group_ref]
+    else:
+        selected.append(group_ref)
+    await state.update_data(scan_selected_groups=selected)
+    await _render_scan_groups_step(query.message, state, page=int(data.get("scan_groups_page", 0)))
+    await query.answer()
+
+
+@dp.callback_query(F.data == "scan_group_add")
+async def scan_group_add_prompt(query: CallbackQuery, state: FSMContext):
+    await state.update_data(scan_group_flow=True)
+    await state.set_state(MainMenu.adding_group)
+    await query.message.edit_text(
+        "➕ <b>Добавить группу для парсинга</b>\n\n"
+        "Отправьте одно из:\n"
+        "• <code>@username</code>\n"
+        "• <code>https://t.me/username</code>\n"
+        "• <code>-1002761923542</code>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="scan_groups_return")],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "scan_groups_return")
+async def scan_groups_return_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(scan_group_flow=False)
+    await _render_scan_groups_step(query.message, state, page=int(data.get("scan_groups_page", 0)))
+    await query.answer()
+
+
+@dp.callback_query(F.data == "scan_groups_done")
+async def scan_groups_done_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected_groups = list(data.get("scan_selected_groups") or [])
+    if not selected_groups:
+        await query.answer("❌ Выбери хотя бы одну группу", show_alert=True)
+        return
+
+    await state.set_state(MainMenu.viewing)
+    await query.message.edit_text(
+        f"<b>Групп выбрано:</b> {len(selected_groups)}\n\n"
+        "<b>Выбери период сканирования:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📅 7 дней", callback_data="scan_period_7"),
+                InlineKeyboardButton(text="📅 30 дней", callback_data="scan_period_30"),
+            ],
+            [
+                InlineKeyboardButton(text="📅 90 дней", callback_data="scan_period_90"),
+                InlineKeyboardButton(text="📅 Всё", callback_data="scan_period_999"),
+            ],
+            [
+                InlineKeyboardButton(text="◀️ Группы", callback_data="scan_groups_back"),
+            ],
+        ]),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == "scan_groups_prev_step")
+async def scan_groups_prev_step_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    scan_mode = str(data.get("scan_mode") or "category")
+    if scan_mode == "custom":
+        await state.set_state(MainMenu.scan_custom_tags_input)
+        await query.message.edit_text(
+            "🏷 <b>Свои теги</b>\n\n"
+            "Введи слова/фразы для разового сканирования.\n"
+            "Разделители: запятая, # или новая строка.\n\n"
+            "Примеры:\n"
+            "• <code>репетитор, подготовка к егэ, английский онлайн</code>\n"
+            "• <code>репетитор #подготовка к егэ #английский онлайн</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад к направлениям", callback_data="scan")],
+            ]),
+        )
+    else:
+        dir_id = str(data.get("current_direction") or "")
+        if not dir_id:
+            await scan_callback(query, state)
+            return
+        cat_state = load()
+        subcategories = get_subcategories(cat_state, dir_id)
+        selected = set(data.get("selected_subcats", set()) or [])
+        await state.set_state(MainMenu.selecting_subcats)
+        await _render_subcats_list(query, dir_id, selected, subcategories)
+    await query.answer()
+
+
+@dp.callback_query(F.data == "scan_groups_back")
+async def scan_groups_back_callback(query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await _render_scan_groups_step(query.message, state, page=int(data.get("scan_groups_page", 0)))
+    await query.answer()
+
+
 @dp.callback_query(F.data.startswith("group_del_"))
 async def group_delete(query: CallbackQuery):
     group_ref = query.data[len("group_del_"):]
@@ -7452,6 +7706,7 @@ async def group_delete(query: CallbackQuery):
 
 @dp.callback_query(F.data == "group_add")
 async def group_add_prompt(query: CallbackQuery, state: FSMContext):
+    await state.update_data(scan_group_flow=False)
     await query.message.edit_text(
         "➕ <b>Добавить группу</b>\n\n"
         "Отправьте одно из:\n"
@@ -7469,6 +7724,8 @@ async def group_add_prompt(query: CallbackQuery, state: FSMContext):
 
 @dp.message(MainMenu.adding_group)
 async def process_group_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    scan_group_flow = bool(data.get("scan_group_flow"))
     ref = normalize_group_ref(message.text or "")
     if not ref:
         await message.answer("❌ Некорректное имя группы. Попробуй снова.")
@@ -7484,12 +7741,25 @@ async def process_group_input(message: Message, state: FSMContext):
 
     add_group(ref)
     groups = load_groups()
-    await state.set_state(MainMenu.viewing)
-    await message.answer(
-        f"✅ <b>Группа {format_group_ref(ref)} добавлена!</b>\n\nВсего групп: <b>{len(groups)}</b>",
-        parse_mode="HTML",
-        reply_markup=groups_keyboard(0)
-    )
+    if scan_group_flow:
+        selected = list(data.get("scan_selected_groups") or list(groups))
+        if ref not in selected:
+            selected.append(ref)
+        await state.update_data(scan_selected_groups=selected, scan_group_flow=False, scan_groups_page=0)
+        await state.set_state(MainMenu.selecting_scan_groups)
+        await message.answer(
+            f"✅ <b>Группа {format_group_ref(ref)} добавлена!</b>\n\n"
+            f"Всего групп: <b>{len(groups)}</b>",
+            parse_mode="HTML",
+            reply_markup=scan_groups_keyboard(0, selected),
+        )
+    else:
+        await state.set_state(MainMenu.viewing)
+        await message.answer(
+            f"✅ <b>Группа {format_group_ref(ref)} добавлена!</b>\n\nВсего групп: <b>{len(groups)}</b>",
+            parse_mode="HTML",
+            reply_markup=groups_keyboard(0)
+        )
 
 
 # ─── Справка ──────────────────────────────────────────────────────────────────
