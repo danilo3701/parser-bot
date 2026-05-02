@@ -6136,12 +6136,17 @@ async def scan_done_callback(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
-@dp.callback_query(F.data.startswith("scan_period_"))
+@dp.callback_query(F.data.startswith("scan_confirm_start_"))
 async def execute_scan(query: CallbackQuery, state: FSMContext):
     """Запускает сканирование"""
     global current_scan_task
     parts = query.data.split("_")
-    days = int(parts[2])
+    days = int(parts[3])
+    await _execute_scan_with_days(query, state, days)
+
+
+async def _execute_scan_with_days(query: CallbackQuery, state: FSMContext, days: int):
+    global current_scan_task
 
     data = await state.get_data()
     scan_mode = str(data.get("scan_mode") or "category")
@@ -6189,11 +6194,16 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         print(f"DEBUG execute_scan: sample_keywords={keywords[:3]}")
 
     # Уведомление о начале
+    tags_block = ""
+    if scan_mode == "custom":
+        tags_block = f"\n\n<b>Теги:</b>\n{_format_tags_preview(keywords, limit=15)}"
+
     await query.message.edit_text(
         f"⏳ <b>Сканирование: {direction_name}</b>\n\n"
         f"Групп: {len(scan_groups)}\n"
         f"Период: {days} дней\n"
-        f"Ключевых слов: {len(keywords)}\n\n"
+        f"Ключевых слов: {len(keywords)}\n"
+        f"{tags_block}\n\n"
         "Это может занять несколько минут...",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -6295,6 +6305,40 @@ async def execute_scan(query: CallbackQuery, state: FSMContext):
         if scan_mode == "custom":
             await state.update_data(scan_mode=None, scan_custom_keywords=None)
         current_scan_task = None
+
+
+@dp.callback_query(F.data.startswith("scan_period_"))
+async def scan_period_confirm_callback(query: CallbackQuery, state: FSMContext):
+    parts = query.data.split("_")
+    days = int(parts[2])
+    data = await state.get_data()
+    scan_mode = str(data.get("scan_mode") or "category")
+
+    if scan_mode != "custom":
+        await _execute_scan_with_days(query, state, days)
+        return
+
+    tags = list(data.get("scan_custom_keywords") or [])
+    selected_groups = list(data.get("scan_selected_groups") or [])
+    if not tags:
+        await query.answer("❌ Сначала введи свои теги", show_alert=True)
+        return
+
+    await query.message.edit_text(
+        "⚠️ <b>Проверь теги перед запуском</b>\n\n"
+        f"<b>Тегов:</b> {len(tags)}\n"
+        f"<b>Групп:</b> {len(selected_groups)}\n"
+        f"<b>Период:</b> {days} дней\n\n"
+        f"{_format_tags_preview(tags)}\n\n"
+        "Сканирование будет идти только по этим тегам.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Запустить сканирование", callback_data=f"scan_confirm_start_{days}")],
+            [InlineKeyboardButton(text="✏️ Изменить теги", callback_data="scan_groups_prev_step")],
+            [InlineKeyboardButton(text="◀️ Назад к периоду", callback_data="scan_groups_done")],
+        ]),
+    )
+    await query.answer()
 
 
 @dp.callback_query(F.data == "scan_cancel")
@@ -7538,6 +7582,15 @@ def _parse_custom_scan_tags(raw_text: str) -> list[str]:
     return result
 
 
+def _format_tags_preview(tags: list[str], limit: int = 25) -> str:
+    if not tags:
+        return "—"
+    lines = [f"{idx}. <code>{tag}</code>" for idx, tag in enumerate(tags[:limit], start=1)]
+    if len(tags) > limit:
+        lines.append(f"... и ещё {len(tags) - limit}")
+    return "\n".join(lines)
+
+
 @dp.callback_query(F.data == "scan_custom_tags")
 async def scan_custom_tags_callback(query: CallbackQuery, state: FSMContext):
     await state.set_state(MainMenu.scan_custom_tags_input)
@@ -7570,7 +7623,9 @@ async def scan_custom_tags_input(message: Message, state: FSMContext):
     await state.set_state(MainMenu.viewing)
     await state.update_data(scan_selected_groups=list(load_groups()), scan_groups_page=0)
     sent = await message.answer(
-        f"<b>Свои теги:</b> {len(tags)}\n\nОткрываю выбор групп для парсинга...",
+        f"<b>Свои теги сохранены:</b> {len(tags)}\n\n"
+        f"{_format_tags_preview(tags)}\n\n"
+        "Открываю выбор групп для парсинга...",
         parse_mode="HTML",
     )
     await _render_scan_groups_step(sent, state, page=0)
